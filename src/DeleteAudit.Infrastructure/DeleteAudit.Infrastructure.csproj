@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.29" />
-    <PackageReference Include="System.Diagnostics.EventLog" Version="8.0.1" />
+    <PackageReference Include="System.Diagnostics.EventLog" Version="8.0.2" />
     <InternalsVisibleTo Include="DeleteAudit.UnitTests" />
     <ProjectReference Include="..\DeleteAudit.Application\DeleteAudit.Application.csproj" />
     <ProjectReference Include="..\DeleteAudit.Domain\DeleteAudit.Domain.csproj" />
