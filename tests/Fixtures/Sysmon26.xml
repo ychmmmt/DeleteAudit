@@ -1,0 +1,19 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Sysmon" />
+    <EventID>26</EventID>
+    <Version>4</Version>
+    <EventRecordID>1002</EventRecordID>
+    <Channel>Microsoft-Windows-Sysmon/Operational</Channel>
+    <Computer>LAB-PC</Computer>
+    <TimeCreated SystemTime="2026-01-02T03:04:06.0000000Z" />
+  </System>
+  <EventData>
+    <Data Name="ProcessGuid">{11111111-1111-1111-1111-111111111111}</Data>
+    <Data Name="ProcessId">4242</Data>
+    <Data Name="User">LAB\Analyst</Data>
+    <Data Name="Image">C:\Lab\Tools\cleaner.exe</Data>
+    <Data Name="TargetFilename">C:\Lab\ordinary.txt</Data>
+    <Data Name="UtcTime">2026-01-02 03:04:06.000</Data>
+  </EventData>
+</Event>

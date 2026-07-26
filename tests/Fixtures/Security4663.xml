@@ -1,0 +1,21 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" />
+    <EventID>4663</EventID>
+    <Version>1</Version>
+    <EventRecordID>2001</EventRecordID>
+    <Channel>Security</Channel>
+    <Computer>LAB-PC</Computer>
+    <TimeCreated SystemTime="2026-01-02T03:04:05.2500000Z" />
+  </System>
+  <EventData>
+    <Data Name="ObjectName">C:\Lab\A&amp;B&lt;final&gt;.txt</Data>
+    <Data Name="SubjectUserSid">S-1-5-21-1000</Data>
+    <Data Name="AccessMask">0x10000</Data>
+    <Data Name="ProcessName">C:\Lab\Tools\cleaner.exe</Data>
+    <Data Name="SubjectUserName">Analyst</Data>
+    <Data Name="ProcessId">0x1092</Data>
+    <Data Name="AccessList">%%1537</Data>
+    <Data Name="ObjectType">File</Data>
+  </EventData>
+</Event>

@@ -1,0 +1,49 @@
+name: CI
+
+# The solution is Windows-only: the viewer is WPF and the event log adapters use
+# System.Diagnostics.EventLog. CI therefore runs on windows-latest.
+#
+# This workflow never reads the real Windows event log, never installs or
+# configures Sysmon, and never modifies audit policy, the registry, services or
+# scheduled tasks. Live monitoring is covered by tests that use injected fakes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_GENERATE_ASPNET_CERTIFICATE: "false"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore
+
+      - name: Test
+        run: dotnet test --no-build
+
+      - name: Check whitespace
+        run: git diff --check

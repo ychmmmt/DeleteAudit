@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DeleteAudit.Application\DeleteAudit.Application.csproj" />
+    <ProjectReference Include="..\DeleteAudit.Infrastructure\DeleteAudit.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>

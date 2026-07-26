@@ -1,0 +1,12 @@
+artifacts/
+**/bin/
+**/obj/
+releases/
+*.db
+*.db-shm
+*.db-wal
+*.pending
+TestResults/
+*.user
+*.suo
+.vs/

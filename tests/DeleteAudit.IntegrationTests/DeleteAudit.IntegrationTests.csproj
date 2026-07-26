@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DeleteAudit.Application\DeleteAudit.Application.csproj" />
+    <ProjectReference Include="..\..\src\DeleteAudit.Domain\DeleteAudit.Domain.csproj" />
+    <ProjectReference Include="..\..\src\DeleteAudit.Infrastructure\DeleteAudit.Infrastructure.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="..\..\db\schema.sql" Link="Fixtures\schema.sql" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\db\migrations\0002_phase_1b_offline_import.sql" Link="Fixtures\0002_phase_1b_offline_import.sql" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\db\migrations\0003_phase_2a_live_monitoring.sql" Link="Fixtures\0003_phase_2a_live_monitoring.sql" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

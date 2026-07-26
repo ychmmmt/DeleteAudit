@@ -1,0 +1,1130 @@
+using System.Threading.Channels;
+using DeleteAudit.Application.LiveMonitoring;
+using DeleteAudit.Domain;
+using DeleteAudit.Infrastructure.Parsing;
+
+namespace DeleteAudit.Infrastructure.LiveMonitoring;
+
+/// <summary>
+/// Drives one user-initiated live preview session: validate schema, probe, subscribe,
+/// hand records to a bounded queue, classify them on a background worker, then persist
+/// the session summary. Nothing starts by itself and nothing restarts after a fault.
+///
+/// Scope: this service classifies events in memory and records per-session counts. It
+/// does not persist raw XML, delete facts, correlation, sessions, or risk — that is
+/// Phase 2B and will need its own evidence identity.
+/// </summary>
+public sealed class LiveMonitoringService : ILiveMonitoringService
+{
+    public const string SchemaNotReadyMessage =
+        "实时监控数据库结构尚未准备完成，请应用 0003 migration。";
+
+    private readonly ILiveEventChannelProbe _probe;
+    private readonly ILiveEventSource _source;
+    private readonly ILiveMonitoringRepository _repository;
+    private readonly LiveMonitoringOptions _options;
+    private readonly TimeProvider _timeProvider;
+    private readonly WindowsEventXmlParser _parser;
+    private readonly SemaphoreSlim _transitionGate = new(1, 1);
+
+    /// <summary>
+    /// Guards every mutable per-session fact: counts, diagnostics, the accepting flag,
+    /// the fault flag, the last error, and the fault shutdown task. Lock order is always
+    /// transition gate first, then this lock; never the reverse, and never an await
+    /// while holding it.
+    /// </summary>
+    private readonly object _sessionLock = new();
+
+    private readonly List<LiveMonitoringDiagnostic> _diagnostics = [];
+    private Counters _counters = Counters.Empty;
+    private bool _queueOverflowReported;
+
+    /// <summary>
+    /// The authoritative record of whether this session faulted. Set inside
+    /// <see cref="_sessionLock"/> the moment a valid fault is observed, and it — not the
+    /// asynchronously published UI state — decides the persisted final state.
+    /// </summary>
+    private bool _sessionFaulted;
+
+    private LiveMonitoringState _state = LiveMonitoringState.Stopped;
+    private IReadOnlyList<LiveChannelStatus> _channelStatuses = [];
+    private string? _lastError;
+    private string? _liveSessionId;
+    private DateTimeOffset _startedUtc;
+    private bool _disposed;
+
+    /// <summary>
+    /// Incremented on every Start. A sink carries the generation it was created for, so
+    /// a late callback from a torn-down watcher can never touch a newer session. This is
+    /// an in-memory lifecycle marker only — it is not, and must not be presented as, a
+    /// forensic channel epoch.
+    /// </summary>
+    private int _generation;
+
+    private bool _acceptingEvents;
+
+    // Three distinct facts, deliberately not collapsed into one flag.
+    private bool _completionStarted = true;
+    private bool _lifecycleCompleted = true;
+    private bool _persisted;
+
+    private LiveEventSubscription? _subscription;
+    private Channel<LiveEventRecord>? _queue;
+    private Task? _consumer;
+    private CancellationTokenSource? _consumerCts;
+    private Task? _faultShutdown;
+    private int _queueDepth;
+
+    public LiveMonitoringService(
+        ILiveEventChannelProbe probe,
+        ILiveEventSource source,
+        ILiveMonitoringRepository repository,
+        LiveMonitoringOptions? options = null,
+        TimeProvider? timeProvider = null)
+    {
+        _probe = probe ?? throw new ArgumentNullException(nameof(probe));
+        _source = source ?? throw new ArgumentNullException(nameof(source));
+        _repository = repository ?? throw new ArgumentNullException(nameof(repository));
+        _options = options ?? new LiveMonitoringOptions();
+        _options.Validate();
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _parser = new WindowsEventXmlParser(_timeProvider);
+    }
+
+    public event EventHandler<LiveMonitoringSnapshot>? SnapshotChanged;
+
+    public event EventHandler<LiveEventClassification>? EventClassified;
+
+    public LiveMonitoringSnapshot Snapshot => CreateSnapshot();
+
+    /// <summary>Completion has begun; guards re-entry from Stop, fault and Dispose.</summary>
+    internal bool CompletionStarted => _completionStarted;
+
+    /// <summary>Teardown finished and the final state was published.</summary>
+    internal bool LifecycleCompleted => _lifecycleCompleted;
+
+    /// <summary>
+    /// The session summary actually reached the repository. Distinct from
+    /// <see cref="LifecycleCompleted"/>: a session can finish cleanly yet fail to persist.
+    /// </summary>
+    internal bool SessionPersisted => _persisted;
+
+    /// <summary>
+    /// The queue options for a live session. Synchronous continuations are disabled
+    /// explicitly: the producer calls <c>TryWrite</c> while holding
+    /// <see cref="_sessionLock"/>, so a consumer continuation must never be inlined onto
+    /// the producer's thread.
+    /// </summary>
+    internal static BoundedChannelOptions CreateQueueOptions(int capacity) =>
+        new(capacity)
+        {
+            // Wait mode combined with TryWrite-only producers gives us an explicit,
+            // countable drop instead of a blocked callback thread.
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = true,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false
+        };
+
+    public async Task<IReadOnlyList<LiveChannelStatus>> ProbeChannelsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var statuses = await _probe
+            .ProbeAsync(LiveMonitoringChannels.All, cancellationToken)
+            .ConfigureAwait(false);
+
+        // A cancelled probe must not overwrite whatever the UI is showing now.
+        cancellationToken.ThrowIfCancellationRequested();
+        _channelStatuses = statuses;
+        RaiseSnapshotChanged();
+        return statuses;
+    }
+
+    public async Task StartAsync(CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _transitionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_state is LiveMonitoringState.Running
+                or LiveMonitoringState.Starting
+                or LiveMonitoringState.Stopping)
+            {
+                // A second Start is a no-op: one session, one watcher set.
+                return;
+            }
+
+            BeginSession();
+            SetState(LiveMonitoringState.Starting);
+
+            // Fail closed before anything subscribes: if the session summary cannot be
+            // stored, no watcher is created and no live event is read.
+            try
+            {
+                await _repository
+                    .ValidateSchemaAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception exception) when (IsExpectedFailure(exception))
+            {
+                AddDiagnostic(
+                    "live_schema_not_ready",
+                    exception.Message,
+                    ImportDiagnosticSeverity.Error,
+                    "persist");
+                await AbortStartAsync(SchemaNotReadyMessage).ConfigureAwait(false);
+                return;
+            }
+
+            var statuses = await _probe
+                .ProbeAsync(LiveMonitoringChannels.All, cancellationToken)
+                .ConfigureAwait(false);
+            _channelStatuses = statuses;
+            foreach (var status in statuses.Where(item => !item.CanSubscribe))
+            {
+                AddDiagnostic(
+                    $"channel_{ToDiagnosticSuffix(status.Availability)}",
+                    $"{status.ChannelName}: {status.Detail ?? status.Availability.ToString()}",
+                    ImportDiagnosticSeverity.Warning,
+                    "probe");
+            }
+
+            var subscription = LiveMonitoringChannels.CreateSubscription(statuses);
+            if (subscription.Channels.Count == 0)
+            {
+                AddDiagnostic(
+                    "no_subscribable_channel",
+                    "No required event log channel is available on this machine; live monitoring cannot start.",
+                    ImportDiagnosticSeverity.Error,
+                    "subscribe");
+                await AbortStartAsync("没有可订阅的事件日志通道。").ConfigureAwait(false);
+                return;
+            }
+
+            _subscription = subscription;
+            _queue = Channel.CreateBounded<LiveEventRecord>(
+                CreateQueueOptions(_options.QueueCapacity));
+            _consumerCts = new CancellationTokenSource();
+            _consumer = Task.Run(
+                () => ConsumeAsync(_queue.Reader, _consumerCts.Token),
+                CancellationToken.None);
+
+            lock (_sessionLock)
+            {
+                _acceptingEvents = true;
+            }
+
+            try
+            {
+                await _source
+                    .StartAsync(subscription, new Sink(this, _generation), cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception exception) when (IsExpectedFailure(exception))
+            {
+                AddDiagnostic(
+                    "live_source_start_failed",
+                    exception.Message,
+                    ImportDiagnosticSeverity.Error,
+                    "subscribe");
+                await AbortStartAsync(exception.Message).ConfigureAwait(false);
+                return;
+            }
+
+            // A watcher may already have faulted during StartAsync. The fault fact lives
+            // in _sessionFaulted, so publishing Running here cannot mislabel the session;
+            // the fault shutdown task will move it to Error.
+            SetState(
+                SessionFaulted()
+                    ? LiveMonitoringState.Error
+                    : LiveMonitoringState.Running);
+        }
+        finally
+        {
+            _transitionGate.Release();
+        }
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken = default)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        // A fault may already be tearing the session down; let it finish first so the
+        // session is completed exactly once. Correctness no longer depends on winning
+        // this read: CompleteSessionAsync derives the final state from _sessionFaulted.
+        await ObserveFaultShutdownAsync().ConfigureAwait(false);
+
+        await _transitionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_completionStarted)
+            {
+                // Stopping an already finished session is safe and does nothing.
+                return;
+            }
+
+            SetState(LiveMonitoringState.Stopping);
+            await CompleteSessionAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _transitionGate.Release();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        await ObserveFaultShutdownAsync().ConfigureAwait(false);
+
+        await _transitionGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            if (!_completionStarted)
+            {
+                await CompleteSessionAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            else
+            {
+                await ReleasePipelineAsync().ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            _transitionGate.Release();
+        }
+
+        await _source.DisposeAsync().ConfigureAwait(false);
+        _transitionGate.Dispose();
+    }
+
+    /// <summary>
+    /// Tears a partially started session down and reports it as an error. Called with
+    /// the transition gate held.
+    /// </summary>
+    private async Task AbortStartAsync(string message)
+    {
+        MarkFaulted(message);
+        await CompleteSessionAsync(CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Stops accepting, releases the pipeline, takes one stable snapshot and persists
+    /// exactly one session summary. Must be called with the transition gate held.
+    ///
+    /// The final state comes from the lock-protected fault flag, never from the
+    /// asynchronously published UI state.
+    /// </summary>
+    private async Task CompleteSessionAsync(CancellationToken cancellationToken)
+    {
+        if (_completionStarted)
+        {
+            return;
+        }
+
+        _completionStarted = true;
+        StopAccepting();
+
+        // ReleasePipelineAsync never throws: it runs every shutdown step and returns
+        // whatever went wrong, so one failure can never skip a later step.
+        var failures = await ReleasePipelineAsync().ConfigureAwait(false);
+        if (failures.Count > 0)
+        {
+            foreach (var failure in failures)
+            {
+                AddDiagnostic(
+                    failure.Code,
+                    failure.Exception.Message,
+                    ImportDiagnosticSeverity.Error,
+                    failure.Stage);
+            }
+
+            // Every failure is named; a second one never overwrites the first.
+            MarkFaulted(
+                "实时管线关闭时发生异常："
+                + string.Join(
+                    "；",
+                    failures.Select(failure =>
+                        $"{failure.Code}: {failure.Exception.Message}")));
+        }
+
+        // Source stopped, writer completed, consumer drained: the snapshot below is
+        // taken under the session lock and can no longer move.
+        Counters counters;
+        LiveMonitoringDiagnostic[] diagnostics;
+        bool faulted;
+        lock (_sessionLock)
+        {
+            counters = _counters;
+            diagnostics = [.. _diagnostics];
+            faulted = _sessionFaulted;
+        }
+
+        var finalState = faulted
+            ? LiveMonitoringState.Error
+            : LiveMonitoringState.Stopped;
+        await PersistSessionAsync(finalState, counters, diagnostics, cancellationToken)
+            .ConfigureAwait(false);
+
+        _lifecycleCompleted = true;
+        SetState(finalState);
+    }
+
+    private void StopAccepting()
+    {
+        lock (_sessionLock)
+        {
+            _acceptingEvents = false;
+        }
+    }
+
+    /// <summary>
+    /// Runs the whole shutdown sequence in a fixed order, with each step isolated so an
+    /// earlier failure can never skip a later one:
+    ///
+    ///   stop source → complete writer → await consumer → dispose CTS → clear fields
+    ///
+    /// The consumer is always awaited before its cancellation source is disposed, so no
+    /// background task is ever orphaned and no task exception is left unobserved. This
+    /// method does not throw; it returns every failure it collected.
+    /// </summary>
+    private async Task<IReadOnlyList<PipelineFailure>> ReleasePipelineAsync()
+    {
+        var failures = new List<PipelineFailure>(2);
+        var consumer = _consumer;
+        var queue = _queue;
+
+        try
+        {
+            try
+            {
+                await _source.StopAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception exception)
+            {
+                failures.Add(new PipelineFailure(
+                    "live_source_stop_failed",
+                    "subscribe",
+                    exception));
+            }
+
+            // Unconditional: the writer must be completed even if stopping the source
+            // failed, otherwise the consumer would never observe the end of the stream.
+            try
+            {
+                queue?.Writer.TryComplete();
+            }
+            catch (Exception exception)
+            {
+                failures.Add(new PipelineFailure(
+                    "live_queue_complete_failed",
+                    "queue",
+                    exception));
+            }
+
+            // Unconditional: awaiting the consumer both drains the queue and observes
+            // any exception the consumer produced.
+            if (consumer is not null)
+            {
+                try
+                {
+                    await consumer.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (Exception exception)
+                {
+                    failures.Add(new PipelineFailure(
+                        "live_consumer_failed",
+                        "parse",
+                        exception));
+                }
+            }
+        }
+        finally
+        {
+            // Only now, with the consumer finished, is it safe to dispose the token
+            // source it was using.
+            _consumerCts?.Dispose();
+            _consumerCts = null;
+            _consumer = null;
+            _queue = null;
+            _subscription = null;
+        }
+
+        return failures;
+    }
+
+    private async Task ConsumeAsync(
+        ChannelReader<LiveEventRecord> reader,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (var record in reader
+                .ReadAllAsync(cancellationToken)
+                .ConfigureAwait(false))
+            {
+                Interlocked.Decrement(ref _queueDepth);
+                try
+                {
+                    Classify(record);
+                }
+                catch (Exception exception)
+                {
+                    // Defensive net only: Classify already counts every record exactly
+                    // once and is not expected to throw. Counting again here would break
+                    // the balance invariant, so this records the anomaly and moves on.
+                    AddDiagnostic(
+                        "live_event_processing_failed",
+                        exception.Message,
+                        ImportDiagnosticSeverity.Error,
+                        "parse");
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Classifies one record. Guarantees exactly one count on every path and never
+    /// throws, so a single bad record can never stop the consumer or unbalance the
+    /// counters. Observer notifications are deliberately outside the counting scope.
+    /// </summary>
+    private void Classify(LiveEventRecord record)
+    {
+        LiveEventOutcome outcome;
+        string? detail = null;
+        try
+        {
+            var result = _parser.Parse(record.RawXml);
+            if (result.Error is not null)
+            {
+                if (result.Error.Code == ParseErrorCode.UnsupportedEvent)
+                {
+                    outcome = LiveEventOutcome.Ignored;
+                    detail = result.Error.Message;
+                    Count(counters => counters with { Ignored = counters.Ignored + 1 });
+                }
+                else
+                {
+                    outcome = LiveEventOutcome.Error;
+                    detail = result.Error.Message;
+                    Count(counters => counters with { Error = counters.Error + 1 });
+                    AddDiagnostic(
+                        $"live_parse_{result.Error.Code.ToString().ToLowerInvariant()}",
+                        result.Error.Message,
+                        ImportDiagnosticSeverity.Error,
+                        "parse");
+                }
+            }
+            else if (!MatchesSubscribedSource(
+                _subscription,
+                record,
+                result.RawEvent,
+                out var mismatch))
+            {
+                // The XML disagrees with the channel it arrived on. Fail closed: no
+                // classification is produced and the record is counted as an error.
+                outcome = LiveEventOutcome.Error;
+                detail = mismatch;
+                Count(counters => counters with { Error = counters.Error + 1 });
+                AddDiagnostic(
+                    "live_event_source_mismatch",
+                    mismatch,
+                    ImportDiagnosticSeverity.Error,
+                    "parse");
+            }
+            else if (result.DeleteEvent is not null)
+            {
+                outcome = LiveEventOutcome.DeleteFact;
+                Count(counters => counters with { DeleteFact = counters.DeleteFact + 1 });
+            }
+            else if (result.ProcessContext is not null)
+            {
+                // Sysmon 1 is enrichment only; it never establishes a delete fact.
+                outcome = LiveEventOutcome.ProcessContext;
+                Count(counters => counters with
+                {
+                    ProcessContext = counters.ProcessContext + 1
+                });
+            }
+            else if (result.SecurityEvidence is not null)
+            {
+                outcome = LiveEventOutcome.SecurityEvidence;
+                Count(counters => counters with
+                {
+                    SecurityEvidence = counters.SecurityEvidence + 1
+                });
+            }
+            else
+            {
+                // Parsed cleanly but establishes nothing, e.g. a 4663 without
+                // DELETE / DELETE_CHILD access.
+                outcome = LiveEventOutcome.Ignored;
+                Count(counters => counters with { Ignored = counters.Ignored + 1 });
+            }
+        }
+        catch (Exception exception)
+        {
+            outcome = LiveEventOutcome.Error;
+            detail = exception.Message;
+            Count(counters => counters with { Error = counters.Error + 1 });
+            AddDiagnostic(
+                "live_event_processing_failed",
+                exception.Message,
+                ImportDiagnosticSeverity.Error,
+                "parse");
+        }
+
+        NotifyClassified(new LiveEventClassification(
+            record,
+            outcome,
+            outcome == LiveEventOutcome.DeleteFact,
+            detail is null ? null : LiveMonitoringLimits.TruncateMessage(detail)));
+    }
+
+    /// <summary>
+    /// Publishes a classification to observers. Each subscriber is invoked separately so
+    /// a throwing one cannot suppress the subscribers registered after it, and no
+    /// observer failure changes a count — the balance invariant survives it.
+    /// </summary>
+    private void NotifyClassified(LiveEventClassification classification)
+    {
+        var handlers = EventClassified;
+        if (handlers is not null)
+        {
+            foreach (var handler in handlers.GetInvocationList())
+            {
+                try
+                {
+                    ((EventHandler<LiveEventClassification>)handler)(this, classification);
+                }
+                catch (Exception exception)
+                {
+                    AddDiagnostic(
+                        "live_classification_observer_failed",
+                        exception.Message,
+                        ImportDiagnosticSeverity.Warning,
+                        "parse");
+                }
+            }
+        }
+
+        RaiseSnapshotChanged();
+    }
+
+    /// <summary>
+    /// Cross-checks the channel the record arrived on against the provider and event ID
+    /// the XML itself claims. A forged EventID inside the XML cannot smuggle an event
+    /// past the subscription's constraints. Fails closed on missing inputs.
+    /// </summary>
+    internal static bool MatchesSubscribedSource(
+        LiveEventSubscription? subscription,
+        LiveEventRecord record,
+        RawWindowsEvent? rawEvent,
+        out string mismatch)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        mismatch = string.Empty;
+
+        if (subscription is null)
+        {
+            mismatch =
+                "No active subscription is available to validate the record's origin.";
+            return false;
+        }
+
+        if (rawEvent is null)
+        {
+            mismatch = "The parsed event carries no identifiable origin.";
+            return false;
+        }
+
+        var channel = subscription.Find(record.ChannelName);
+        if (channel is null)
+        {
+            mismatch =
+                $"Record arrived on unsubscribed channel '{record.ChannelName}'.";
+            return false;
+        }
+
+        if (!channel.Accepts(rawEvent.ProviderName, rawEvent.EventId))
+        {
+            mismatch =
+                $"Channel '{channel.ChannelName}' does not accept provider "
+                + $"'{rawEvent.ProviderName ?? "(none)"}' with event ID {rawEvent.EventId}.";
+            return false;
+        }
+
+        if (rawEvent.ChannelName is not null
+            && !string.Equals(
+                rawEvent.ChannelName,
+                channel.ChannelName,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            mismatch =
+                $"XML channel '{rawEvent.ChannelName}' does not match delivery channel "
+                + $"'{channel.ChannelName}'.";
+            return false;
+        }
+
+        if (record.ProviderName is not null
+            && !string.Equals(
+                record.ProviderName,
+                channel.ExpectedProviderName,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            mismatch =
+                $"Record provider '{record.ProviderName}' does not match the expected "
+                + $"provider for '{channel.ChannelName}'.";
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Runs on the event delivery thread; must never block. Accepting a record and
+    /// enqueuing it stay atomic under the session lock so that Received and the
+    /// classification buckets can never disagree; see CreateQueueOptions for why that is
+    /// safe with respect to consumer continuations.
+    /// </summary>
+    private void OnRecordReceived(int generation, LiveEventRecord record)
+    {
+        var length = record.RawXml.Length;
+        var oversized = length > LiveMonitoringLimits.MaxEventXmlCharacters;
+
+        lock (_sessionLock)
+        {
+            if (generation != _generation || !_acceptingEvents)
+            {
+                // A late callback from a torn-down watcher, or an event that arrived
+                // after this session stopped accepting. It belongs to no live session,
+                // so it changes no session count and is never reported as a queue drop.
+                _counters = _counters with
+                {
+                    LateDiscarded = _counters.LateDiscarded + 1
+                };
+                return;
+            }
+
+            _counters = _counters with { Received = _counters.Received + 1 };
+
+            if (oversized)
+            {
+                _counters = _counters with { Error = _counters.Error + 1 };
+                AddDiagnosticCore(
+                    "live_event_xml_too_large",
+                    $"An event's XML is {length} UTF-16 code units, above the "
+                    + $"{LiveMonitoringLimits.MaxEventXmlCharacters} limit; it was not queued or parsed.",
+                    ImportDiagnosticSeverity.Error,
+                    "queue");
+                return;
+            }
+
+            // Accepting is still true here, so the writer is still open: a false result
+            // means the bounded queue is genuinely full.
+            if (_queue is not null && _queue.Writer.TryWrite(record))
+            {
+                Interlocked.Increment(ref _queueDepth);
+            }
+            else
+            {
+                _counters = _counters with { Dropped = _counters.Dropped + 1 };
+                if (!_queueOverflowReported)
+                {
+                    _queueOverflowReported = true;
+                    _lastError =
+                        $"事件队列已满（容量 {_options.QueueCapacity}），部分事件已被丢弃。";
+                    AddDiagnosticCore(
+                        "live_queue_overflow",
+                        $"The bounded queue reached its capacity of {_options.QueueCapacity}; records are being dropped.",
+                        ImportDiagnosticSeverity.Warning,
+                        "queue");
+                }
+            }
+        }
+
+        RaiseSnapshotChanged();
+    }
+
+    /// <summary>
+    /// A source fault stops the session for good. Everything that decides the persisted
+    /// outcome happens inside the session lock; the teardown runs off the delivery thread
+    /// so the watcher never disposes itself from its own callback, and the task is
+    /// tracked so its exceptions are observed by Stop/Dispose.
+    /// </summary>
+    private void OnSourceFault(int generation, string code, string message)
+    {
+        lock (_sessionLock)
+        {
+            if (generation != _generation)
+            {
+                // A stale watcher: it cannot mark a newer session as faulted.
+                return;
+            }
+
+            if (_faultShutdown is not null)
+            {
+                // A second channel faulting: record it, but the session is already
+                // being completed exactly once.
+                AddDiagnosticCore(code, message, ImportDiagnosticSeverity.Error, "receive");
+                return;
+            }
+
+            _acceptingEvents = false;
+            _sessionFaulted = true;
+            _lastError = LiveMonitoringLimits.TruncateMessage(message);
+            AddDiagnosticCore(code, message, ImportDiagnosticSeverity.Error, "receive");
+            _faultShutdown = Task.Run(HandleFaultAsync, CancellationToken.None);
+        }
+
+        // UI only; the persisted final state never reads this field.
+        SetState(LiveMonitoringState.Error);
+    }
+
+    private async Task HandleFaultAsync()
+    {
+        await _transitionGate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            if (_completionStarted)
+            {
+                return;
+            }
+
+            await CompleteSessionAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            _transitionGate.Release();
+        }
+    }
+
+    private async Task ObserveFaultShutdownAsync()
+    {
+        Task? faultShutdown;
+        lock (_sessionLock)
+        {
+            faultShutdown = _faultShutdown;
+        }
+
+        if (faultShutdown is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await faultShutdown.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception exception) when (IsExpectedFailure(exception))
+        {
+        }
+    }
+
+    private async Task PersistSessionAsync(
+        LiveMonitoringState finalState,
+        Counters counters,
+        IReadOnlyList<LiveMonitoringDiagnostic> diagnostics,
+        CancellationToken cancellationToken)
+    {
+        if (_liveSessionId is null)
+        {
+            return;
+        }
+
+        var value = counters.ToDomain();
+        if (!value.IsBalanced)
+        {
+            // Never lose a session silently: surface the inconsistency instead.
+            var message =
+                $"监控会话计数不一致（接收 {value.Received}，已分类 {value.Parsed}，"
+                + $"忽略 {value.Ignored}，错误 {value.Error}，丢弃 {value.Dropped}），未能保存会话摘要。";
+            SetLastError(message);
+            AddDiagnostic(
+                "live_session_counters_unbalanced",
+                message,
+                ImportDiagnosticSeverity.Error,
+                "persist");
+            return;
+        }
+
+        var session = new LiveMonitoringSession(
+            _liveSessionId,
+            _startedUtc,
+            _timeProvider.GetUtcNow(),
+            _channelStatuses,
+            value,
+            finalState,
+            _options.QueueCapacity,
+            _options.ApplicationVersion);
+
+        try
+        {
+            // One attempt only: a failed write is reported, never retried in a loop.
+            await _repository
+                .SaveSessionAsync(session, diagnostics, cancellationToken)
+                .ConfigureAwait(false);
+            _persisted = true;
+        }
+        catch (Exception exception) when (IsExpectedFailure(exception))
+        {
+            SetLastError(
+                $"监控会话未能写入数据库：{LiveMonitoringLimits.TruncateMessage(exception.Message)}");
+            AddDiagnostic(
+                "live_session_persist_failed",
+                exception.Message,
+                ImportDiagnosticSeverity.Error,
+                "persist");
+        }
+    }
+
+    private void BeginSession()
+    {
+        lock (_sessionLock)
+        {
+            _generation++;
+            _counters = Counters.Empty;
+            _diagnostics.Clear();
+            _queueOverflowReported = false;
+            _acceptingEvents = false;
+            _sessionFaulted = false;
+            _lastError = null;
+            _faultShutdown = null;
+        }
+
+        _completionStarted = false;
+        _lifecycleCompleted = false;
+        _persisted = false;
+        _liveSessionId = Guid.NewGuid().ToString("D");
+        _startedUtc = _timeProvider.GetUtcNow();
+        Interlocked.Exchange(ref _queueDepth, 0);
+    }
+
+    private bool SessionFaulted()
+    {
+        lock (_sessionLock)
+        {
+            return _sessionFaulted;
+        }
+    }
+
+    private void MarkFaulted(string message)
+    {
+        lock (_sessionLock)
+        {
+            _sessionFaulted = true;
+            _lastError = LiveMonitoringLimits.TruncateMessage(message);
+        }
+    }
+
+    private void SetLastError(string message)
+    {
+        lock (_sessionLock)
+        {
+            _lastError = LiveMonitoringLimits.TruncateMessage(message);
+        }
+    }
+
+    private void Count(Func<Counters, Counters> update)
+    {
+        lock (_sessionLock)
+        {
+            _counters = update(_counters);
+        }
+    }
+
+    private void AddDiagnostic(
+        string code,
+        string message,
+        ImportDiagnosticSeverity severity,
+        string stage)
+    {
+        lock (_sessionLock)
+        {
+            AddDiagnosticCore(code, message, severity, stage);
+        }
+    }
+
+    /// <summary>
+    /// Retains the first <see cref="LiveMonitoringLimits.MaxDiagnostics"/> real
+    /// diagnostics untouched. Beyond that, nothing is added and nothing already retained
+    /// is overwritten; the surplus is only counted. Must be called with
+    /// <see cref="_sessionLock"/> held.
+    /// </summary>
+    private void AddDiagnosticCore(
+        string code,
+        string message,
+        ImportDiagnosticSeverity severity,
+        string stage)
+    {
+        if (_diagnostics.Count >= LiveMonitoringLimits.MaxDiagnostics)
+        {
+            _counters = _counters with
+            {
+                SuppressedDiagnostics = _counters.SuppressedDiagnostics + 1
+            };
+            return;
+        }
+
+        _diagnostics.Add(new LiveMonitoringDiagnostic(
+            code,
+            LiveMonitoringLimits.TruncateMessage(message),
+            severity,
+            stage,
+            _timeProvider.GetUtcNow()));
+    }
+
+    private void SetState(LiveMonitoringState state)
+    {
+        _state = state;
+        RaiseSnapshotChanged();
+    }
+
+    private LiveMonitoringSnapshot CreateSnapshot()
+    {
+        Counters counters;
+        string? lastError;
+        lock (_sessionLock)
+        {
+            counters = _counters;
+            lastError = _lastError;
+        }
+
+        return new LiveMonitoringSnapshot(
+            _state,
+            _channelStatuses,
+            counters.ToDomain(),
+            _options.QueueCapacity,
+            Volatile.Read(ref _queueDepth),
+            lastError,
+            _liveSessionId);
+    }
+
+    /// <summary>
+    /// Publishes a snapshot to observers, each isolated from the others. This also runs
+    /// on the watcher delivery thread, so a throwing subscriber must never be allowed to
+    /// escape into the event log callback.
+    /// </summary>
+    private void RaiseSnapshotChanged()
+    {
+        var handlers = SnapshotChanged;
+        if (handlers is null)
+        {
+            return;
+        }
+
+        var snapshot = CreateSnapshot();
+        foreach (var handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                ((EventHandler<LiveMonitoringSnapshot>)handler)(this, snapshot);
+            }
+            catch (Exception exception)
+            {
+                AddDiagnostic(
+                    "live_snapshot_observer_failed",
+                    exception.Message,
+                    ImportDiagnosticSeverity.Warning,
+                    "receive");
+            }
+        }
+    }
+
+    private static string ToDiagnosticSuffix(LiveChannelAvailability availability) =>
+        availability switch
+        {
+            LiveChannelAvailability.Unavailable => "unavailable",
+            LiveChannelAvailability.AccessDenied => "access_denied",
+            LiveChannelAvailability.Disabled => "disabled",
+            _ => "unknown_error"
+        };
+
+    private static bool IsExpectedFailure(Exception exception) =>
+        exception is InvalidOperationException
+            or ArgumentException
+            or IOException
+            or UnauthorizedAccessException
+            or System.Data.Common.DbException;
+
+    /// <summary>One named shutdown-step failure; failures never overwrite each other.</summary>
+    private readonly record struct PipelineFailure(
+        string Code,
+        string Stage,
+        Exception Exception);
+
+    /// <summary>Immutable count set; only ever replaced under <see cref="_sessionLock"/>.</summary>
+    private readonly record struct Counters(
+        long Received,
+        long DeleteFact,
+        long ProcessContext,
+        long SecurityEvidence,
+        long Ignored,
+        long Error,
+        long Dropped,
+        long LateDiscarded,
+        long SuppressedDiagnostics)
+    {
+        public static Counters Empty { get; }
+
+        public LiveMonitoringCounters ToDomain() =>
+            new(
+                Received,
+                DeleteFact,
+                ProcessContext,
+                SecurityEvidence,
+                Ignored,
+                Error,
+                Dropped,
+                LateDiscarded,
+                SuppressedDiagnostics);
+    }
+
+    private sealed class Sink(LiveMonitoringService owner, int generation) : ILiveEventSink
+    {
+        public void Publish(LiveEventRecord record)
+        {
+            ArgumentNullException.ThrowIfNull(record);
+            owner.OnRecordReceived(generation, record);
+        }
+
+        public void Report(LiveMonitoringDiagnostic diagnostic)
+        {
+            ArgumentNullException.ThrowIfNull(diagnostic);
+            lock (owner._sessionLock)
+            {
+                if (generation != owner._generation)
+                {
+                    return;
+                }
+
+                owner.AddDiagnosticCore(
+                    diagnostic.Code,
+                    diagnostic.Message,
+                    diagnostic.Severity,
+                    diagnostic.Stage);
+            }
+        }
+
+        public void Fault(string code, string message) =>
+            owner.OnSourceFault(generation, code, message);
+    }
+}

@@ -1,0 +1,617 @@
+<Window x:Class="DeleteAudit.Viewer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:viewer="clr-namespace:DeleteAudit.Viewer"
+        Title="DeleteAudit — 离线查看器"
+        Height="760"
+        Width="1240"
+        MinHeight="620"
+        MinWidth="980">
+    <Window.Resources>
+        <viewer:UnknownValueConverter x:Key="UnknownValue" />
+        <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+
+        <Style x:Key="VirtualizedDataGrid" TargetType="{x:Type DataGrid}">
+            <Setter Property="AutoGenerateColumns" Value="False" />
+            <Setter Property="CanUserAddRows" Value="False" />
+            <Setter Property="EnableColumnVirtualization" Value="True" />
+            <Setter Property="EnableRowVirtualization" Value="True" />
+            <Setter Property="HeadersVisibility" Value="Column" />
+            <Setter Property="IsReadOnly" Value="True" />
+            <Setter Property="ScrollViewer.CanContentScroll" Value="True" />
+            <Setter Property="ScrollViewer.IsDeferredScrollingEnabled" Value="True" />
+            <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True" />
+            <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling" />
+        </Style>
+
+        <Style x:Key="FilterLabel" TargetType="{x:Type TextBlock}">
+            <Setter Property="Margin" Value="0,0,6,0" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+
+        <Style x:Key="ErrorText" TargetType="{x:Type TextBlock}">
+            <Setter Property="Foreground" Value="#B42318" />
+            <Setter Property="Margin" Value="0,6,0,6" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+        </Style>
+
+        <Style x:Key="MetricBorder" TargetType="{x:Type Border}">
+            <Setter Property="Background" Value="#F5F7FA" />
+            <Setter Property="BorderBrush" Value="#D0D5DD" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="4" />
+            <Setter Property="Margin" Value="4" />
+            <Setter Property="Padding" Value="12" />
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0"
+                Background="#FFF4CC"
+                BorderBrush="#EAAA08"
+                BorderThickness="0,0,0,1"
+                Padding="12,9">
+            <TextBlock FontWeight="SemiBold"
+                       Foreground="#7A2E0E"
+                       Text="{Binding BannerMessage}" />
+        </Border>
+
+        <DockPanel Grid.Row="1" Margin="12,8">
+            <TextBlock DockPanel.Dock="Left"
+                       FontWeight="SemiBold"
+                       Text="{Binding DatabaseStatusMessage}" />
+            <TextBlock Margin="16,0,0,0"
+                       Foreground="#B42318"
+                       Text="{Binding ErrorMessage}" />
+        </DockPanel>
+
+        <TabControl Grid.Row="2"
+                    Margin="12,0,12,12"
+                    SelectedIndex="{Binding SelectedPageIndex, Mode=TwoWay}">
+            <TabItem Header="Dashboard">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="12">
+                        <UniformGrid Columns="4">
+                            <Border Style="{StaticResource MetricBorder}">
+                                <StackPanel>
+                                    <TextBlock Text="导入次数" />
+                                    <TextBlock FontSize="26"
+                                               FontWeight="SemiBold"
+                                               Text="{Binding Dashboard.Summary.ImportCount}" />
+                                </StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource MetricBorder}">
+                                <StackPanel>
+                                    <TextBlock Text="删除会话" />
+                                    <TextBlock FontSize="26"
+                                               FontWeight="SemiBold"
+                                               Text="{Binding Dashboard.Summary.DeleteSessionCount}" />
+                                </StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource MetricBorder}">
+                                <StackPanel>
+                                    <TextBlock Text="删除事件" />
+                                    <TextBlock FontSize="26"
+                                               FontWeight="SemiBold"
+                                               Text="{Binding Dashboard.Summary.DeleteEventCount}" />
+                                </StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource MetricBorder}">
+                                <StackPanel>
+                                    <TextBlock Text="Warning 会话" />
+                                    <TextBlock FontSize="26"
+                                               FontWeight="SemiBold"
+                                               Text="{Binding Dashboard.Summary.WarningSessionCount}" />
+                                </StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource MetricBorder}">
+                                <StackPanel>
+                                    <TextBlock Text="Critical 会话" />
+                                    <TextBlock FontSize="26"
+                                               FontWeight="SemiBold"
+                                               Text="{Binding Dashboard.Summary.CriticalSessionCount}" />
+                                </StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource MetricBorder}">
+                                <StackPanel>
+                                    <TextBlock Text="Warning 诊断" />
+                                    <TextBlock FontSize="26"
+                                               FontWeight="SemiBold"
+                                               Text="{Binding Dashboard.Summary.WarningDiagnosticCount}" />
+                                </StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource MetricBorder}">
+                                <StackPanel>
+                                    <TextBlock Text="Error 诊断" />
+                                    <TextBlock FontSize="26"
+                                               FontWeight="SemiBold"
+                                               Text="{Binding Dashboard.Summary.ErrorDiagnosticCount}" />
+                                </StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource MetricBorder}">
+                                <StackPanel>
+                                    <TextBlock Text="最近导入（UTC）" />
+                                    <TextBlock FontSize="14"
+                                               FontWeight="SemiBold"
+                                               Text="{Binding Dashboard.Summary.LastImportStartedUtc, Converter={StaticResource UnknownValue}}" />
+                                </StackPanel>
+                            </Border>
+                        </UniformGrid>
+
+                        <StackPanel Margin="4,18,4,0"
+                                    Orientation="Horizontal">
+                            <Button Command="{Binding Dashboard.ImportCommand}"
+                                    Content="选择单个 XML / EVTX 并导入"
+                                    Padding="14,8" />
+                            <Button Command="{Binding Dashboard.RefreshCommand}"
+                                    Content="刷新"
+                                    Margin="8,0,0,0"
+                                    Padding="14,8" />
+                        </StackPanel>
+                        <TextBlock Margin="4,10,4,0"
+                                   Text="{Binding Dashboard.LastImportStatus}" />
+                        <TextBlock Style="{StaticResource ErrorText}"
+                                   Text="{Binding Dashboard.ErrorMessage}" />
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <TabItem Header="Import History">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <WrapPanel Grid.Row="0" Margin="0,0,0,8">
+                        <TextBlock Style="{StaticResource FilterLabel}" Text="状态" />
+                        <TextBox Width="130"
+                                 Text="{Binding ImportHistory.Status, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="起始 UTC" />
+                        <TextBox Width="190"
+                                 Text="{Binding ImportHistory.FromUtcText, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="结束 UTC" />
+                        <TextBox Width="190"
+                                 Text="{Binding ImportHistory.ToUtcText, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="来源路径" />
+                        <TextBox Width="180"
+                                 Text="{Binding ImportHistory.SourcePathContains, UpdateSourceTrigger=PropertyChanged}" />
+                        <Button Command="{Binding ImportHistory.ApplyFiltersCommand}"
+                                Content="筛选"
+                                Margin="8,0,0,0"
+                                Padding="10,4" />
+                    </WrapPanel>
+                    <TextBlock Grid.Row="1"
+                               Style="{StaticResource ErrorText}"
+                               Text="{Binding ImportHistory.ErrorMessage}" />
+                    <DataGrid Grid.Row="2"
+                              ItemsSource="{Binding ImportHistory.Items}"
+                              Style="{StaticResource VirtualizedDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="开始 UTC" Binding="{Binding StartedUtc}" />
+                            <DataGridTextColumn Header="文件" Binding="{Binding OriginalFileName}" />
+                            <DataGridTextColumn Header="类型" Binding="{Binding SourceKind}" />
+                            <DataGridTextColumn Header="状态" Binding="{Binding Status}" />
+                            <DataGridTextColumn Header="总数" Binding="{Binding TotalRecordCount}" />
+                            <DataGridTextColumn Header="成功" Binding="{Binding SuccessRecordCount}" />
+                            <DataGridTextColumn Header="忽略" Binding="{Binding IgnoredRecordCount}" />
+                            <DataGridTextColumn Header="错误" Binding="{Binding ErrorRecordCount}" />
+                            <DataGridTextColumn Header="输出状态" Binding="{Binding OutputStatus, Converter={StaticResource UnknownValue}}" />
+                            <DataGridTextColumn Header="来源路径" Binding="{Binding NormalizedSourcePath}" Width="*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                    <DockPanel Grid.Row="3" Margin="0,8,0,0">
+                        <TextBlock VerticalAlignment="Center"
+                                   Text="{Binding ImportHistory.PageStatus}" />
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <Button Command="{Binding ImportHistory.PreviousPageCommand}"
+                                    Content="上一页"
+                                    Padding="10,4" />
+                            <Button Command="{Binding ImportHistory.NextPageCommand}"
+                                    Content="下一页"
+                                    Margin="8,0,0,0"
+                                    Padding="10,4" />
+                        </StackPanel>
+                    </DockPanel>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="Delete Sessions">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <WrapPanel Grid.Row="0" Margin="0,0,0,8">
+                        <TextBlock Style="{StaticResource FilterLabel}" Text="风险" />
+                        <ComboBox Width="115"
+                                  DisplayMemberPath="Label"
+                                  ItemsSource="{Binding DeleteSessions.RiskOptions}"
+                                  SelectedValue="{Binding DeleteSessions.SelectedRisk, Mode=TwoWay}"
+                                  SelectedValuePath="Value" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="起始 UTC" />
+                        <TextBox Width="170" Text="{Binding DeleteSessions.FromUtcText}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="结束 UTC" />
+                        <TextBox Width="170" Text="{Binding DeleteSessions.ToUtcText}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="路径" />
+                        <TextBox Width="150" Text="{Binding DeleteSessions.PathContains}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="进程" />
+                        <TextBox Width="150" Text="{Binding DeleteSessions.ProcessContains}" />
+                        <Button Command="{Binding DeleteSessions.ApplyFiltersCommand}"
+                                Content="筛选"
+                                Margin="8,0,0,0"
+                                Padding="10,4" />
+                    </WrapPanel>
+                    <TextBlock Grid.Row="1"
+                               Style="{StaticResource ErrorText}"
+                               Text="{Binding DeleteSessions.ErrorMessage}" />
+                    <DataGrid Grid.Row="2"
+                              ItemsSource="{Binding DeleteSessions.Items}"
+                              Style="{StaticResource VirtualizedDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="最后事件 UTC" Binding="{Binding LastEventUtc}" />
+                            <DataGridTextColumn Header="风险" Binding="{Binding RiskLevel}" />
+                            <DataGridTextColumn Header="确认项" Binding="{Binding ConfirmedItemCount}" />
+                            <DataGridTextColumn Header="保护项" Binding="{Binding ProtectedItemCount}" />
+                            <DataGridTextColumn Header="路径范围" Binding="{Binding PathScope, Converter={StaticResource UnknownValue}}" Width="*" />
+                            <DataGridTextColumn Header="进程" Binding="{Binding ProcessIdentity, Converter={StaticResource UnknownValue}}" />
+                            <DataGridTextColumn Header="PID" Binding="{Binding ProcessId, Converter={StaticResource UnknownValue}}" />
+                            <DataGridTextColumn Header="用户 SID" Binding="{Binding UserSid, Converter={StaticResource UnknownValue}}" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                    <DockPanel Grid.Row="3" Margin="0,8,0,0">
+                        <TextBlock VerticalAlignment="Center"
+                                   Text="{Binding DeleteSessions.PageStatus}" />
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <Button Command="{Binding DeleteSessions.PreviousPageCommand}"
+                                    Content="上一页"
+                                    Padding="10,4" />
+                            <Button Command="{Binding DeleteSessions.NextPageCommand}"
+                                    Content="下一页"
+                                    Margin="8,0,0,0"
+                                    Padding="10,4" />
+                        </StackPanel>
+                    </DockPanel>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="Delete Events">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <WrapPanel Grid.Row="0" Margin="0,0,0,8">
+                        <TextBlock Style="{StaticResource FilterLabel}" Text="风险" />
+                        <ComboBox Width="115"
+                                  DisplayMemberPath="Label"
+                                  ItemsSource="{Binding DeleteEvents.RiskOptions}"
+                                  SelectedValue="{Binding DeleteEvents.SelectedRisk, Mode=TwoWay}"
+                                  SelectedValuePath="Value" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="起始 UTC" />
+                        <TextBox Width="170" Text="{Binding DeleteEvents.FromUtcText}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="结束 UTC" />
+                        <TextBox Width="170" Text="{Binding DeleteEvents.ToUtcText}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="路径" />
+                        <TextBox Width="150" Text="{Binding DeleteEvents.PathContains}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="进程" />
+                        <TextBox Width="150" Text="{Binding DeleteEvents.ProcessContains}" />
+                        <Button Command="{Binding DeleteEvents.ApplyFiltersCommand}"
+                                Content="筛选"
+                                Margin="8,0,0,0"
+                                Padding="10,4" />
+                    </WrapPanel>
+                    <TextBlock Grid.Row="1"
+                               Style="{StaticResource ErrorText}"
+                               Text="{Binding DeleteEvents.ErrorMessage}" />
+                    <DataGrid Grid.Row="2"
+                              ItemsSource="{Binding DeleteEvents.Items}"
+                              SelectedItem="{Binding DeleteEvents.SelectedItem, Mode=TwoWay}"
+                              Style="{StaticResource VirtualizedDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="发生 UTC" Binding="{Binding OccurredUtc}" />
+                            <DataGridTextColumn Header="风险" Binding="{Binding RiskLevel}" />
+                            <DataGridTextColumn Header="事件 ID" Binding="{Binding SourceEventId}" />
+                            <DataGridTextColumn Header="路径" Binding="{Binding FullPath, Converter={StaticResource UnknownValue}}" Width="*" />
+                            <DataGridTextColumn Header="对象" Binding="{Binding ObjectKind, Converter={StaticResource UnknownValue}}" />
+                            <DataGridTextColumn Header="进程" Binding="{Binding ProcessPath, Converter={StaticResource UnknownValue}}" />
+                            <DataGridTextColumn Header="PID" Binding="{Binding ProcessId, Converter={StaticResource UnknownValue}}" />
+                            <DataGridTextColumn Header="用户" Binding="{Binding UserName, Converter={StaticResource UnknownValue}}" />
+                            <DataGridTextColumn Header="归因%" Binding="{Binding AttributionConfidence}" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                    <DockPanel Grid.Row="3" Margin="0,8,0,0">
+                        <StackPanel DockPanel.Dock="Left" Orientation="Horizontal">
+                            <Button Command="{Binding DeleteEvents.OpenRawXmlCommand}"
+                                    Content="查看只读 Raw XML"
+                                    Padding="10,4" />
+                            <TextBlock Margin="12,0,0,0"
+                                       VerticalAlignment="Center"
+                                       Text="{Binding DeleteEvents.PageStatus}" />
+                        </StackPanel>
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <Button Command="{Binding DeleteEvents.PreviousPageCommand}"
+                                    Content="上一页"
+                                    Padding="10,4" />
+                            <Button Command="{Binding DeleteEvents.NextPageCommand}"
+                                    Content="下一页"
+                                    Margin="8,0,0,0"
+                                    Padding="10,4" />
+                        </StackPanel>
+                    </DockPanel>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="Diagnostics">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <WrapPanel Grid.Row="0" Margin="0,0,0,8">
+                        <TextBlock Style="{StaticResource FilterLabel}" Text="级别" />
+                        <ComboBox Width="120"
+                                  DisplayMemberPath="Label"
+                                  ItemsSource="{Binding Diagnostics.SeverityOptions}"
+                                  SelectedValue="{Binding Diagnostics.SelectedSeverity, Mode=TwoWay}"
+                                  SelectedValuePath="Value" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="起始 UTC" />
+                        <TextBox Width="180" Text="{Binding Diagnostics.FromUtcText}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="结束 UTC" />
+                        <TextBox Width="180" Text="{Binding Diagnostics.ToUtcText}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="文本" />
+                        <TextBox Width="220" Text="{Binding Diagnostics.TextContains}" />
+                        <Button Command="{Binding Diagnostics.ApplyFiltersCommand}"
+                                Content="筛选"
+                                Margin="8,0,0,0"
+                                Padding="10,4" />
+                    </WrapPanel>
+                    <TextBlock Grid.Row="1"
+                               Style="{StaticResource ErrorText}"
+                               Text="{Binding Diagnostics.ErrorMessage}" />
+                    <DataGrid Grid.Row="2"
+                              ItemsSource="{Binding Diagnostics.Items}"
+                              Style="{StaticResource VirtualizedDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="发生 UTC" Binding="{Binding OccurredUtc}" />
+                            <DataGridTextColumn Header="级别" Binding="{Binding Severity}" />
+                            <DataGridTextColumn Header="阶段" Binding="{Binding Stage}" />
+                            <DataGridTextColumn Header="代码" Binding="{Binding Code}" />
+                            <DataGridTextColumn Header="消息" Binding="{Binding Message}" Width="*" />
+                            <DataGridTextColumn Header="记录号" Binding="{Binding RecordOrdinal, Converter={StaticResource UnknownValue}}" />
+                            <DataGridTextColumn Header="文件" Binding="{Binding OriginalFileName}" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                    <DockPanel Grid.Row="3" Margin="0,8,0,0">
+                        <TextBlock VerticalAlignment="Center"
+                                   Text="{Binding Diagnostics.PageStatus}" />
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <Button Command="{Binding Diagnostics.PreviousPageCommand}"
+                                    Content="上一页"
+                                    Padding="10,4" />
+                            <Button Command="{Binding Diagnostics.NextPageCommand}"
+                                    Content="下一页"
+                                    Margin="8,0,0,0"
+                                    Padding="10,4" />
+                        </StackPanel>
+                    </DockPanel>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="Raw XML">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <StackPanel Grid.Row="0" Orientation="Horizontal">
+                        <TextBlock FontWeight="SemiBold"
+                                   Text="只读预览：" />
+                        <TextBlock FontWeight="SemiBold"
+                                   Text="{Binding RawXml.ResourceId}" />
+                    </StackPanel>
+                    <TextBlock Grid.Row="1"
+                               Style="{StaticResource ErrorText}"
+                               Text="{Binding RawXml.ErrorMessage}" />
+                    <Border Grid.Row="2"
+                            Background="#FFF4CC"
+                            BorderBrush="#EAAA08"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Margin="0,0,0,6"
+                            Padding="10,8"
+                            Visibility="{Binding RawXml.IsTruncated, Converter={StaticResource BoolToVisibility}}">
+                        <TextBlock FontWeight="SemiBold"
+                                   Foreground="#7A2E0E"
+                                   Text="{Binding RawXml.TruncationNotice}"
+                                   TextWrapping="Wrap" />
+                    </Border>
+                    <DockPanel Grid.Row="3" Margin="0,0,0,6">
+                        <Button Command="{Binding RawXml.CopyPreviewCommand}"
+                                Content="复制预览"
+                                DockPanel.Dock="Right"
+                                Padding="10,4" />
+                        <TextBlock VerticalAlignment="Center"
+                                   Text="{Binding RawXml.LengthSummary}" />
+                    </DockPanel>
+                    <TextBox Grid.Row="4"
+                             AcceptsReturn="True"
+                             AcceptsTab="True"
+                             FontFamily="Consolas"
+                             FontSize="13"
+                             HorizontalScrollBarVisibility="Auto"
+                             IsReadOnly="True"
+                             Text="{Binding RawXml.PreviewText, Mode=OneWay}"
+                             TextWrapping="NoWrap"
+                             VerticalScrollBarVisibility="Auto" />
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="实时接入预览">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <!-- Row 0 is deliberately outside the ScrollViewer: the persistence
+                         disclosure must stay visible no matter how far the page scrolls. -->
+                    <Border x:Name="LivePersistenceDisclosure"
+                            Grid.Row="0"
+                            Background="#FDECEA"
+                            BorderBrush="#B42318"
+                            BorderThickness="2"
+                            CornerRadius="4"
+                            Margin="12,12,12,0"
+                            Padding="12,10">
+                        <StackPanel>
+                            <TextBlock FontWeight="Bold"
+                                       Foreground="#B42318"
+                                       Text="重要：数据保存范围"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Margin="0,4,0,0"
+                                       Foreground="#B42318"
+                                       Text="{Binding LiveMonitoring.Disclosure}"
+                                       TextWrapping="Wrap" />
+                        </StackPanel>
+                    </Border>
+
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="12">
+                        <Border Background="#FFF4CC"
+                                BorderBrush="#EAAA08"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Padding="10,8">
+                            <TextBlock FontWeight="SemiBold"
+                                       Foreground="#7A2E0E"
+                                       Text="{Binding LiveMonitoring.Disclaimer}"
+                                       TextWrapping="Wrap" />
+                        </Border>
+
+                        <StackPanel Margin="0,14,0,0" Orientation="Horizontal">
+                            <TextBlock FontWeight="SemiBold" Text="当前状态：" />
+                            <TextBlock FontWeight="SemiBold"
+                                       Text="{Binding LiveMonitoring.StateLabel}" />
+                        </StackPanel>
+
+                        <Grid Margin="0,12,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0"
+                                       Grid.Column="0"
+                                       Margin="0,0,10,4"
+                                       Text="Sysmon 通道" />
+                            <TextBlock Grid.Row="0"
+                                       Grid.Column="1"
+                                       Margin="0,0,0,4"
+                                       Text="{Binding LiveMonitoring.SysmonChannelStatus}"
+                                       TextWrapping="Wrap" />
+                            <TextBlock Grid.Row="1"
+                                       Grid.Column="0"
+                                       Margin="0,0,10,0"
+                                       Text="Security 通道" />
+                            <TextBlock Grid.Row="1"
+                                       Grid.Column="1"
+                                       Text="{Binding LiveMonitoring.SecurityChannelStatus}"
+                                       TextWrapping="Wrap" />
+                        </Grid>
+
+                        <StackPanel Margin="0,16,0,0" Orientation="Horizontal">
+                            <Button Command="{Binding LiveMonitoring.ProbeChannelsCommand}"
+                                    Content="检测通道"
+                                    Padding="14,8" />
+                            <Button Command="{Binding LiveMonitoring.StartCommand}"
+                                    Content="开始监控"
+                                    Margin="8,0,0,0"
+                                    Padding="14,8" />
+                            <Button Command="{Binding LiveMonitoring.StopCommand}"
+                                    Content="停止监控"
+                                    Margin="8,0,0,0"
+                                    Padding="14,8" />
+                        </StackPanel>
+
+                        <TextBlock Margin="0,16,0,0"
+                                   Text="{Binding LiveMonitoring.CountersSummary}" />
+                        <TextBlock Margin="0,6,0,0"
+                                   FontWeight="SemiBold"
+                                   Text="{Binding LiveMonitoring.ClassificationSummary}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Margin="0,6,0,0"
+                                   Text="{Binding LiveMonitoring.QueueSummary}" />
+
+                        <Border Background="#FDECEA"
+                                BorderBrush="#B42318"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Margin="0,10,0,0"
+                                Padding="10,8"
+                                Visibility="{Binding LiveMonitoring.HasDropped, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B42318"
+                                       Text="事件队列已满，部分事件被丢弃；丢弃数量见上方统计。"
+                                       TextWrapping="Wrap" />
+                        </Border>
+
+                        <TextBlock Margin="0,10,0,0"
+                                   Style="{StaticResource ErrorText}"
+                                   Text="{Binding LiveMonitoring.LastError}"
+                                   Visibility="{Binding LiveMonitoring.HasLastError, Converter={StaticResource BoolToVisibility}}" />
+                        <TextBlock Style="{StaticResource ErrorText}"
+                                   Text="{Binding LiveMonitoring.ErrorMessage}" />
+                    </StackPanel>
+                </ScrollViewer>
+                </Grid>
+            </TabItem>
+        </TabControl>
+    </Grid>
+</Window>
