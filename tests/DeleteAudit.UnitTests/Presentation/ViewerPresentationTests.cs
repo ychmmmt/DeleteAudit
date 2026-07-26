@@ -2,6 +2,7 @@ using DeleteAudit.Application.Importing;
 using DeleteAudit.Application.Presentation;
 using DeleteAudit.Application.Viewing;
 using DeleteAudit.Domain;
+using DeleteAudit.Infrastructure;
 
 namespace DeleteAudit.UnitTests.Presentation;
 
@@ -82,7 +83,7 @@ public sealed class ViewerPresentationTests
     [Theory]
     [InlineData(@"\\fixture-server\share\offline.xml")]
     [InlineData("//fixture-server/share/offline.evtx")]
-    public async Task DecliningNetworkConfirmationImportsNothingAndReportsNoFailure(
+    public async Task DecliningNetworkConfirmationStopsDeleteAuditWithoutUndoingThePicker(
         string selectedPath)
     {
         var importService = new FakeImportService();
@@ -96,12 +97,52 @@ public sealed class ViewerPresentationTests
         await viewModel.ImportSelectedFileAsync();
 
         Assert.Equal(selectedPath, Assert.Single(confirmation.ConfirmedPaths));
-        // Nothing is imported, so nothing was opened, read or written.
+        // What declining actually stops: DeleteAudit's own import. Nothing is
+        // checked, opened, read or written by this application.
         Assert.Equal(0, importService.CallCount);
         // Same quiet semantics as cancelling the picker: no error surfaces and the
         // status line is untouched.
         Assert.False(viewModel.HasError);
         Assert.Equal("尚未执行导入。", viewModel.LastImportStatus);
+
+        // What declining does NOT stop: the Windows file picker runs first, with
+        // CheckPathExists/CheckFileExists enabled, so Windows may already have
+        // reached the share before this application saw the path. The shipped copy
+        // must say so and must not claim otherwise — an inaccurate promise is a
+        // defect even when the behaviour is correct.
+        var dialog = File.ReadAllText(Path.Combine(
+            RepositoryRoot.Value,
+            "src",
+            "DeleteAudit.Viewer",
+            "NetworkPathConfirmationWindow.xaml"));
+        var readme = File.ReadAllText(Path.Combine(RepositoryRoot.Value, "README.md"));
+
+        foreach (var text in new[] { dialog, readme })
+        {
+            // The picker boundary is disclosed …
+            Assert.Contains("Windows 可能已经连接该共享", text, StringComparison.Ordinal);
+            Assert.Contains("不能撤销", text, StringComparison.Ordinal);
+            // … cancelling is scoped to this application …
+            Assert.Contains("DeleteAudit", text, StringComparison.Ordinal);
+            // … and the retired absolute claims are gone.
+            Assert.DoesNotContain("继续操作会连接这个网络共享", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("不检查文件是否存在", text, StringComparison.Ordinal);
+        }
+
+        // The picker really does pre-check, which is why the wording above matters.
+        var picker = File.ReadAllText(Path.Combine(
+            RepositoryRoot.Value,
+            "src",
+            "DeleteAudit.Viewer",
+            "OpenFileDialogOfflineFilePicker.cs"));
+        Assert.Contains("CheckFileExists = true", picker, StringComparison.Ordinal);
+        Assert.Contains("CheckPathExists = true", picker, StringComparison.Ordinal);
+
+        // The safe default is still the default, and Escape still declines.
+        Assert.Contains("IsDefault=\"True\"", dialog, StringComparison.Ordinal);
+        Assert.Contains("IsCancel=\"True\"", dialog, StringComparison.Ordinal);
+        Assert.Contains("Content=\"取消\"", dialog, StringComparison.Ordinal);
+        Assert.Contains("Content=\"继续导入\"", dialog, StringComparison.Ordinal);
     }
 
     [Fact]
