@@ -36,6 +36,22 @@ jobs:
         with:
           dotnet-version: "8.0.x"
 
+      # The runner image ships newer SDKs alongside the one installed above.
+      # global.json pins resolution to the 8.0 band; this step fails the build
+      # immediately if anything else was selected, so an SDK upgrade on the runner
+      # can never silently change the analyzer baseline again.
+      - name: Verify .NET 8 SDK selection
+        shell: pwsh
+        run: |
+          $selected = dotnet --version
+          Write-Host "dotnet --version : $selected"
+          Write-Host "dotnet --list-sdks:"
+          dotnet --list-sdks
+          if (-not $selected.StartsWith('8.0.')) {
+            Write-Error "Expected the 8.0 SDK band, but '$selected' was selected. Check global.json."
+            exit 1
+          }
+
       - name: Restore
         run: dotnet restore
 

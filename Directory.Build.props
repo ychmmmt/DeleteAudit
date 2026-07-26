@@ -4,7 +4,10 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <!-- Pinned to the .NET 8 rule set so the analyzer baseline cannot drift with the
+         installed SDK. Combined with global.json this keeps local and CI builds
+         byte-for-byte comparable; warnings are still errors. -->
+    <AnalysisLevel>8.0-recommended</AnalysisLevel>
     <Deterministic>true</Deterministic>
   </PropertyGroup>
 </Project>
