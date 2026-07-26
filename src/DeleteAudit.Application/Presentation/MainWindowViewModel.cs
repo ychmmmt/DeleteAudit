@@ -25,7 +25,8 @@ public sealed class MainWindowViewModel : ViewModelBase
         IOfflineFilePicker filePicker,
         IRawXmlPreviewClipboard rawXmlPreviewClipboard,
         ILiveMonitoringService liveMonitoringService,
-        IUiDispatcher uiDispatcher)
+        IUiDispatcher uiDispatcher,
+        INetworkPathImportConfirmation? networkPathConfirmation = null)
     {
         _queryService = queryService
             ?? throw new ArgumentNullException(nameof(queryService));
@@ -45,7 +46,8 @@ public sealed class MainWindowViewModel : ViewModelBase
             queryService,
             importService,
             filePicker,
-            RefreshListsAfterImportAsync);
+            RefreshListsAfterImportAsync,
+            networkPathConfirmation);
     }
 
     public string BannerMessage => _bannerMessage;

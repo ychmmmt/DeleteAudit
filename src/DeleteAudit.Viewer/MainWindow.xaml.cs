@@ -26,7 +26,8 @@ public partial class MainWindow : Window
             new OpenFileDialogOfflineFilePicker(),
             new WpfRawXmlPreviewClipboard(),
             liveMonitoring,
-            new WpfUiDispatcher());
+            new WpfUiDispatcher(),
+            new WpfNetworkPathImportConfirmation(this));
         DataContext = _viewModel;
         Loaded += OnLoaded;
 

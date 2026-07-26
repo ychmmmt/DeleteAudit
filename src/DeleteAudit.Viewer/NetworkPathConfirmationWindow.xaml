@@ -1,0 +1,53 @@
+<Window x:Class="DeleteAudit.Viewer.NetworkPathConfirmationWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="确认从网络共享导入"
+        Width="560"
+        SizeToContent="Height"
+        ResizeMode="NoResize"
+        ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner">
+    <StackPanel Margin="20">
+        <TextBlock Text="即将从网络共享导入"
+                   FontSize="15"
+                   FontWeight="Bold"
+                   Margin="0,0,0,10" />
+        <TextBlock x:Name="NetworkPathText"
+                   TextWrapping="Wrap"
+                   FontFamily="Consolas"
+                   Margin="0,0,0,14" />
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,8">
+            继续操作会连接这个网络共享。
+        </TextBlock>
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,8">
+            · Windows 可能使用你当前的登录凭据与该共享协商访问。本程序不保存、也不向你索要任何网络凭据。
+        </TextBlock>
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,8">
+            · 网络不可用或共享无响应时，导入可能失败，也可能长时间没有反应。
+        </TextBlock>
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,8">
+            · 只有在你信任这个位置时才继续。
+        </TextBlock>
+        <TextBlock TextWrapping="Wrap" Margin="0,0,0,16">
+            建议先把文件复制到本机，再从本机导入。
+        </TextBlock>
+        <TextBlock TextWrapping="Wrap"
+                   Margin="0,0,0,16"
+                   Opacity="0.75">
+            本次确认只对这一次导入、这一条路径有效，不会被记住。
+        </TextBlock>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Content="取消"
+                    IsDefault="True"
+                    IsCancel="True"
+                    MinWidth="110"
+                    Padding="10,4"
+                    Margin="0,0,10,0"
+                    Click="OnCancelClick" />
+            <Button Content="继续导入"
+                    MinWidth="110"
+                    Padding="10,4"
+                    Click="OnContinueClick" />
+        </StackPanel>
+    </StackPanel>
+</Window>

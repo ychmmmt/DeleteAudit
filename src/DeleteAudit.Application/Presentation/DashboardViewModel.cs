@@ -9,6 +9,7 @@ public sealed class DashboardViewModel : ViewModelBase
     private readonly IViewerQueryService _queryService;
     private readonly IOfflineViewerImportService _importService;
     private readonly IOfflineFilePicker _filePicker;
+    private readonly INetworkPathImportConfirmation _networkPathConfirmation;
     private readonly Func<Task> _refreshAfterImport;
     private DashboardSummary _summary = EmptySummary();
     private bool _databaseReady;
@@ -18,7 +19,8 @@ public sealed class DashboardViewModel : ViewModelBase
         IViewerQueryService queryService,
         IOfflineViewerImportService importService,
         IOfflineFilePicker filePicker,
-        Func<Task>? refreshAfterImport = null)
+        Func<Task>? refreshAfterImport = null,
+        INetworkPathImportConfirmation? networkPathConfirmation = null)
     {
         _queryService = queryService
             ?? throw new ArgumentNullException(nameof(queryService));
@@ -26,6 +28,10 @@ public sealed class DashboardViewModel : ViewModelBase
             ?? throw new ArgumentNullException(nameof(importService));
         _filePicker = filePicker
             ?? throw new ArgumentNullException(nameof(filePicker));
+        // Fail closed: with no interactive surface wired up, a network share is
+        // simply never authorised rather than silently allowed.
+        _networkPathConfirmation = networkPathConfirmation
+            ?? new DeniedNetworkPathImportConfirmation();
         _refreshAfterImport = refreshAfterImport ?? (() => Task.CompletedTask);
 
         RefreshCommand = new AsyncCommand(
@@ -86,8 +92,27 @@ public sealed class DashboardViewModel : ViewModelBase
                 return;
             }
 
+            // Classification is pure string analysis, so deciding that the
+            // selection is remote does not itself touch the share. The answer
+            // lives only in this local: it is bound to this one import of this
+            // one path, is never stored, and the next selection asks again.
+            var networkPathConfirmed = false;
+            if (InputPathClassifier.Classify(selectedPath) == InputPathKind.NetworkShare)
+            {
+                networkPathConfirmed = await _networkPathConfirmation
+                    .ConfirmAsync(selectedPath)
+                    .ConfigureAwait(true);
+                if (!networkPathConfirmed)
+                {
+                    // Declining is a cancellation, not a failure: exactly the same
+                    // quiet semantics as cancelling the file picker. Nothing is
+                    // opened, nothing is written, and no error is shown.
+                    return;
+                }
+            }
+
             var result = await _importService
-                .ImportAsync(selectedPath)
+                .ImportAsync(selectedPath, networkPathConfirmed)
                 .ConfigureAwait(true);
             LastImportStatus = ImportStatusPresentation.Label(result.Status);
             if (result.Status == ImportStatus.Failed)

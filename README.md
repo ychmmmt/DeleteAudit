@@ -23,7 +23,7 @@ Windows 删除审计应用（Alpha / 实验性）。
 
 Phase 2A（实时接入预览）**已封版**。在 Phase 1A 离线审计核心、Phase 1B 离线事件导入管线、Phase 1C 离线 WPF 查看器之上，加入用户手动开启的 Windows Event Log 实时接入预览与会话统计。
 
-最近一次动态验收：7 个项目以 0 warning、0 error 构建；Unit **126**、Integration **48**，合计 **174** 项测试全部通过，无 skip、无失败。
+最近一次动态验收：7 个项目以 0 warning、0 error 构建；Unit **174**、Integration **55**，合计 **229** 项测试全部通过，无 skip、无失败。
 
 各阶段验收记录见 `docs/PHASE_1A_ACCEPTANCE.md`、`docs/PHASE_1B_ACCEPTANCE.md`、`docs/PHASE_1C_ACCEPTANCE.md`、`docs/PHASE_2A_ACCEPTANCE.md`。设计总览见 `docs/PROJECT_PLAN.md`，威胁模型见 `docs/THREAT_MODEL.md`，SQLite 结构见 `db/schema.sql`。
 
@@ -87,6 +87,20 @@ set DELETEAUDIT_REPOSITORY_ROOT=C:\path\to\your\checkout
 ## 离线导入边界
 
 - 导入只接受调用方明确给出的、完全限定的单个 `.xml` 或 `.evtx` 文件路径；不扫描目录，不接受重解析点、设备路径或备用数据流。
+- **不自动枚举任何路径**：产品代码中不存在 `EnumerateFiles`、`EnumerateDirectories`、`GetDirectories`、`DriveInfo`、`GetLogicalDrives`，既不遍历网络位置，也不枚举本机盘符。
+- **不连接远程 Windows Event Log**，不使用 `EventLogSession`。
+- **不保存、也不向你索要任何网络凭据。**
+
+### 普通 UNC 输入需要逐次确认
+
+- **普通 UNC 文件（`\\server\share\file.evtx`、`//server/share/file.xml`）只有在你主动选择、并逐次明确确认后才可能被读取。** 选择之后会先弹出二次确认，说明继续会连接该网络共享、Windows 可能使用你当前的登录凭据协商访问、网络不可用时可能失败或长时间无响应，并建议先把文件复制到本机再导入。按钮是「取消」与「继续导入」，**默认按钮是「取消」**，按 Esc 同样是取消。
+- **取消等同于取消选择文件**：不调用导入服务、不检查文件是否存在、不读取任何属性、不创建或修改数据库与输出文件，也不弹出失败错误。
+- **确认只对这一次导入、这一条路径有效**，不写入配置、不被记住。再次选择同一共享会再次确认；确认一条路径不会顺带授权另一条路径。
+- **服务边界携带同一个一次性状态**：`ImportAsync(path, networkPathConfirmed)` 与 `ImportRequest.NetworkPathConfirmed`，两者默认都是 `false`。未携带确认状态的普通 UNC 请求会在**任何文件系统或网络访问之前**以诊断码 `network_path_confirmation_required` 被拒绝，因此非交互调用无法绕过确认；未接入确认界面时一律拒绝（fail closed）。
+- **设备命名空间路径仍然直接拒绝**：`\\?\`、`\\.\`、`\??\` 以及 `\\?\UNC\server\share\…` 一律返回 `device_path_rejected`，永远不会被当作可确认的普通 UNC 弹窗。
+- 路径分类是**纯字符串判断，不执行任何 I/O**，UI 与服务边界共用同一份实现；判断"这是远程路径"这件事本身不会触碰网络。
+- **本轮不新增对映射网络盘（例如 `Z:\`）的识别。** 映射盘在字符串上与本机完全限定路径无法区分，识别它必须查询驱动器，而那正是分类逻辑拒绝执行的 I/O；因此选择 `Z:\` 不会触发网络确认。本项目也不会因为盘符字母而拒绝任何路径。
+- 需要说明的是：**这不等于"完全不发生网络访问"。** 你确认之后，读取该共享确实会产生网络访问——确认机制保证的是这件事永远由你明确同意、逐次同意。
 - WPF 只通过 `OfflineImportPipeline` 写入；UI 不执行 SQL，也不创建或迁移 schema。
 - 结构化查询只通过专用只读应用服务，SQLite 连接固定为 `ReadOnly`；列表查询采用参数化筛选和最大 200 项的服务端分页。
 - Raw XML 按事件 ID 延迟读取，查询端只通过参数化 `length`/`substr` 返回前 262,144 个字符的只读预览；超限时 UI 明确标记截断并显示原始/预览字符数，复制操作仅复制预览，数据库中的原始证据不被修改。

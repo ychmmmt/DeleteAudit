@@ -54,6 +54,140 @@ public sealed class ViewerPresentationTests
         Assert.Equal("fixture import failure", viewModel.ErrorMessage);
     }
 
+    [Theory]
+    [InlineData(@"C:\Fixtures\offline.xml")]
+    [InlineData(@"D:\Fixtures\offline.xml")]
+    [InlineData(@"E:\Fixtures\offline.evtx")]
+    [InlineData(@"Z:\Fixtures\offline.xml")]
+    public async Task LocalPathImportNeverAsksForNetworkConfirmation(string selectedPath)
+    {
+        // Z: is a mapped-drive shape and is deliberately treated as local. No path
+        // here is opened: the import service is a fake.
+        var importService = new FakeImportService();
+        var confirmation = new FakeNetworkPathConfirmation(answer: false);
+        var viewModel = new DashboardViewModel(
+            new FakeQueryService(),
+            importService,
+            new FakeFilePicker(selectedPath),
+            networkPathConfirmation: confirmation);
+
+        await viewModel.ImportSelectedFileAsync();
+
+        Assert.Empty(confirmation.ConfirmedPaths);
+        Assert.Equal(1, importService.CallCount);
+        Assert.False(Assert.Single(importService.NetworkPathConfirmations));
+        Assert.False(viewModel.HasError);
+    }
+
+    [Theory]
+    [InlineData(@"\\fixture-server\share\offline.xml")]
+    [InlineData("//fixture-server/share/offline.evtx")]
+    public async Task DecliningNetworkConfirmationImportsNothingAndReportsNoFailure(
+        string selectedPath)
+    {
+        var importService = new FakeImportService();
+        var confirmation = new FakeNetworkPathConfirmation(answer: false);
+        var viewModel = new DashboardViewModel(
+            new FakeQueryService(),
+            importService,
+            new FakeFilePicker(selectedPath),
+            networkPathConfirmation: confirmation);
+
+        await viewModel.ImportSelectedFileAsync();
+
+        Assert.Equal(selectedPath, Assert.Single(confirmation.ConfirmedPaths));
+        // Nothing is imported, so nothing was opened, read or written.
+        Assert.Equal(0, importService.CallCount);
+        // Same quiet semantics as cancelling the picker: no error surfaces and the
+        // status line is untouched.
+        Assert.False(viewModel.HasError);
+        Assert.Equal("尚未执行导入。", viewModel.LastImportStatus);
+    }
+
+    [Fact]
+    public async Task AcceptingNetworkConfirmationPassesOneShotAuthorisation()
+    {
+        var importService = new FakeImportService();
+        var confirmation = new FakeNetworkPathConfirmation(answer: true);
+        var viewModel = new DashboardViewModel(
+            new FakeQueryService(),
+            importService,
+            new FakeFilePicker(@"\\fixture-server\share\offline.xml"),
+            networkPathConfirmation: confirmation);
+
+        await viewModel.ImportSelectedFileAsync();
+
+        Assert.Single(confirmation.ConfirmedPaths);
+        Assert.Equal(1, importService.CallCount);
+        Assert.True(Assert.Single(importService.NetworkPathConfirmations));
+    }
+
+    [Fact]
+    public async Task SelectingTheSameNetworkPathAgainAsksAgain()
+    {
+        var importService = new FakeImportService();
+        var confirmation = new FakeNetworkPathConfirmation(answer: true);
+        var viewModel = new DashboardViewModel(
+            new FakeQueryService(),
+            importService,
+            new FakeFilePicker(@"\\fixture-server\share\offline.xml"),
+            networkPathConfirmation: confirmation);
+
+        await viewModel.ImportSelectedFileAsync();
+        await viewModel.ImportSelectedFileAsync();
+
+        // The authorisation is never remembered, so the second import prompts too.
+        Assert.Equal(2, confirmation.ConfirmedPaths.Count);
+        Assert.Equal(2, importService.CallCount);
+        Assert.Collection(
+            importService.NetworkPathConfirmations,
+            first => Assert.True(first),
+            second => Assert.True(second));
+    }
+
+    [Fact]
+    public async Task NetworkConfirmationDoesNotCarryOverToAnotherPath()
+    {
+        var importService = new FakeImportService();
+        var confirmation = new FakeNetworkPathConfirmation(answer: true);
+        var viewModel = new DashboardViewModel(
+            new FakeQueryService(),
+            importService,
+            new FakeFilePicker(
+                @"\\fixture-server\share\offline.xml",
+                @"C:\Fixtures\offline.xml"),
+            networkPathConfirmation: confirmation);
+
+        await viewModel.ImportSelectedFileAsync();
+        await viewModel.ImportSelectedFileAsync();
+
+        // Confirming the share does not authorise the next selection.
+        Assert.Equal(
+            @"\\fixture-server\share\offline.xml",
+            Assert.Single(confirmation.ConfirmedPaths));
+        Assert.Collection(
+            importService.NetworkPathConfirmations,
+            share => Assert.True(share),
+            local => Assert.False(local));
+    }
+
+    [Fact]
+    public async Task WithoutAConfirmationSurfaceNetworkImportIsBlocked()
+    {
+        // Fail closed: a caller that wires no confirmation surface cannot reach a
+        // share, rather than reaching it unconditionally.
+        var importService = new FakeImportService();
+        var viewModel = new DashboardViewModel(
+            new FakeQueryService(),
+            importService,
+            new FakeFilePicker(@"\\fixture-server\share\offline.xml"));
+
+        await viewModel.ImportSelectedFileAsync();
+
+        Assert.Equal(0, importService.CallCount);
+        Assert.False(viewModel.HasError);
+    }
+
     [Fact]
     public void MissingDisplayValuesUseUnknown()
     {
@@ -267,18 +401,42 @@ public sealed class ViewerPresentationTests
 
     private sealed class FakeFilePicker : IOfflineFilePicker
     {
-        private readonly string? _selectedPath;
+        private readonly string?[] _selectedPaths;
+        private int _callCount;
 
-        public FakeFilePicker(string? selectedPath)
+        public FakeFilePicker(string? selectedPath, params string?[] laterPaths)
         {
-            _selectedPath = selectedPath;
+            _selectedPaths = [selectedPath, .. laterPaths];
         }
 
         public Task<string?> PickSingleFileAsync(
             CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return Task.FromResult(_selectedPath);
+            var index = Math.Min(_callCount, _selectedPaths.Length - 1);
+            _callCount++;
+            return Task.FromResult(_selectedPaths[index]);
+        }
+    }
+
+    private sealed class FakeNetworkPathConfirmation : INetworkPathImportConfirmation
+    {
+        private readonly bool _answer;
+
+        public FakeNetworkPathConfirmation(bool answer)
+        {
+            _answer = answer;
+        }
+
+        public List<string> ConfirmedPaths { get; } = [];
+
+        public Task<bool> ConfirmAsync(
+            string networkPath,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ConfirmedPaths.Add(networkPath);
+            return Task.FromResult(_answer);
         }
     }
 
@@ -288,12 +446,16 @@ public sealed class ViewerPresentationTests
 
         public Exception? Exception { get; init; }
 
+        public List<bool> NetworkPathConfirmations { get; } = [];
+
         public Task<ImportResult> ImportAsync(
             string inputFilePath,
+            bool networkPathConfirmed = false,
             CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
             CallCount++;
+            NetworkPathConfirmations.Add(networkPathConfirmed);
             if (Exception is not null)
             {
                 return Task.FromException<ImportResult>(Exception);

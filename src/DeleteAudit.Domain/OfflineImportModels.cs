@@ -7,6 +7,14 @@ public sealed record ImportRequest(
     string ApplicationVersion,
     int SchemaVersion)
 {
+    /// <summary>
+    /// One-shot authorisation for this single request to read from a network
+    /// share. It defaults to <see langword="false"/>, is never persisted, and is
+    /// never shared between requests: a caller must set it again for every
+    /// import of every path.
+    /// </summary>
+    public bool NetworkPathConfirmed { get; init; }
+
     public void Validate()
     {
         if (string.IsNullOrWhiteSpace(InputFilePath))

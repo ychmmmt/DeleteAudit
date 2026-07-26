@@ -265,6 +265,127 @@ public sealed class OfflineViewerImportServiceTests
             diagnostic => diagnostic.Code is "input_file_not_found" or "invalid_input_path");
     }
 
+    [Theory]
+    [InlineData(@"\\fixture-server\share\selected.xml")]
+    [InlineData("//fixture-server/share/selected.xml")]
+    public async Task UnconfirmedNetworkPathStopsBeforeDatabaseSourceAndOutput(
+        string inputPath)
+    {
+        // The viewer database is deliberately absent. If the request got past the
+        // confirmation gate it would fail with viewer_database_unavailable instead,
+        // so the diagnostic below is what proves the gate runs first — before the
+        // database is opened, before the source runs, and before the fictional
+        // share named in the path is contacted in any way.
+        var source = new CountingSource();
+        var scenarioId = Guid.NewGuid().ToString("N");
+        var root = Path.Combine(ViewerDataRoot, $"network-unconfirmed-{scenarioId}");
+        var databasePath = Path.Combine(root, "missing.db");
+        var jsonlDirectory = Path.Combine(root, "jsonl");
+        var location = ViewerDataLocation.CreateForTesting(databasePath, jsonlDirectory);
+        var service = CreateService(location, [source]);
+
+        var result = await service.ImportAsync(inputPath);
+
+        Assert.Equal(ImportStatus.Failed, result.Status);
+        Assert.False(result.DatabaseCommitted);
+        Assert.Contains(
+            result.Report.Diagnostics,
+            diagnostic => diagnostic.Code == "network_path_confirmation_required");
+        Assert.DoesNotContain(
+            result.Report.Diagnostics,
+            diagnostic => diagnostic.Code == "viewer_database_unavailable");
+        Assert.Equal(0, source.CallCount);
+        Assert.False(File.Exists(databasePath));
+        Assert.False(Directory.Exists(jsonlDirectory));
+        Assert.Null(result.JsonlFilePath);
+        Assert.Null(result.ManifestFilePath);
+    }
+
+    [Fact]
+    public async Task ConfirmedNetworkPathReachesTheInjectedSourceOnly()
+    {
+        // With the one-shot authorisation supplied, the gate opens and the request
+        // reaches the source. The source is a fake that never touches a filesystem,
+        // so the share is still never contacted.
+        var source = new CountingSource();
+        var scenario = await CreateScenarioAsync("network-confirmed", [source]);
+
+        var result = await scenario.Service.ImportAsync(
+            @"\\fixture-server\share\selected.xml",
+            networkPathConfirmed: true);
+
+        Assert.Equal(1, source.CallCount);
+        Assert.DoesNotContain(
+            result.Report.Diagnostics,
+            diagnostic => diagnostic.Code == "network_path_confirmation_required");
+    }
+
+    [Fact]
+    public async Task NetworkConfirmationIsNotRememberedBetweenCalls()
+    {
+        var source = new CountingSource();
+        var scenario = await CreateScenarioAsync("network-not-sticky", [source]);
+        const string InputPath = @"\\fixture-server\share\selected.xml";
+
+        await scenario.Service.ImportAsync(InputPath, networkPathConfirmed: true);
+        var second = await scenario.Service.ImportAsync(InputPath);
+
+        // The second call omits the authorisation and is refused again: nothing
+        // about the first call was retained.
+        Assert.Equal(1, source.CallCount);
+        Assert.Contains(
+            second.Report.Diagnostics,
+            diagnostic => diagnostic.Code == "network_path_confirmation_required");
+    }
+
+    [Theory]
+    [InlineData(@"\\?\UNC\fixture-server\share\selected.xml")]
+    [InlineData(@"\\?\unc\fixture-server\share\selected.xml")]
+    public async Task DeviceUncPrefixIsRejectedAsDeviceNotAsConfirmableShare(
+        string inputPath)
+    {
+        var scenario = await CreateScenarioAsync("device-unc");
+
+        var result = await scenario.Service.ImportAsync(inputPath);
+
+        Assert.Equal(ImportStatus.Failed, result.Status);
+        Assert.Contains(
+            result.Report.Diagnostics,
+            diagnostic => diagnostic.Code == "device_path_rejected");
+        Assert.DoesNotContain(
+            result.Report.Diagnostics,
+            diagnostic => diagnostic.Code == "network_path_confirmation_required");
+    }
+
+    [Fact]
+    public void ProductionCodeHasNoProhibitedInputVolumeAndNoPathEnumeration()
+    {
+        // Structural guard over the whole shipped tree: the retired machine-specific
+        // volume rule must not come back under any name, and nothing in production
+        // may enumerate directories or volumes to decide about a path.
+        var sourceDirectory = Path.Combine(RepositoryRoot.Value, "src");
+        var files = Directory.EnumerateFiles(
+            sourceDirectory,
+            "*.cs",
+            SearchOption.AllDirectories)
+            .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
+            .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
+            .ToArray();
+
+        Assert.NotEmpty(files);
+        foreach (var file in files)
+        {
+            var source = File.ReadAllText(file);
+            Assert.DoesNotContain("prohibited_input_volume", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("EnumerateDirectories", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("EnumerateFiles", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("GetDirectories", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("GetLogicalDrives", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("DriveInfo", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("EventLogSession", source, StringComparison.Ordinal);
+        }
+    }
+
     [Fact]
     public void ImportPathValidationHasNoHardCodedDriveLetter()
     {

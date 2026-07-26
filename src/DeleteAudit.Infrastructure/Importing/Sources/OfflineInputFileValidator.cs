@@ -38,11 +38,12 @@ public static class OfflineInputFileValidator
                 "Only the .xml and .evtx offline formats are supported.");
         }
 
-        if (IsDevicePath(request.InputFilePath))
+        var requestedPathDiagnostic = ClassifyPath(
+            request.InputFilePath,
+            request.NetworkPathConfirmed);
+        if (requestedPathDiagnostic is not null)
         {
-            return Failure(
-                "device_path_rejected",
-                "Device namespace paths are not valid offline event input files.");
+            return new OfflineInputFileOpenResult(null, requestedPathDiagnostic);
         }
 
         string absolutePath;
@@ -63,11 +64,12 @@ public static class OfflineInputFileValidator
             return Failure("invalid_input_path", exception.Message);
         }
 
-        if (IsDevicePath(absolutePath))
+        var absolutePathDiagnostic = ClassifyPath(
+            absolutePath,
+            request.NetworkPathConfirmed);
+        if (absolutePathDiagnostic is not null)
         {
-            return Failure(
-                "device_path_rejected",
-                "Device namespace paths are not valid offline event input files.");
+            return new OfflineInputFileOpenResult(null, absolutePathDiagnostic);
         }
 
         if (!string.Equals(
@@ -253,10 +255,25 @@ public static class OfflineInputFileValidator
         return null;
     }
 
-    private static bool IsDevicePath(string path) =>
-        path.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase)
-        || path.StartsWith(@"\\.\", StringComparison.OrdinalIgnoreCase)
-        || path.StartsWith(@"\??\", StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// Gate that both path checks run through. It is pure string analysis and sits
+    /// ahead of every filesystem call in <see cref="TryOpenAsync"/>, so a device
+    /// path is refused and an unauthorised share is refused before anything is
+    /// probed, opened or contacted.
+    /// </summary>
+    private static ImportDiagnostic? ClassifyPath(
+        string path,
+        bool networkPathConfirmed) =>
+        InputPathClassifier.Classify(path) switch
+        {
+            InputPathKind.DeviceNamespace => Diagnostic(
+                "device_path_rejected",
+                "Device namespace paths are not valid offline event input files."),
+            InputPathKind.NetworkShare when !networkPathConfirmed => Diagnostic(
+                "network_path_confirmation_required",
+                "Reading from a network share requires an explicit confirmation for this import."),
+            _ => null
+        };
 
     private static bool ContainsAlternateDataStream(string absolutePath)
     {

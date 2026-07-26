@@ -71,9 +71,12 @@ public sealed class OfflineViewerImportService : IOfflineViewerImportService
 
     public async Task<ImportResult> ImportAsync(
         string inputFilePath,
+        bool networkPathConfirmed = false,
         CancellationToken cancellationToken = default)
     {
-        var validationDiagnostic = ValidateInputPath(inputFilePath);
+        // Runs before the viewer database is opened, so an unconfirmed network
+        // path creates no database, writes no output and reaches no share.
+        var validationDiagnostic = ValidateInputPath(inputFilePath, networkPathConfirmed);
         if (validationDiagnostic is not null)
         {
             return Failure(validationDiagnostic);
@@ -121,14 +124,21 @@ public sealed class OfflineViewerImportService : IOfflineViewerImportService
             _importOptions.MaximumFileSizeBytes,
             _importOptions.JsonlOutputDirectory,
             _applicationVersion,
-            _importOptions.SchemaVersion);
+            _importOptions.SchemaVersion)
+        {
+            // Carried into the pipeline so the validator can refuse an
+            // unconfirmed share again, immediately before it would touch it.
+            NetworkPathConfirmed = networkPathConfirmed
+        };
 
         return await pipeline
             .ImportAsync(request, cancellationToken)
             .ConfigureAwait(false);
     }
 
-    private static ImportDiagnostic? ValidateInputPath(string inputFilePath)
+    private static ImportDiagnostic? ValidateInputPath(
+        string inputFilePath,
+        bool networkPathConfirmed)
     {
         if (string.IsNullOrWhiteSpace(inputFilePath))
         {
@@ -144,6 +154,16 @@ public sealed class OfflineViewerImportService : IOfflineViewerImportService
                 "The input file path must be fully qualified.");
         }
 
+        // Classified from the text as selected, before normalization, so the
+        // decision cannot depend on anything the filesystem says.
+        var networkDiagnostic = NetworkConfirmationDiagnostic(
+            inputFilePath,
+            networkPathConfirmed);
+        if (networkDiagnostic is not null)
+        {
+            return networkDiagnostic;
+        }
+
         string normalizedPath;
         try
         {
@@ -157,10 +177,21 @@ public sealed class OfflineViewerImportService : IOfflineViewerImportService
             return Diagnostic("invalid_input_path", exception.Message);
         }
 
+        // Re-checked after normalization: a path that only becomes a share once
+        // it is expanded must not slip past the first check.
+        networkDiagnostic = NetworkConfirmationDiagnostic(
+            normalizedPath,
+            networkPathConfirmed);
+        if (networkDiagnostic is not null)
+        {
+            return networkDiagnostic;
+        }
+
         // A drive letter says nothing about whether a file is a legitimate offline log,
-        // so no volume is rejected on its letter alone. Device-namespace paths, alternate
-        // data streams, reparse points, non-regular files and unsupported formats are all
-        // still rejected downstream by OfflineInputFileValidator.
+        // so no volume is rejected on its letter alone. A mapped network drive is a
+        // drive letter and is therefore treated as any other local path. Device-namespace
+        // paths, alternate data streams, reparse points, non-regular files and unsupported
+        // formats are all still rejected downstream by OfflineInputFileValidator.
         var extension = Path.GetExtension(normalizedPath);
         if (!string.Equals(extension, ".xml", StringComparison.OrdinalIgnoreCase)
             && !string.Equals(extension, ".evtx", StringComparison.OrdinalIgnoreCase))
@@ -172,6 +203,22 @@ public sealed class OfflineViewerImportService : IOfflineViewerImportService
 
         return null;
     }
+
+    /// <summary>
+    /// Returns a diagnostic when <paramref name="path"/> names a plain UNC share
+    /// that this import was not explicitly authorised to read, and null in every
+    /// other case. Device paths are not handled here: they are rejected outright
+    /// by <see cref="OfflineInputFileValidator"/> and are never confirmable.
+    /// </summary>
+    private static ImportDiagnostic? NetworkConfirmationDiagnostic(
+        string path,
+        bool networkPathConfirmed) =>
+        !networkPathConfirmed
+        && InputPathClassifier.Classify(path) == InputPathKind.NetworkShare
+            ? Diagnostic(
+                "network_path_confirmation_required",
+                "Reading from a network share requires an explicit confirmation for this import.")
+            : null;
 
     private static OfflineImportOptions CreateDefaultImportOptions(
         ViewerDataLocation location)
