@@ -90,3 +90,22 @@ projects. Package source mapping restricts all packages to `nuget.org`.
 - Confirm `dotnet build`, `dotnet test` and `git diff --check` are clean.
 - By contributing you agree that your contribution is licensed under the
   [MIT License](LICENSE).
+
+## Contribution licensing
+
+By submitting a contribution to this repository, you agree that your
+contribution is provided under the MIT License included in this repository.
+
+You represent that you have the right to submit the contribution and that it
+does not knowingly include code, documentation, or other material that you are
+not permitted to license under these terms.
+
+Contributors retain copyright in their contributions. This project does not
+require copyright assignment or a Contributor License Agreement (CLA).
+
+提交 Pull Request 或其他代码、文档贡献，即表示你同意该贡献按本仓库的
+MIT 许可证提供，并确认自己有权提交相关内容，且没有故意包含无权按该许可
+提交的代码、文档或其他材料。
+
+贡献者仍保留其贡献内容的版权；本项目不要求版权转让，也暂不要求签署
+贡献者许可协议（CLA）。
