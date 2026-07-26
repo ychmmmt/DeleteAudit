@@ -23,7 +23,7 @@ Windows 删除审计应用（Alpha / 实验性）。
 
 Phase 2A（实时接入预览）**已封版**。在 Phase 1A 离线审计核心、Phase 1B 离线事件导入管线、Phase 1C 离线 WPF 查看器之上，加入用户手动开启的 Windows Event Log 实时接入预览与会话统计。
 
-最近一次动态验收：7 个项目以 0 warning、0 error 构建；Unit **126**、Integration **41**，合计 **167** 项测试全部通过，无 skip、无失败。
+最近一次动态验收：7 个项目以 0 warning、0 error 构建；Unit **126**、Integration **48**，合计 **174** 项测试全部通过，无 skip、无失败。
 
 各阶段验收记录见 `docs/PHASE_1A_ACCEPTANCE.md`、`docs/PHASE_1B_ACCEPTANCE.md`、`docs/PHASE_1C_ACCEPTANCE.md`、`docs/PHASE_2A_ACCEPTANCE.md`。设计总览见 `docs/PROJECT_PLAN.md`，威胁模型见 `docs/THREAT_MODEL.md`，SQLite 结构见 `db/schema.sql`。
 
