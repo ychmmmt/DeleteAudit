@@ -1,5 +1,6 @@
 using System.Text;
 using DeleteAudit.Domain;
+using DeleteAudit.Infrastructure;
 using DeleteAudit.Infrastructure.Importing.Output;
 using DeleteAudit.Infrastructure.Importing.Sources;
 using DeleteAudit.Infrastructure.Viewing;
@@ -162,29 +163,128 @@ public sealed class OfflineViewerImportServiceTests
             diagnostic => diagnostic.Code == "viewer_database_unavailable");
     }
 
-    [Fact]
-    public async Task ProhibitedVolumeIsRejectedBeforeInjectedSourceRuns()
+    [Theory]
+    [InlineData('C')]
+    [InlineData('D')]
+    [InlineData('E')]
+    public async Task InputIsNeverRejectedForItsDriveLetterAlone(char driveLetter)
     {
+        // Purely a path-validation assertion: the database is missing, so the import
+        // stops before the input file is ever opened and no volume is touched.
         var source = new CountingSource();
         var scenarioId = Guid.NewGuid().ToString("N");
-        var root = Path.Combine(ViewerDataRoot, $"prohibited-{scenarioId}");
+        var root = Path.Combine(ViewerDataRoot, $"volume-{scenarioId}");
         var location = ViewerDataLocation.CreateForTesting(
             Path.Combine(root, "missing.db"),
             Path.Combine(root, "jsonl"));
         var service = CreateService(location, [source]);
-        var prohibitedPath = string.Concat(
-            'D',
+        var inputPath = string.Concat(
+            driveLetter,
             Path.VolumeSeparatorChar,
+            Path.DirectorySeparatorChar,
+            "logs",
             Path.DirectorySeparatorChar,
             "selected.xml");
 
-        var result = await service.ImportAsync(prohibitedPath);
+        var result = await service.ImportAsync(inputPath);
+
+        Assert.DoesNotContain(
+            result.Report.Diagnostics,
+            diagnostic => diagnostic.Code == "prohibited_input_volume");
+        // It still fails, but for the real reason: the viewer database is not there.
+        Assert.Equal(ImportStatus.Failed, result.Status);
+        Assert.False(result.DatabaseCommitted);
+        Assert.Contains(
+            result.Report.Diagnostics,
+            diagnostic => diagnostic.Code == "viewer_database_unavailable");
+        Assert.Equal(0, source.CallCount);
+    }
+
+    [Fact]
+    public async Task RelativeInputPathIsRejectedBeforeInjectedSourceRuns()
+    {
+        var source = new CountingSource();
+        var scenario = await CreateScenarioAsync("relative-path", [source]);
+
+        var result = await scenario.Service.ImportAsync(
+            Path.Combine("logs", "selected.xml"));
 
         Assert.Equal(ImportStatus.Failed, result.Status);
         Assert.Equal(0, source.CallCount);
         Assert.Contains(
             result.Report.Diagnostics,
-            diagnostic => diagnostic.Code == "prohibited_input_volume");
+            diagnostic => diagnostic.Code == "invalid_import_request");
+    }
+
+    [Fact]
+    public async Task UnsupportedExtensionIsRejectedBeforeInjectedSourceRuns()
+    {
+        var source = new CountingSource();
+        var scenario = await CreateScenarioAsync("bad-extension", [source]);
+        var inputPath = await WriteNewFileAsync(
+            scenario.Root,
+            "selected.txt",
+            "not an offline event file");
+
+        var result = await scenario.Service.ImportAsync(inputPath);
+
+        Assert.Equal(ImportStatus.Failed, result.Status);
+        Assert.Equal(0, source.CallCount);
+        Assert.Contains(
+            result.Report.Diagnostics,
+            diagnostic => diagnostic.Code == "unsupported_file_extension");
+    }
+
+    [Fact]
+    public async Task DeviceNamespacePathIsRejected()
+    {
+        var scenario = await CreateScenarioAsync("device-path");
+        var inputPath = await WriteXmlEnvelopeAsync(
+            scenario.Root,
+            SysmonDelete(3501, @"C:\Work\viewer-device.txt"));
+
+        var result = await scenario.Service.ImportAsync($@"\\?\{inputPath}");
+
+        Assert.Equal(ImportStatus.Failed, result.Status);
+        Assert.Contains(
+            result.Report.Diagnostics,
+            diagnostic => diagnostic.Code == "device_path_rejected");
+    }
+
+    [Fact]
+    public async Task MissingInputFileIsRejected()
+    {
+        var scenario = await CreateScenarioAsync("missing-input");
+        var inputPath = Path.Combine(scenario.Root, "does-not-exist.xml");
+
+        var result = await scenario.Service.ImportAsync(inputPath);
+
+        Assert.Equal(ImportStatus.Failed, result.Status);
+        Assert.Contains(
+            result.Report.Diagnostics,
+            diagnostic => diagnostic.Code is "input_file_not_found" or "invalid_input_path");
+    }
+
+    [Fact]
+    public void ImportPathValidationHasNoHardCodedDriveLetter()
+    {
+        // Structural guard: the service must not reintroduce a machine-specific volume
+        // rule. This inspects the shipped source rather than reimplementing validation.
+        var source = File.ReadAllText(Path.Combine(
+            RepositoryRoot.Value,
+            "src",
+            "DeleteAudit.Infrastructure",
+            "ViewingImport",
+            "OfflineViewerImportService.cs"));
+
+        Assert.DoesNotContain("prohibited_input_volume", source, StringComparison.Ordinal);
+        Assert.DoesNotMatch(
+            new System.Text.RegularExpressions.Regex(
+                @"[A-Za-z]:\\\\""\s*,\s*StringComparison",
+                System.Text.RegularExpressions.RegexOptions.None,
+                TimeSpan.FromSeconds(2)),
+            source);
+        Assert.DoesNotContain("GetPathRoot", source, StringComparison.Ordinal);
     }
 
     private static async Task<ViewerImportScenario> CreateScenarioAsync(

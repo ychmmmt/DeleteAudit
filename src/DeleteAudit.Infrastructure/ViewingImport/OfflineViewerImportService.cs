@@ -157,14 +157,10 @@ public sealed class OfflineViewerImportService : IOfflineViewerImportService
             return Diagnostic("invalid_input_path", exception.Message);
         }
 
-        var root = Path.GetPathRoot(normalizedPath);
-        if (string.Equals(root, @"D:\", StringComparison.OrdinalIgnoreCase))
-        {
-            return Diagnostic(
-                "prohibited_input_volume",
-                "The selected input path is on a prohibited volume.");
-        }
-
+        // A drive letter says nothing about whether a file is a legitimate offline log,
+        // so no volume is rejected on its letter alone. Device-namespace paths, alternate
+        // data streams, reparse points, non-regular files and unsupported formats are all
+        // still rejected downstream by OfflineInputFileValidator.
         var extension = Path.GetExtension(normalizedPath);
         if (!string.Equals(extension, ".xml", StringComparison.OrdinalIgnoreCase)
             && !string.Equals(extension, ".evtx", StringComparison.OrdinalIgnoreCase))
