@@ -13,7 +13,6 @@ namespace DeleteAudit.Infrastructure.ViewingImport;
 public sealed class OfflineViewerImportService : IOfflineViewerImportService
 {
     private const long DefaultMaximumFileSizeBytes = 67_108_864;
-    private const string DefaultApplicationVersion = "1.2.0-phase1c";
     private const int DefaultSchemaVersion = 2;
 
     private readonly ViewerDataLocation _location;
@@ -30,7 +29,9 @@ public sealed class OfflineViewerImportService : IOfflineViewerImportService
         : this(
             location,
             CreateDefaultImportOptions(location),
-            DefaultApplicationVersion,
+            // One shared constant, so the offline and live paths can never stamp
+            // two different application versions from the same build.
+            ApplicationVersionInfo.Current,
             new CorrelationOptions(TimeSpan.FromSeconds(3)),
             new AuditRiskOptions(TimeSpan.FromSeconds(10), 30, 100))
     {

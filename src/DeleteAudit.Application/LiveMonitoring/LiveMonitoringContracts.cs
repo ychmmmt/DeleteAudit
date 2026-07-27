@@ -77,7 +77,7 @@ public sealed record LiveMonitoringSnapshot(
 
 public sealed record LiveMonitoringOptions(
     int QueueCapacity = 2048,
-    string ApplicationVersion = "2.0.0-phase2a")
+    string ApplicationVersion = ApplicationVersionInfo.Current)
 {
     public void Validate()
     {

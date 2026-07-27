@@ -1094,16 +1094,18 @@ public sealed class LiveMonitoringServiceTests
     }
 
     [Fact]
-    public async Task NormalStopStillPersistsAsStopped()
+    public async Task NormalStopPersistsAsStoppedWithTheCurrentApplicationVersion()
     {
         await using var service = CreateService(FakeProbe.AllAvailable(), out _, out var repository);
 
         await service.StartAsync();
         await service.StopAsync();
 
-        Assert.Equal(
-            LiveMonitoringState.Stopped,
-            Assert.Single(repository.Sessions).FinalState);
+        var session = Assert.Single(repository.Sessions);
+        Assert.Equal(LiveMonitoringState.Stopped, session.FinalState);
+        // The live path takes its version from the one shared constant, so a session
+        // summary can never disagree with what the offline path writes.
+        Assert.Equal(ApplicationVersionInfo.Current, session.ApplicationVersion);
     }
 
     [Fact]

@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using DeleteAudit.Domain;
 using DeleteAudit.Infrastructure;
 using DeleteAudit.Infrastructure.Importing.Output;
@@ -47,6 +48,23 @@ public sealed class OfflineViewerImportServiceTests
             StringComparison.OrdinalIgnoreCase);
         Assert.Equal(bytesBefore, await File.ReadAllBytesAsync(inputPath));
         Assert.Equal(lastWriteBefore, File.GetLastWriteTimeUtc(inputPath));
+
+        // The application version travels all the way through: session record, the row
+        // persisted in import_sessions, and the manifest a user can read afterwards.
+        // Schema and manifest format versions are separate and unchanged.
+        Assert.Equal(
+            ApplicationVersionInfo.Current,
+            Assert.IsType<ImportSession>(result.Session).ApplicationVersion);
+        Assert.Equal(
+            ApplicationVersionInfo.Current,
+            await ReadStoredApplicationVersionAsync(scenario.Location.DatabasePath));
+        using var manifest = JsonDocument.Parse(
+            await File.ReadAllTextAsync(Assert.IsType<string>(result.ManifestFilePath)));
+        Assert.Equal(
+            ApplicationVersionInfo.Current,
+            manifest.RootElement.GetProperty("applicationVersion").GetString());
+        Assert.Equal(2, manifest.RootElement.GetProperty("schemaVersion").GetInt32());
+        Assert.Equal(1, manifest.RootElement.GetProperty("formatVersion").GetInt32());
     }
 
     [Fact]
@@ -358,11 +376,12 @@ public sealed class OfflineViewerImportServiceTests
     }
 
     [Fact]
-    public void ProductionCodeHasNoProhibitedInputVolumeAndNoPathEnumeration()
+    public void ProductionCodeKeepsItsRetiredStringsAndVersionStampRetired()
     {
         // Structural guard over the whole shipped tree: the retired machine-specific
-        // volume rule must not come back under any name, and nothing in production
-        // may enumerate directories or volumes to decide about a path.
+        // volume rule must not come back under any name, nothing in production may
+        // enumerate directories or volumes to decide about a path, and no per-phase
+        // application version may reappear now that one shared constant owns it.
         var sourceDirectory = Path.Combine(RepositoryRoot.Value, "src");
         var files = Directory.EnumerateFiles(
             sourceDirectory,
@@ -383,7 +402,18 @@ public sealed class OfflineViewerImportServiceTests
             Assert.DoesNotContain("GetLogicalDrives", source, StringComparison.Ordinal);
             Assert.DoesNotContain("DriveInfo", source, StringComparison.Ordinal);
             Assert.DoesNotContain("EventLogSession", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("1.2.0-phase1c", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("2.0.0-phase2a", source, StringComparison.Ordinal);
         }
+
+        // Exactly one production file may spell the version out; everyone else reads it.
+        var declaringFiles = files
+            .Where(file => File
+                .ReadAllText(file)
+                .Contains(ApplicationVersionInfo.Current, StringComparison.Ordinal))
+            .Select(file => Path.GetFileName(file))
+            .ToArray();
+        Assert.Equal("ApplicationVersionInfo.cs", Assert.Single(declaringFiles));
     }
 
     [Fact]
@@ -434,7 +464,9 @@ public sealed class OfflineViewerImportServiceTests
                 4 * 1024 * 1024,
                 location.JsonlOutputDirectory,
                 2),
-            "1.2.0-integration",
+            // The same constant the production single-argument constructor uses, so the
+            // assertions below pin the value that ships rather than a fixture literal.
+            ApplicationVersionInfo.Current,
             new CorrelationOptions(TimeSpan.FromSeconds(3)),
             new AuditRiskOptions(TimeSpan.FromSeconds(10), 30, 100),
             sources: sources,
@@ -461,6 +493,21 @@ public sealed class OfflineViewerImportServiceTests
         using var command = connection.CreateCommand();
         command.CommandText = $"{schema}{Environment.NewLine}{migration}";
         await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<string?> ReadStoredApplicationVersionAsync(string databasePath)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false
+        }.ToString();
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT application_version FROM import_sessions LIMIT 1;";
+        return (string?)await command.ExecuteScalarAsync();
     }
 
     private static async Task<long> CountImportSessionsAsync(string databasePath)
