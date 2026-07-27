@@ -33,8 +33,11 @@ application fails closed with an explicit error rather than guessing a path.
 
 ## Build rules
 
-- `TreatWarningsAsErrors` is **true** and `AnalysisLevel` is `latest-recommended`.
+- `TreatWarningsAsErrors` is **true** and `AnalysisLevel` is `8.0-recommended`.
   A warning fails the build; please fix the cause rather than suppressing it.
+- The SDK major version is pinned to .NET 8 by `global.json` in the repository root.
+  Run `dotnet --version` and confirm you are actually on a .NET 8 SDK — a newer SDK
+  changes which analyzer rules fire.
 - `Nullable` and `ImplicitUsings` are enabled solution-wide.
 - Keep the build at **0 warnings, 0 errors**.
 

@@ -31,6 +31,26 @@ delete audit trail, and it cannot prevent, block, or recover deletions.
 - It does not start automatically or run in the background.
 - It does not upload anything anywhere.
 
+## Files on a network share
+
+Importing a file that lives on a network share is allowed, but the boundary is
+narrower than it may look, so it is stated here explicitly:
+
+- When you browse to or select a network share in the **Windows file picker**,
+  Windows may already have contacted that location and checked whether the path or
+  file exists. That happens before DeleteAudit is given the path.
+- The confirmation prompt DeleteAudit shows afterwards controls only whether
+  **this application** goes on to check, open and read the selected file.
+- If you confirm, reading that file **does** produce network access. This is not a
+  claim that no network access occurs.
+- Cancelling stops DeleteAudit from doing anything further, but it **cannot undo**
+  whatever the Windows file picker may already have done.
+- DeleteAudit neither stores nor asks you for network credentials.
+
+Copying the file to your own machine first avoids all of this. The user-facing
+explanation is in the README:
+[中文](README.md#关于网络共享上的文件) · [English](README.en.md#about-files-on-a-network-share).
+
 ## Supported versions
 
 Only the latest commit on the default branch receives fixes. There are no
