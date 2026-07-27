@@ -143,6 +143,61 @@ public sealed class ViewerPresentationTests
         Assert.Contains("IsCancel=\"True\"", dialog, StringComparison.Ordinal);
         Assert.Contains("Content=\"取消\"", dialog, StringComparison.Ordinal);
         Assert.Contains("Content=\"继续导入\"", dialog, StringComparison.Ordinal);
+
+        // The README ships in three languages. They are one document, so each has to
+        // reach the other two and carry the same status, licence meaning and reporting
+        // channel — a translation that quietly drops a limitation is a defect too.
+        var repositoryRoot = RepositoryRoot.Value;
+        var readmes = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["README.md"] = readme,
+            ["README.en.md"] = File.ReadAllText(Path.Combine(repositoryRoot, "README.en.md")),
+            ["README.fil.md"] = File.ReadAllText(Path.Combine(repositoryRoot, "README.fil.md"))
+        };
+
+        foreach (var (name, content) in readmes)
+        {
+            // Real prose, not a stub or a bare list of links.
+            Assert.True(content.Length > 2000, name);
+            Assert.StartsWith("# DeleteAudit", content, StringComparison.Ordinal);
+            // Every code fence is closed.
+            Assert.Equal(1, content.Split("```").Length % 2);
+
+            foreach (var other in readmes.Keys.Where(key => !string.Equals(key, name, StringComparison.Ordinal)))
+            {
+                Assert.Contains($"]({other})", content, StringComparison.Ordinal);
+            }
+
+            Assert.Contains("Alpha", content, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("Windows", content, StringComparison.Ordinal);
+            Assert.Contains("MIT", content, StringComparison.Ordinal);
+            Assert.Contains("Private Vulnerability Reporting", content, StringComparison.Ordinal);
+            Assert.Contains("](LICENSE)", content, StringComparison.Ordinal);
+
+            foreach (var conflicting in new[]
+                     {
+                         "noncommercial",
+                         "non-commercial",
+                         "personal use only",
+                         "evaluation only",
+                         "research only",
+                         "禁止商用",
+                         "仅限个人"
+                     })
+            {
+                Assert.DoesNotContain(conflicting, content, StringComparison.OrdinalIgnoreCase);
+            }
+
+            // No machine-specific path and no personal contact detail in a public README.
+            Assert.DoesNotContain(@"C:\Users\", content, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(@"C:\Dev\", content, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotMatch(
+                new System.Text.RegularExpressions.Regex(
+                    @"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                    System.Text.RegularExpressions.RegexOptions.None,
+                    TimeSpan.FromSeconds(2)),
+                content);
+        }
     }
 
     [Fact]

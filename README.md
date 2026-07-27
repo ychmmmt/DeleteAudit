@@ -1,33 +1,69 @@
 # DeleteAudit
 
-> **Alpha / experimental.** Windows 10 / Windows 11 · .NET 8 · MIT licensed.
->
-> DeleteAudit analyses Windows delete-related event data. It offers offline
-> import of event XML/EVTX files and a **live ingestion preview** that the user
-> must start manually. The live preview reads existing Sysmon/Security channels
-> read-only and stores **only a session summary** — live event detail is not
-> persisted. DeleteAudit cannot prevent, block, or recover deletions, does not
-> install Sysmon, does not change audit policy, does not request administrator
-> rights, and does not run in the background. **It is not a complete or
-> production-grade forensic system.**
+**简体中文** · [English](README.en.md) · [Filipino](README.fil.md)
 
-Windows 删除审计应用（Alpha / 实验性）。
+> 面向 Windows 的开源日志查看与整理工具。**Alpha / 实验性。**
 
-- **状态**：Alpha / experimental，非生产可用
-- **支持系统**：Windows 10 / Windows 11
-- **开发环境**：.NET 8 SDK
-- **许可证**：[MIT](LICENSE)
-- **安全策略**：[SECURITY.md](SECURITY.md) · **贡献指南**：[CONTRIBUTING.md](CONTRIBUTING.md) · **行为准则**：[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+DeleteAudit 是一款面向 Windows 的开源日志查看与整理工具。它可以导入受支持的本地日志文件，帮助你查看导入结果，并在你明确开启后预览本机实时日志接入。项目目前仍处于 Alpha 阶段，适合学习、测试和验证工作流，**不应被视为完整或生产级取证系统**。
 
-## 当前进度
+## 这是什么
 
-Phase 2A（实时接入预览）**已封版**。在 Phase 1A 离线审计核心、Phase 1B 离线事件导入管线、Phase 1C 离线 WPF 查看器之上，加入用户手动开启的 Windows Event Log 实时接入预览与会话统计。
+Windows 会把"某个文件被删除了"这类事情记录在系统日志里，但这些日志分散、原始、不易阅读。DeleteAudit 把你**主动选择**的一个日志文件读进来，整理成可以翻阅的列表：什么时间、哪个文件、哪个程序、哪个用户。
 
-最近一次动态验收：7 个项目以 0 warning、0 error 构建；Unit **174**、Integration **55**，合计 **229** 项测试全部通过，无 skip、无失败。
+它是一个**查看和整理**工具，不是防护工具。它不能阻止删除，也不能把已删除的文件找回来。
 
-各阶段验收记录见 `docs/PHASE_1A_ACCEPTANCE.md`、`docs/PHASE_1B_ACCEPTANCE.md`、`docs/PHASE_1C_ACCEPTANCE.md`、`docs/PHASE_2A_ACCEPTANCE.md`。设计总览见 `docs/PROJECT_PLAN.md`，威胁模型见 `docs/THREAT_MODEL.md`，SQLite 结构见 `db/schema.sql`。
+## 主要功能
 
-## 快速开始
+- **离线导入**：一次导入一个你指定的 `.xml` 或 `.evtx` 日志文件。
+- **整理与查看**：按时间、路径、状态浏览导入结果，查看删除事件与原始证据。
+- **实时接入预览**：在"实时接入预览"页点击开始后，只读订阅本机已有的日志通道，显示本次会话的统计。**关闭或停止后，本次实时事件的明细不会保留**，**仅保存监控会话摘要**。
+- **导入记录**：每次导入都会生成一份记录和一个说明文件（manifest），方便你核对导入了什么。
+
+## 适合谁使用
+
+**适合**：想了解 Windows 删除相关日志长什么样的人；需要把一份日志文件整理成可读列表的人；想学习或参与这类工具开发的人。
+
+**暂时不适合**：需要在生产环境或正式调查中使用的人；需要防止误删或阻断攻击的人；需要一个下载即用的安装程序的人。
+
+## 当前状态与限制
+
+- 阶段：**Alpha / experimental**，公开阶段为 **Phase 2A**。
+- 系统：**Windows 10 / Windows 11**。
+- 运行环境：**.NET 8**。
+- **不是完整或生产级取证系统**，不达到正式数字取证产品的标准。
+- 不能防止误删，也不能防住有意的攻击或证据清除。
+- 实时事件的明细目前**不会长期保存**，只保存会话摘要。
+- 实时接入目前只做识别与统计；关联分析、会话聚合、风险评估和长期保存**尚未接入**实时管线，留待 **Phase 2B** 或更后阶段。
+- 本仓库**只提供源代码**。目前**没有**提供可直接使用的、已签名的 Windows 安装包。
+- 最近一次验收：**Unit 174、Integration 55，合计 229 项测试全部通过**，构建 0 warning、0 error。
+
+各阶段的详细验收记录、设计总览与威胁模型见 [`docs/`](docs/)。
+
+## 隐私和安全边界
+
+这部分请认真读一遍：
+
+- **不会在后台偷偷上传你的数据。** DeleteAudit 不把任何数据发送到互联网。
+- **默认不读取实时日志。** 只有你手动点击开始，才会订阅本机日志通道。
+- **不连接远程 Windows 事件日志**，只读本机已经存在的通道。
+- **不会自动去扫描或枚举网络位置**，也不会遍历你的磁盘。
+- **不安装 Sysmon、不改审计策略、不改注册表、不要管理员权限、不后台常驻。**
+- **不保存、也不向你索要任何网络凭据。**
+- 一些特殊的系统内部路径（设备路径，如以 `\\?\`、`\\.\` 开头的写法）**会被直接拒绝**，不接受导入。
+
+### 关于网络共享上的文件
+
+如果你选择的是网络共享（例如 `\\服务器\共享\日志.evtx`）上的文件，请注意两件事的区别：
+
+如果你在 Windows 文件选择器中浏览或选择网络共享，**Windows 可能已经连接该共享**并检查路径或文件。之后出现的确认框只控制 DeleteAudit 是否继续读取和导入；选择取消可以阻止 DeleteAudit 后续操作，但**不能撤销**系统文件选择器此前可能发生的访问。
+
+确认框默认停在「取消」上，按 Esc 也是取消；每次选择网络共享都会重新询问，答案不会被记住。**建议先把文件复制到本机再导入**，这样最省事，也最不容易出问题。
+
+需要说明的是：这**不等于**"完全不会发生任何网络访问"。你确认继续之后，读取那个共享文件确实会走网络。
+
+## 如何运行或参与开发
+
+目前需要自己从源码构建。你需要 Windows 10/11、[.NET 8 SDK](https://dotnet.microsoft.com/download) 和 Git。
 
 ```bash
 git clone <repository-url>
@@ -37,101 +73,22 @@ dotnet build --no-restore
 dotnet test --no-build
 ```
 
-运行开发版查看器：
+运行查看器：
 
 ```bash
 dotnet run --project src/DeleteAudit.Viewer
 ```
 
-仓库可以克隆到任意合法的本地路径。仓库根目录由构建输出向上查找 `DeleteAudit.sln` 自动解析；查看器数据库与 JSONL 输出固定在 `<仓库根>\artifacts\viewer-data`。
+数据和输出都放在仓库内的 `artifacts\` 目录下，不会写到仓库以外的地方。更详细的构建规则、测试要求与目录约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-### 可选环境变量
+## 反馈安全问题
 
-```bash
-set DELETEAUDIT_REPOSITORY_ROOT=C:\path\to\your\checkout
-```
+发现安全问题，请使用本仓库的 **GitHub Private Vulnerability Reporting**（Security → Report a vulnerability），不要开公开 issue。完整的安全策略和报告须知见 [SECURITY.md](SECURITY.md)。
 
-`DELETEAUDIT_REPOSITORY_ROOT` 用于显式指定仓库根（例如部署场景）。它必须是完全限定的本地目录，不接受 UNC 或设备路径。若环境变量未设置且向上找不到 `DeleteAudit.sln`，程序会 **fail closed** 并给出明确错误，不会退回当前工作目录或任意用户目录。
+报告时请**不要**附上真实的日志数据、真实机器名或真实用户名，用合成样例即可。
 
-## 实时能力边界
+## 贡献与许可证
 
-这是本项目最需要被准确理解的部分：
+欢迎提 issue 和 pull request。参与前请看 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
 
-- **默认不读取实时 Event Log，必须由用户手动开启。** 应用启动、切换页面都不会订阅任何通道；只有在“实时接入预览”页点击“开始监控”后才建立订阅。
-- **只读订阅本机已经存在的通道**：`Microsoft-Windows-Sysmon/Operational` 与 `Security`，服务端 XPath 只过滤 Sysmon 1/23/26 与 Security 4663。不连接远程日志，不使用 `EventLogSession`。
-- **不保存实时事件详情。** 实时事件的原始 XML、删除事实、关联结果和风险结果一律不保存。
-- **仅保存监控会话摘要**：起止时间、通道状态、分类计数、有界诊断。停止监控或关闭应用后，无法在“删除事件”或“原始证据”页面回看本次实时事件详情。
-- **不拦截、不阻止、不恢复删除。**
-- **不安装 Sysmon**，不下载、不配置。
-- **不修改审计策略**，不调用 `wevtutil` / `auditpol` / `sc.exe`，不改注册表、证书、服务或计划任务。
-- **不申请管理员权限**，不触发 UAC。权限不足时降级为可见状态。
-- **不自动启动、不后台常驻。** 点击“停止监控”或关闭窗口即释放全部订阅。
-- 不写入、不清除、不修改任何 Event Log；不上传任何数据。
-- 从订阅那一刻开始接收，**不回放历史**，不创建也不保存 bookmark。
-- **不是完整或生产级取证系统。** 详见 [SECURITY.md](SECURITY.md)。
-
-### 已实现的实时细节
-
-- 只读检测通道是否存在、是否启用、当前用户是否可读，结果区分 `available` / `unavailable` / `access_denied` / `disabled` / `unknown_error`；检测在线程池执行，不阻塞 UI。
-- 有界队列（默认 2048 条，`AllowSynchronousContinuations=false`），队列满时计数丢弃并给出限频可见警告，绝不阻塞事件投递线程。
-- 单条事件 XML 上限 1,048,576 个 UTF-16 code unit；超限不入队、不解析、不截断冒充完整事件。
-- 分类计数按语义拆分：删除事实（Sysmon 23/26）、进程上下文（Sysmon 1）、安全补强（Security 4663 命中 DELETE/DELETE_CHILD）、忽略、错误、丢弃、停止后丢弃。**进程上下文与安全补强永不作为删除事实呈现。**
-- 通道、Provider 与 EventID 三者不一致时 fail closed。
-- 每会话最多保留前 256 条真实诊断，单条消息最多 2048 字符，超出部分只累加计数。
-- 启动前校验实时监控所需的数据库结构；缺失时 fail closed，不创建任何 watcher、不读取任何实时事件。
-
-### 尚未实现，留待 Phase 2B 或更后阶段
-
-实时原始 XML 持久化、实时删除事实持久化、进程上下文关联、删除会话聚合、风险计算、实时证据哈希链。实时管线目前只复用 Phase 1A 的 `WindowsEventXmlParser`；`DeleteEventCorrelator`、`DeleteSessionAggregator` 与风险模型**尚未接入**实时管线。Phase 2B 将为实时证据设计独立的身份与持久化结构，不会伪造 `import_session`、输入文件 SHA-256、channel epoch 或离线哈希链锚点。
-
-## 离线导入边界
-
-- 导入只接受调用方明确给出的、完全限定的单个 `.xml` 或 `.evtx` 文件路径；不扫描目录，不接受重解析点、设备路径或备用数据流。
-- **不自动枚举任何路径**：产品代码中不存在 `EnumerateFiles`、`EnumerateDirectories`、`GetDirectories`、`DriveInfo`、`GetLogicalDrives`，既不遍历网络位置，也不枚举本机盘符。
-- **不连接远程 Windows Event Log**，不使用 `EventLogSession`。
-- **不保存、也不向你索要任何网络凭据。**
-
-### 普通 UNC 输入需要逐次确认
-
-这个确认框管的是 **DeleteAudit 自己的导入行为**，不是整个操作系统的网络行为。请先分清两件事：
-
-**一、Windows 系统文件选择器（不在 DeleteAudit 控制范围内）**
-
-你在系统文件选择器里浏览、输入或选择网络位置时，**Windows 可能已经连接该共享，并检查路径或文件是否存在**（选择器本身启用了 `CheckPathExists` 与 `CheckFileExists`），也可能使用你当前的登录凭据协商访问。这些发生在 DeleteAudit 拿到所选路径**之前**，属于系统选择器的行为，**不代表 DeleteAudit 已经开始导入**，而且**无法被选择完成之后的确认框撤销**。
-
-**二、DeleteAudit 自己的导入（确认框控制的部分）**
-
-- **普通 UNC 文件（`\\server\share\file.evtx`、`//server/share/file.xml`）只有在你主动选择、并逐次明确确认之后，才会被 DeleteAudit 检查、打开和读取。** 确认框会说明上述系统选择器行为、继续后 DeleteAudit 会开始检查并读取该文件、网络不可用时可能失败或长时间无响应，并建议先把文件复制到本机再导入。按钮是「取消」与「继续导入」，**默认按钮是「取消」**，按 Esc 同样是取消。
-- **取消之后，DeleteAudit 自身不做任何后续动作**：不调用导入服务、不检查输入文件属性、不打开或读取该文件、不创建或修改数据库、JSONL、manifest 或任何输出，也不弹出失败错误（与取消选择文件的安静语义一致）。**但取消不能撤销 Windows 文件选择器此前可能已经发生的访问。**
-- **确认之后确实会产生网络读取**：DeleteAudit 会通过网络逐段检查路径、打开文件、读取全文并计算 SHA-256。确认机制保证的是这一步永远由你明确同意、逐次同意，而不是保证"全程没有网络访问"。
-- **确认只对这一次导入、这一条路径有效**，不写入配置、不被记住。再次选择同一共享会再次确认；确认一条路径不会顺带授权另一条路径。
-- **服务边界携带同一个一次性状态**：`ImportAsync(path, networkPathConfirmed)` 与 `ImportRequest.NetworkPathConfirmed`，两者默认都是 `false`。未携带确认状态的普通 UNC 请求会在 **DeleteAudit 自身的任何文件系统或网络访问之前**以诊断码 `network_path_confirmation_required` 被拒绝，因此非交互调用无法绕过确认；未接入确认界面时一律拒绝（fail closed）。
-- **设备命名空间路径仍然直接拒绝**：`\\?\`、`\\.\`、`\??\` 以及 `\\?\UNC\server\share\…` 一律返回 `device_path_rejected`，永远不会被当作可确认的普通 UNC 弹窗。
-- DeleteAudit 的路径分类是**纯字符串判断，不执行任何 I/O**，UI 与服务边界共用同一份实现；DeleteAudit 判断"这是远程路径"这件事本身不会触碰网络。
-- **不自动枚举网络路径**，**不连接远程 Windows Event Log**，**不保存也不向你索要网络凭据**。
-- **映射网络盘（例如 `Z:\`）不在字面 UNC 检测范围内。** 映射盘在字符串上与本机完全限定路径无法区分，识别它必须查询驱动器，而那正是分类逻辑拒绝执行的 I/O；因此选择 `Z:\` 不会触发网络确认。本项目也不会因为盘符字母而拒绝任何路径。
-- **建议先把文件复制到本机再导入**，这样两侧的网络访问都不会发生。
-- WPF 只通过 `OfflineImportPipeline` 写入；UI 不执行 SQL，也不创建或迁移 schema。
-- 结构化查询只通过专用只读应用服务，SQLite 连接固定为 `ReadOnly`；列表查询采用参数化筛选和最大 200 项的服务端分页。
-- Raw XML 按事件 ID 延迟读取，查询端只通过参数化 `length`/`substr` 返回前 262,144 个字符的只读预览；超限时 UI 明确标记截断并显示原始/预览字符数，复制操作仅复制预览，数据库中的原始证据不被修改。
-- EVTX 适配器只构造 `EventLogQuery(filePath, PathType.FilePath)`，不连接日志通道、会话或实时订阅。
-- 文件 SHA-256 是导入身份；同内容再次导入返回 `already_imported`。
-- 数据库迁移是显式增量（`db/migrations/`），运行时代码只验证 schema，从不自动执行迁移，也不自动建库。
-- 缺失字段在 UI 中显示为“未知”；原始值以 nullable 状态保留，不会被推测值覆盖。
-- 查看器顶部持续显示能力横幅：“当前支持离线日志分析，以及用户手动开启的实时事件接入预览；实时事件详情暂不持久保存。”
-
-## 数据存放位置
-
-所有运行时产物都在仓库内的 `artifacts\` 下（已被 `.gitignore` 排除）：
-
-| 路径 | 内容 |
-| --- | --- |
-| `artifacts\viewer-data\` | 查看器 SQLite 数据库与 JSONL 输出 |
-| `artifacts\test-output\` | 测试输出 |
-| `artifacts\nuget-packages\` | 本地 NuGet 包缓存（见 `NuGet.Config`） |
-
-应用不创建 `C:\ProgramData\DeleteAudit`，不访问用户配置目录，也不写入仓库以外的任何位置。
-
-## 许可证
-
-[MIT](LICENSE) · Copyright (c) 2026 DeleteAudit contributors
+本项目采用 **MIT 许可证**，可以用于个人或商业用途，也可以修改和分发，但须保留许可证和版权声明。全文见 [LICENSE](LICENSE)。
