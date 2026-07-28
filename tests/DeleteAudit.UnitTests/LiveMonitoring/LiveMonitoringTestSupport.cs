@@ -242,6 +242,10 @@ internal sealed class FakeChannelWatcher : IDisposable
 internal sealed class FakeRepository : ILiveMonitoringRepository
 {
     private readonly List<LiveMonitoringSession> _sessions = [];
+    private readonly List<LiveCaptureSessionStart> _starts = [];
+    private readonly List<LiveCaptureCompletion> _completions = [];
+    private readonly List<LiveCaptureRecord> _records = [];
+    private readonly List<int> _batchSizes = [];
     private readonly List<IReadOnlyList<LiveMonitoringDiagnostic>> _diagnostics = [];
     private readonly object _sync = new();
 
@@ -249,14 +253,25 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
 
     public Exception? ValidateException { get; init; }
 
+    public Exception? StartException { get; init; }
+
+    public Exception? AppendException { get; init; }
+
     /// <summary>Held open to park a save mid-flight and interleave a concurrent Stop.</summary>
     public ManualResetEventSlim? SaveGate { get; init; }
+
+    /// <summary>Held open to park an append mid-flight.</summary>
+    public ManualResetEventSlim? AppendGate { get; init; }
 
     public TimeSpan SaveGatePatience { get; init; } = TimeSpan.FromSeconds(10);
 
     public int SaveCount { get; private set; }
 
     public int ValidateCount { get; private set; }
+
+    public int StartCount { get; private set; }
+
+    public int AppendCount { get; private set; }
 
     public IReadOnlyList<LiveMonitoringSession> Sessions
     {
@@ -265,6 +280,50 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
             lock (_sync)
             {
                 return [.. _sessions];
+            }
+        }
+    }
+
+    public IReadOnlyList<LiveCaptureSessionStart> Starts
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return [.. _starts];
+            }
+        }
+    }
+
+    public IReadOnlyList<LiveCaptureCompletion> Completions
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return [.. _completions];
+            }
+        }
+    }
+
+    public IReadOnlyList<LiveCaptureRecord> Records
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return [.. _records];
+            }
+        }
+    }
+
+    public IReadOnlyList<int> BatchSizes
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return [.. _batchSizes];
             }
         }
     }
@@ -293,7 +352,49 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
             : Task.FromException(ValidateException);
     }
 
-    public Task SaveSessionAsync(
+    public Task StartCaptureSessionAsync(
+        LiveCaptureSessionStart start,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_sync)
+        {
+            StartCount++;
+            if (StartException is not null)
+            {
+                return Task.FromException(StartException);
+            }
+
+            _starts.Add(start);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public Task AppendRecordsAsync(
+        IReadOnlyList<LiveCaptureRecord> records,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_sync)
+        {
+            AppendCount++;
+            _batchSizes.Add(records.Count);
+            if (AppendException is not null)
+            {
+                return Task.FromException(AppendException);
+            }
+
+            _records.AddRange(records);
+        }
+
+        // Waits on a real signal; the timeout only guards against a hung test.
+        AppendGate?.Wait(SaveGatePatience, CancellationToken.None);
+        return Task.CompletedTask;
+    }
+
+    public Task CompleteSessionAsync(
+        LiveCaptureCompletion completion,
         LiveMonitoringSession session,
         IReadOnlyList<LiveMonitoringDiagnostic> diagnostics,
         CancellationToken cancellationToken = default)
@@ -307,6 +408,7 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
                 return Task.FromException(SaveException);
             }
 
+            _completions.Add(completion);
             _sessions.Add(session);
             _diagnostics.Add(diagnostics);
         }

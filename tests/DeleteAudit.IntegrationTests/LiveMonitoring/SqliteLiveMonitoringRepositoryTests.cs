@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using DeleteAudit.Domain;
+using DeleteAudit.Infrastructure;
 using DeleteAudit.Infrastructure.LiveMonitoring;
 using DeleteAudit.Infrastructure.Viewing;
 using Microsoft.Data.Sqlite;
@@ -36,7 +37,7 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => repository.ValidateSchemaAsync());
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => repository.SaveSessionAsync(CreateSession(), []));
+            () => SaveSessionAsync(repository, CreateSession(), []));
 
         Assert.False(File.Exists(location.DatabasePath));
     }
@@ -97,7 +98,7 @@ public sealed class SqliteLiveMonitoringRepositoryTests
                 StartedUtc.AddSeconds(5))
         };
 
-        await repository.SaveSessionAsync(session, diagnostics);
+        await SaveSessionAsync(repository, session, diagnostics);
 
         var stored = await ReadSessionAsync(location, session.LiveSessionId);
         Assert.Equal("stopped", stored.FinalState);
@@ -120,6 +121,286 @@ public sealed class SqliteLiveMonitoringRepositoryTests
     }
 
     [Fact]
+    public async Task MissingEvidenceSchemaFailsClosedNamingThe0004Migration()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(
+            location,
+            applyLiveMigration: true,
+            applyEvidenceMigration: false);
+        var repository = new SqliteLiveMonitoringRepository(location);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => repository.ValidateSchemaAsync());
+
+        Assert.Contains("live_capture_sessions", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            "0004_phase_2b_live_evidence.sql",
+            exception.Message,
+            StringComparison.Ordinal);
+        // Failing validation must never bring the missing tables into existence.
+        Assert.Equal(0, await CountCaptureTablesAsync(location));
+    }
+
+    [Fact]
+    public async Task CaptureSessionStartIsPersistedExactly()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var start = new LiveCaptureSessionStart(
+            "aaaaaaaa-0000-0000-0000-000000000001",
+            StartedUtc,
+            2048,
+            "0.1.0-alpha");
+
+        await repository.StartCaptureSessionAsync(start);
+
+        Assert.Equal(1, await ScalarAsync(
+            location,
+            "SELECT COUNT(*) FROM live_capture_sessions WHERE queue_capacity = 2048;"));
+        // A start on its own is a legal, queryable state: the capture is running.
+        Assert.Equal(0, await ScalarAsync(
+            location,
+            "SELECT COUNT(*) FROM live_capture_completions;"));
+    }
+
+    [Fact]
+    public async Task RecordsAreAppendedInSequenceOrderWithTheirExactDigest()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var sessionId = await StartCaptureAsync(repository);
+
+        await repository.AppendRecordsAsync(
+        [
+            CaptureRecord(sessionId, 1, "<Event>one</Event>"),
+            CaptureRecord(sessionId, 2, "<Event>two</Event>")
+        ]);
+
+        Assert.Equal(
+            [$"{sessionId}:1", $"{sessionId}:2"],
+            await ReadEvidenceIdsAsync(location));
+        var storedDigest = await BlobAsync(
+            location,
+            $"SELECT raw_xml_sha256 FROM live_capture_records WHERE received_sequence = 1;");
+        Assert.Equal(
+            SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("<Event>one</Event>")),
+            storedDigest);
+    }
+
+    [Fact]
+    public async Task ADuplicateSequenceAbortsTheWholeBatch()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var sessionId = await StartCaptureAsync(repository);
+        await repository.AppendRecordsAsync([CaptureRecord(sessionId, 1)]);
+
+        // The second batch reuses sequence 1. Nothing in it may survive: no OR IGNORE,
+        // no OR REPLACE, no partial batch.
+        await Assert.ThrowsAsync<SqliteException>(
+            () => repository.AppendRecordsAsync(
+            [
+                CaptureRecord(sessionId, 1, "<Event>replayed</Event>"),
+                CaptureRecord(sessionId, 5)
+            ]));
+
+        Assert.Equal([$"{sessionId}:1"], await ReadEvidenceIdsAsync(location));
+        Assert.Equal("<Event />", await TextAsync(
+            location,
+            "SELECT raw_xml FROM live_capture_records WHERE received_sequence = 1;"));
+    }
+
+    [Fact]
+    public async Task ABatchMayNotSpanTwoSessionsOrGoBackwards()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var sessionId = await StartCaptureAsync(repository);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => repository.AppendRecordsAsync(
+            [
+                CaptureRecord(sessionId, 1),
+                CaptureRecord("bbbbbbbb-0000-0000-0000-000000000002", 2)
+            ]));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => repository.AppendRecordsAsync(
+            [
+                CaptureRecord(sessionId, 2),
+                CaptureRecord(sessionId, 1)
+            ]));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => repository.AppendRecordsAsync([]));
+
+        Assert.Equal(0, await ScalarAsync(
+            location,
+            "SELECT COUNT(*) FROM live_capture_records;"));
+    }
+
+    [Fact]
+    public async Task RepositoryUsesNeitherIgnoreNorReplace()
+    {
+        // Structural guard: evidence must never be silently skipped or overwritten.
+        var source = await File.ReadAllTextAsync(Path.Combine(
+            RepositoryRoot.Value,
+            "src",
+            "DeleteAudit.Infrastructure",
+            "LiveMonitoring",
+            "SqliteLiveMonitoringRepository.cs"));
+
+        Assert.DoesNotContain("INSERT OR IGNORE", source, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("INSERT OR REPLACE", source, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("UPDATE live_capture", source, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("DELETE FROM live_capture", source, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task CompletionAndSummaryShareOneTransactionAndTheSameCounts()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var counters = new LiveMonitoringCounters(
+            Received: 4,
+            DeleteFact: 1,
+            Ignored: 1,
+            Error: 1,
+            Dropped: 1,
+            LateDiscarded: 2,
+            SuppressedDiagnostics: 3);
+        var session = CreateSession(counters: counters);
+        await repository.StartCaptureSessionAsync(new LiveCaptureSessionStart(
+            session.LiveSessionId,
+            session.StartedUtc,
+            session.QueueCapacity,
+            session.ApplicationVersion));
+
+        await repository.CompleteSessionAsync(
+            new LiveCaptureCompletion(
+                session.LiveSessionId,
+                StartedUtc.AddMinutes(3),
+                LiveMonitoringState.Stopped,
+                counters,
+                PersistedRecordCount: 3),
+            session,
+            []);
+
+        // Both rows exist and agree; that is what one transaction buys.
+        var completionRow = await RowAsync(
+            location,
+            """
+            SELECT received_count, delete_fact_count, ignored_count, error_count,
+                   dropped_count, persisted_record_count
+            FROM live_capture_completions;
+            """);
+        var summaryRow = await RowAsync(
+            location,
+            """
+            SELECT received_count, delete_fact_count, ignored_count, error_count,
+                   dropped_count
+            FROM live_monitoring_sessions;
+            """);
+
+        Assert.Equal(new long[] { 4, 1, 1, 1, 1, 3 }, completionRow);
+        Assert.Equal(new long[] { 4, 1, 1, 1, 1 }, summaryRow);
+    }
+
+    [Fact]
+    public async Task CompletingAnUnstartedSessionWritesNothing()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var session = CreateSession();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => repository.CompleteSessionAsync(
+                new LiveCaptureCompletion(
+                    session.LiveSessionId,
+                    StartedUtc,
+                    LiveMonitoringState.Stopped,
+                    LiveMonitoringCounters.Empty,
+                    0),
+                session,
+                []));
+
+        // The whole transaction rolled back, so no summary leaked out either.
+        Assert.Equal(0, await CountSessionsAsync(location));
+        Assert.Equal(0, await ScalarAsync(
+            location,
+            "SELECT COUNT(*) FROM live_capture_completions;"));
+    }
+
+    [Fact]
+    public async Task ASessionMayBeCompletedOnlyOnce()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var session = CreateSession();
+        await SaveSessionAsync(repository, session, []);
+
+        await Assert.ThrowsAsync<SqliteException>(
+            () => repository.CompleteSessionAsync(
+                new LiveCaptureCompletion(
+                    session.LiveSessionId,
+                    StartedUtc.AddMinutes(9),
+                    LiveMonitoringState.Error,
+                    session.Counters,
+                    0),
+                session,
+                []));
+
+        Assert.Equal(1, await ScalarAsync(
+            location,
+            "SELECT COUNT(*) FROM live_capture_completions;"));
+        Assert.Equal("stopped", await TextAsync(
+            location,
+            "SELECT final_state FROM live_capture_completions;"));
+    }
+
+    [Fact]
+    public async Task ViewerConnectionStillRefusesWritesToCaptureTables()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+
+        await using var connection = location.CreateReadOnlyConnection();
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO live_capture_sessions (
+                live_session_id, started_utc, queue_capacity, application_version)
+            VALUES ('forbidden', '2026-07-25T09:00:00.0000000+00:00', 1, 'test');
+            """;
+
+        var exception = await Assert.ThrowsAsync<SqliteException>(
+            () => command.ExecuteNonQueryAsync());
+        Assert.Equal(8, exception.SqliteErrorCode);
+    }
+
+    [Fact]
+    public async Task CaptureWritesDoNotDisturbOfflineEvidenceTables()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var evidenceBefore = await ReadEvidenceTableShapeAsync(location);
+        var sessionId = await StartCaptureAsync(repository);
+
+        await repository.AppendRecordsAsync([CaptureRecord(sessionId, 1)]);
+
+        Assert.Equal(evidenceBefore, await ReadEvidenceTableShapeAsync(location));
+        Assert.Equal(0, await ScalarAsync(location, "SELECT COUNT(*) FROM raw_events;"));
+        Assert.Equal(0, await ScalarAsync(location, "SELECT COUNT(*) FROM delete_events;"));
+    }
+
+    [Fact]
     public async Task UnbalancedCountersAreRejectedBeforeAnyWrite()
     {
         var location = CreateLocation();
@@ -132,7 +413,7 @@ public sealed class SqliteLiveMonitoringRepositoryTests
                 Ignored: 1));
 
         await Assert.ThrowsAsync<ArgumentException>(
-            () => repository.SaveSessionAsync(session, []));
+            () => SaveSessionAsync(repository, session, []));
 
         Assert.Equal(0, await CountSessionsAsync(location));
     }
@@ -171,7 +452,7 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         await CreateDatabaseAsync(location, applyLiveMigration: true);
         var repository = new SqliteLiveMonitoringRepository(location);
         var session = CreateSession();
-        await repository.SaveSessionAsync(session, []);
+        await SaveSessionAsync(repository, session, []);
 
         await using var connection = CreateWritableConnection(location.DatabasePath);
         await connection.OpenAsync();
@@ -209,7 +490,7 @@ public sealed class SqliteLiveMonitoringRepositoryTests
                 StartedUtc.AddSeconds(index)))
             .ToArray();
 
-        await repository.SaveSessionAsync(session, diagnostics);
+        await SaveSessionAsync(repository, session, diagnostics);
 
         Assert.Equal(
             LiveMonitoringLimits.MaxDiagnostics,
@@ -231,7 +512,7 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         var repository = new SqliteLiveMonitoringRepository(location);
         var evidenceBefore = await ReadEvidenceTableShapeAsync(location);
 
-        await repository.SaveSessionAsync(CreateSession(), []);
+        await SaveSessionAsync(repository, CreateSession(), []);
 
         Assert.Equal(evidenceBefore, await ReadEvidenceTableShapeAsync(location));
         Assert.Equal(1, await CountSessionsAsync(location));
@@ -329,9 +610,37 @@ public sealed class SqliteLiveMonitoringRepositoryTests
             Path.Combine(directory, "jsonl"));
     }
 
+    /// <summary>
+    /// Starts a capture session and then completes it, which is what the service does.
+    /// Completion and the Phase 2A summary share one transaction, so the summary can only
+    /// be written this way.
+    /// </summary>
+    private static async Task SaveSessionAsync(
+        SqliteLiveMonitoringRepository repository,
+        LiveMonitoringSession session,
+        IReadOnlyList<LiveMonitoringDiagnostic> diagnostics,
+        long persistedRecordCount = 0)
+    {
+        await repository.StartCaptureSessionAsync(new LiveCaptureSessionStart(
+            session.LiveSessionId,
+            session.StartedUtc,
+            session.QueueCapacity,
+            session.ApplicationVersion));
+        await repository.CompleteSessionAsync(
+            new LiveCaptureCompletion(
+                session.LiveSessionId,
+                session.StoppedUtc ?? session.StartedUtc,
+                session.FinalState,
+                session.Counters,
+                persistedRecordCount),
+            session,
+            diagnostics);
+    }
+
     private static async Task CreateDatabaseAsync(
         ViewerDataLocation location,
-        bool applyLiveMigration)
+        bool applyLiveMigration,
+        bool? applyEvidenceMigration = null)
     {
         await using var connection = CreateWritableConnection(location.DatabasePath);
         await connection.OpenAsync();
@@ -348,6 +657,12 @@ public sealed class SqliteLiveMonitoringRepositoryTests
                 Path.Combine(fixtures, "0003_phase_2a_live_monitoring.sql")));
         }
 
+        if (applyEvidenceMigration ?? applyLiveMigration)
+        {
+            scripts.Add(await File.ReadAllTextAsync(
+                Path.Combine(fixtures, "0004_phase_2b_live_evidence.sql")));
+        }
+
         using var command = connection.CreateCommand();
         command.CommandText = string.Join(Environment.NewLine, scripts);
         await command.ExecuteNonQueryAsync();
@@ -361,6 +676,108 @@ public sealed class SqliteLiveMonitoringRepositoryTests
             Cache = SqliteCacheMode.Private,
             Pooling = false
         }.ToString());
+
+    /// <summary>
+    /// A synthetic captured record. The machine and provider names are fixtures; no real
+    /// event log is read anywhere in these tests.
+    /// </summary>
+    private static LiveCaptureRecord CaptureRecord(
+        string sessionId,
+        long sequence,
+        string rawXml = "<Event />") =>
+        new(
+            LiveEvidenceIdentity.Create(sessionId, sequence),
+            sessionId,
+            sequence,
+            41,
+            LiveMonitoringChannels.SysmonProvider,
+            LiveMonitoringChannels.SysmonOperational,
+            "LAB-PC",
+            StartedUtc,
+            StartedUtc,
+            rawXml,
+            SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(rawXml)),
+            "raw-1",
+            26,
+            LiveEventOutcome.Ignored,
+            null,
+            null);
+
+    private static async Task<string> StartCaptureAsync(
+        SqliteLiveMonitoringRepository repository)
+    {
+        var sessionId = Guid.NewGuid().ToString("D");
+        await repository.StartCaptureSessionAsync(new LiveCaptureSessionStart(
+            sessionId,
+            StartedUtc,
+            2048,
+            "0.1.0-alpha"));
+        return sessionId;
+    }
+
+    private static async Task<string[]> ReadEvidenceIdsAsync(ViewerDataLocation location)
+    {
+        await using var connection = location.CreateReadOnlyConnection();
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT live_evidence_id
+            FROM live_capture_records
+            ORDER BY received_sequence;
+            """;
+        var values = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            values.Add(reader.GetString(0));
+        }
+
+        return [.. values];
+    }
+
+    private static async Task<byte[]> BlobAsync(ViewerDataLocation location, string sql)
+    {
+        await using var connection = location.CreateReadOnlyConnection();
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return (byte[])(await command.ExecuteScalarAsync() ?? Array.Empty<byte>());
+    }
+
+    private static async Task<string> TextAsync(ViewerDataLocation location, string sql)
+    {
+        await using var connection = location.CreateReadOnlyConnection();
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return (string)(await command.ExecuteScalarAsync() ?? string.Empty);
+    }
+
+    private static async Task<long[]> RowAsync(ViewerDataLocation location, string sql)
+    {
+        await using var connection = location.CreateReadOnlyConnection();
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        var values = new long[reader.FieldCount];
+        for (var index = 0; index < reader.FieldCount; index++)
+        {
+            values[index] = reader.GetInt64(index);
+        }
+
+        return values;
+    }
+
+    private static async Task<long> CountCaptureTablesAsync(ViewerDataLocation location) =>
+        await ScalarAsync(
+            location,
+            """
+            SELECT COUNT(*)
+            FROM sqlite_master
+            WHERE type = 'table' AND name LIKE 'live_capture_%';
+            """);
 
     private static async Task<long> CountLiveTablesAsync(ViewerDataLocation location) =>
         await ScalarAsync(

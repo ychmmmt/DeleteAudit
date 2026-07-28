@@ -117,14 +117,51 @@ public interface ILiveMonitoringService : IAsyncDisposable
 }
 
 /// <summary>
-/// Persistence boundary for live monitoring sessions. Writes are additive only:
-/// no schema creation, no migration, no destructive statements.
+/// Persistence boundary for live monitoring sessions and live captured evidence.
 /// </summary>
+/// <remarks>
+/// <para>
+/// Writes are additive only: the implementation never creates a database, never applies
+/// a migration, and never issues a destructive statement. A missing schema is a visible
+/// failure, not something to repair on the fly.
+/// </para>
+/// <para>
+/// Every method here is called from a background workflow or a lifecycle transition.
+/// None of them may be called from a watcher delivery callback: that thread does no
+/// database I/O at all.
+/// </para>
+/// <para>
+/// Completion and the Phase 2A session summary are deliberately one operation
+/// (<see cref="CompleteSessionAsync"/>) so they commit together and can never disagree
+/// about how a session ended.
+/// </para>
+/// </remarks>
 public interface ILiveMonitoringRepository
 {
     Task ValidateSchemaAsync(CancellationToken cancellationToken = default);
 
-    Task SaveSessionAsync(
+    /// <summary>
+    /// Appends the session-start fact. Must succeed before any watcher is created, so a
+    /// capture that reads events always has a row explaining where they came from.
+    /// </summary>
+    Task StartCaptureSessionAsync(
+        LiveCaptureSessionStart start,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Appends one bounded batch of captured records in a single transaction. All rows
+    /// commit or none do; duplicates are rejected rather than ignored or replaced.
+    /// </summary>
+    Task AppendRecordsAsync(
+        IReadOnlyList<LiveCaptureRecord> records,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Appends the completion fact and the Phase 2A session summary in one transaction.
+    /// A session may be completed only once.
+    /// </summary>
+    Task CompleteSessionAsync(
+        LiveCaptureCompletion completion,
         LiveMonitoringSession session,
         IReadOnlyList<LiveMonitoringDiagnostic> diagnostics,
         CancellationToken cancellationToken = default);

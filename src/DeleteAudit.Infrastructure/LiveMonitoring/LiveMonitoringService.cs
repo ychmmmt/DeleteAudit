@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Channels;
 using DeleteAudit.Application.LiveMonitoring;
 using DeleteAudit.Domain;
@@ -6,18 +8,24 @@ using DeleteAudit.Infrastructure.Parsing;
 namespace DeleteAudit.Infrastructure.LiveMonitoring;
 
 /// <summary>
-/// Drives one user-initiated live preview session: validate schema, probe, subscribe,
-/// hand records to a bounded queue, classify them on a background worker, then persist
-/// the session summary. Nothing starts by itself and nothing restarts after a fault.
+/// Drives one user-initiated live capture session: validate schema, record that the
+/// session started, probe, subscribe, hand records to a bounded queue, classify them on
+/// a background worker, append the captured evidence in bounded batches, then record the
+/// completion together with the session summary. Nothing starts by itself and nothing
+/// restarts after a fault.
 ///
-/// Scope: this service classifies events in memory and records per-session counts. It
-/// does not persist raw XML, delete facts, correlation, sessions, or risk — that is
-/// Phase 2B and will need its own evidence identity.
+/// Scope (Phase 2B.1): raw XML and the classification of each received record are
+/// persisted under a dedicated live evidence identity. Correlation, delete session
+/// aggregation and risk assessment are still not wired into the live path, and nothing
+/// here is written into the offline evidence tables.
 /// </summary>
 public sealed class LiveMonitoringService : ILiveMonitoringService
 {
     public const string SchemaNotReadyMessage =
-        "实时监控数据库结构尚未准备完成，请应用 0003 migration。";
+        "实时监控数据库结构尚未准备完成，请应用 0003 与 0004 migration。";
+
+    public const string SessionStartNotPersistedMessage =
+        "无法记录实时接入会话的开始事实，未创建任何订阅。";
 
     private readonly ILiveEventChannelProbe _probe;
     private readonly ILiveEventSource _source;
@@ -63,13 +71,37 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
 
     private bool _acceptingEvents;
 
+    /// <summary>
+    /// Receive position within this session, assigned on the delivery thread before the
+    /// queue decision. A record that is dropped or refused for size still consumes one,
+    /// so a gap in the persisted sequence is exactly the evidence that something was
+    /// received but not stored.
+    /// </summary>
+    private long _receivedSequence;
+
+    /// <summary>
+    /// Whether the session-start row reached the database. Completion may only be written
+    /// for a session that was actually started.
+    /// </summary>
+    private bool _captureStarted;
+
+    /// <summary>Rows this session has committed to live_capture_records.</summary>
+    private long _persistedRecordCount;
+
+    /// <summary>
+    /// Set once appending evidence has failed. The consumer keeps classifying so the
+    /// balance invariant survives, but it stops writing: a faulted session must never
+    /// look like a complete capture.
+    /// </summary>
+    private bool _persistenceFaulted;
+
     // Three distinct facts, deliberately not collapsed into one flag.
     private bool _completionStarted = true;
     private bool _lifecycleCompleted = true;
     private bool _persisted;
 
     private LiveEventSubscription? _subscription;
-    private Channel<LiveEventRecord>? _queue;
+    private Channel<LiveQueuedRecord>? _queue;
     private Task? _consumer;
     private CancellationTokenSource? _consumerCts;
     private Task? _faultShutdown;
@@ -177,6 +209,32 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                 return;
             }
 
+            // The start fact is recorded before anything is probed or subscribed, so a
+            // capture that later dies abruptly still leaves a row explaining what ran.
+            try
+            {
+                await _repository
+                    .StartCaptureSessionAsync(
+                        new LiveCaptureSessionStart(
+                            _liveSessionId!,
+                            _startedUtc,
+                            _options.QueueCapacity,
+                            _options.ApplicationVersion),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                _captureStarted = true;
+            }
+            catch (Exception exception) when (IsExpectedFailure(exception))
+            {
+                AddDiagnostic(
+                    "live_capture_session_start_failed",
+                    exception.Message,
+                    ImportDiagnosticSeverity.Error,
+                    "persist");
+                await AbortStartAsync(SessionStartNotPersistedMessage).ConfigureAwait(false);
+                return;
+            }
+
             var statuses = await _probe
                 .ProbeAsync(LiveMonitoringChannels.All, cancellationToken)
                 .ConfigureAwait(false);
@@ -203,7 +261,7 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             }
 
             _subscription = subscription;
-            _queue = Channel.CreateBounded<LiveEventRecord>(
+            _queue = Channel.CreateBounded<LiveQueuedRecord>(
                 CreateQueueOptions(_options.QueueCapacity));
             _consumerCts = new CancellationTokenSource();
             _consumer = Task.Run(
@@ -362,17 +420,24 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
         Counters counters;
         LiveMonitoringDiagnostic[] diagnostics;
         bool faulted;
+        long persistedRecords;
         lock (_sessionLock)
         {
             counters = _counters;
             diagnostics = [.. _diagnostics];
             faulted = _sessionFaulted;
+            persistedRecords = _persistedRecordCount;
         }
 
         var finalState = faulted
             ? LiveMonitoringState.Error
             : LiveMonitoringState.Stopped;
-        await PersistSessionAsync(finalState, counters, diagnostics, cancellationToken)
+        await PersistSessionAsync(
+                finalState,
+                counters,
+                persistedRecords,
+                diagnostics,
+                cancellationToken)
             .ConfigureAwait(false);
 
         _lifecycleCompleted = true;
@@ -399,7 +464,7 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
     /// </summary>
     private async Task<IReadOnlyList<PipelineFailure>> ReleasePipelineAsync()
     {
-        var failures = new List<PipelineFailure>(2);
+        var failures = new List<PipelineFailure>(3);
         var consumer = _consumer;
         var queue = _queue;
 
@@ -465,20 +530,39 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
         return failures;
     }
 
+    /// <summary>
+    /// The single background consumer. Each record is parsed exactly once; that one parse
+    /// feeds both the counters and the persisted evidence row. Records accumulate in a
+    /// bounded batch that is flushed when it fills and unconditionally when the stream
+    /// ends, so Stop always writes whatever is still pending.
+    /// </summary>
+    /// <remarks>
+    /// Known limitation: with no timed flush, a quiet session can hold up to
+    /// <see cref="LiveMonitoringLimits.MaxCaptureBatchRecords"/> - 1 classified records in
+    /// memory until it stops. An abrupt process termination loses exactly those, which is
+    /// why a session with no completion row must be read as "did not finish cleanly".
+    /// </remarks>
     private async Task ConsumeAsync(
-        ChannelReader<LiveEventRecord> reader,
+        ChannelReader<LiveQueuedRecord> reader,
         CancellationToken cancellationToken)
     {
+        var batch = new List<LiveCaptureRecord>(
+            LiveMonitoringLimits.MaxCaptureBatchRecords);
         try
         {
-            await foreach (var record in reader
+            await foreach (var queued in reader
                 .ReadAllAsync(cancellationToken)
                 .ConfigureAwait(false))
             {
                 Interlocked.Decrement(ref _queueDepth);
                 try
                 {
-                    Classify(record);
+                    var processed = Classify(queued);
+                    batch.Add(processed);
+                    if (batch.Count >= LiveMonitoringLimits.MaxCaptureBatchRecords)
+                    {
+                        await FlushAsync(batch, cancellationToken).ConfigureAwait(false);
+                    }
                 }
                 catch (Exception exception)
                 {
@@ -496,22 +580,80 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
         }
+
+        // Unconditional final flush: the stream has ended, so whatever is still pending
+        // is everything this session has left to record.
+        await FlushAsync(batch, CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Classifies one record. Guarantees exactly one count on every path and never
-    /// throws, so a single bad record can never stop the consumer or unbalance the
-    /// counters. Observer notifications are deliberately outside the counting scope.
+    /// Appends one batch and clears it. A failure faults the session and switches the
+    /// consumer to classify-only: counts stay balanced and honest, but nothing further is
+    /// claimed to be stored.
     /// </summary>
-    private void Classify(LiveEventRecord record)
+    private async Task FlushAsync(
+        List<LiveCaptureRecord> batch,
+        CancellationToken cancellationToken)
     {
+        if (batch.Count == 0)
+        {
+            return;
+        }
+
+        if (PersistenceFaulted())
+        {
+            // Already faulted: drop the buffer rather than pretend it was written.
+            batch.Clear();
+            return;
+        }
+
+        var pending = batch.ToArray();
+        batch.Clear();
+        try
+        {
+            await _repository
+                .AppendRecordsAsync(pending, cancellationToken)
+                .ConfigureAwait(false);
+            lock (_sessionLock)
+            {
+                _persistedRecordCount += pending.Length;
+            }
+        }
+        catch (Exception exception) when (IsExpectedFailure(exception))
+        {
+            OnPersistenceFault(exception.Message);
+        }
+    }
+
+    private bool PersistenceFaulted()
+    {
+        lock (_sessionLock)
+        {
+            return _persistenceFaulted;
+        }
+    }
+
+    /// <summary>
+    /// Classifies one record from a single parse of its XML. Guarantees exactly one count
+    /// on every path and never throws, so a single bad record can never stop the consumer
+    /// or unbalance the counters. The parse result is returned as a persistable row so
+    /// the XML is never parsed twice. Observer notifications stay outside the counting
+    /// scope.
+    /// </summary>
+    private LiveCaptureRecord Classify(LiveQueuedRecord queued)
+    {
+        var record = queued.Record;
         LiveEventOutcome outcome;
         string? detail = null;
+        string? errorCode = null;
+        RawWindowsEvent? rawEvent = null;
         try
         {
             var result = _parser.Parse(record.RawXml);
+            rawEvent = result.RawEvent;
             if (result.Error is not null)
             {
+                errorCode = $"parse_{result.Error.Code.ToString().ToLowerInvariant()}";
                 if (result.Error.Code == ParseErrorCode.UnsupportedEvent)
                 {
                     outcome = LiveEventOutcome.Ignored;
@@ -540,6 +682,7 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                 // classification is produced and the record is counted as an error.
                 outcome = LiveEventOutcome.Error;
                 detail = mismatch;
+                errorCode = "event_source_mismatch";
                 Count(counters => counters with { Error = counters.Error + 1 });
                 AddDiagnostic(
                     "live_event_source_mismatch",
@@ -581,6 +724,7 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
         {
             outcome = LiveEventOutcome.Error;
             detail = exception.Message;
+            errorCode = "event_processing_failed";
             Count(counters => counters with { Error = counters.Error + 1 });
             AddDiagnostic(
                 "live_event_processing_failed",
@@ -594,6 +738,58 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             outcome,
             outcome == LiveEventOutcome.DeleteFact,
             detail is null ? null : LiveMonitoringLimits.TruncateMessage(detail)));
+
+        return new LiveCaptureRecord(
+            LiveEvidenceIdentity.Create(_liveSessionId!, queued.ReceivedSequence),
+            _liveSessionId!,
+            queued.ReceivedSequence,
+            // Only what the channel or the parser actually reported; nothing is inferred.
+            record.RecordId ?? rawEvent?.EventRecordId,
+            record.ProviderName ?? rawEvent?.ProviderName,
+            record.ChannelName,
+            record.MachineName ?? rawEvent?.ComputerName,
+            record.TimeCreatedUtc ?? rawEvent?.EventTimeUtc,
+            _timeProvider.GetUtcNow(),
+            record.RawXml,
+            SHA256.HashData(Encoding.UTF8.GetBytes(record.RawXml)),
+            rawEvent?.RawEventId,
+            rawEvent?.EventId,
+            outcome,
+            LiveMonitoringLimits.TruncateErrorCode(errorCode),
+            LiveMonitoringLimits.TruncateDetail(detail));
+    }
+
+    /// <summary>
+    /// Appending evidence failed. The session stops accepting and moves to Error through
+    /// the same single-shutdown path a source fault uses; it is never retried in a loop
+    /// and never quietly downgraded to counting only.
+    /// </summary>
+    private void OnPersistenceFault(string message)
+    {
+        lock (_sessionLock)
+        {
+            if (_persistenceFaulted)
+            {
+                return;
+            }
+
+            _persistenceFaulted = true;
+            _acceptingEvents = false;
+            _sessionFaulted = true;
+            _lastError = LiveMonitoringLimits.TruncateMessage(
+                $"实时证据未能写入数据库：{message}");
+            AddDiagnosticCore(
+                "live_evidence_persist_failed",
+                message,
+                ImportDiagnosticSeverity.Error,
+                "persist");
+
+            // Teardown runs off this thread: the consumer must not await its own
+            // shutdown, and the watcher must not be disposed from a callback.
+            _faultShutdown ??= Task.Run(HandleFaultAsync, CancellationToken.None);
+        }
+
+        SetState(LiveMonitoringState.Error);
     }
 
     /// <summary>
@@ -723,6 +919,11 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
 
             _counters = _counters with { Received = _counters.Received + 1 };
 
+            // Assigned before the queue decision and exactly once per accepted callback,
+            // so an oversized or dropped record still consumes a sequence and the gap it
+            // leaves is itself evidence that something was received but not stored.
+            var sequence = ++_receivedSequence;
+
             if (oversized)
             {
                 _counters = _counters with { Error = _counters.Error + 1 };
@@ -737,7 +938,8 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
 
             // Accepting is still true here, so the writer is still open: a false result
             // means the bounded queue is genuinely full.
-            if (_queue is not null && _queue.Writer.TryWrite(record))
+            if (_queue is not null
+                && _queue.Writer.TryWrite(new LiveQueuedRecord(sequence, record)))
             {
                 Interlocked.Increment(ref _queueDepth);
             }
@@ -842,11 +1044,24 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
     private async Task PersistSessionAsync(
         LiveMonitoringState finalState,
         Counters counters,
+        long persistedRecordCount,
         IReadOnlyList<LiveMonitoringDiagnostic> diagnostics,
         CancellationToken cancellationToken)
     {
         if (_liveSessionId is null)
         {
+            return;
+        }
+
+        if (!_captureStarted)
+        {
+            // The start row never reached the database, so there is nothing a completion
+            // could belong to. Say so instead of writing an orphaned summary.
+            AddDiagnostic(
+                "live_capture_session_not_recorded",
+                "The capture session start was never persisted; no completion or summary was written.",
+                ImportDiagnosticSeverity.Error,
+                "persist");
             return;
         }
 
@@ -866,21 +1081,30 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             return;
         }
 
+        var stoppedUtc = _timeProvider.GetUtcNow();
         var session = new LiveMonitoringSession(
             _liveSessionId,
             _startedUtc,
-            _timeProvider.GetUtcNow(),
+            stoppedUtc,
             _channelStatuses,
             value,
             finalState,
             _options.QueueCapacity,
             _options.ApplicationVersion);
+        var completion = new LiveCaptureCompletion(
+            _liveSessionId,
+            stoppedUtc,
+            finalState,
+            value,
+            persistedRecordCount);
 
         try
         {
-            // One attempt only: a failed write is reported, never retried in a loop.
+            // One attempt only, and one transaction: the evidence completion and the
+            // Phase 2A summary commit together or not at all, so they can never disagree
+            // about how this session ended.
             await _repository
-                .SaveSessionAsync(session, diagnostics, cancellationToken)
+                .CompleteSessionAsync(completion, session, diagnostics, cancellationToken)
                 .ConfigureAwait(false);
             _persisted = true;
         }
@@ -908,11 +1132,15 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             _sessionFaulted = false;
             _lastError = null;
             _faultShutdown = null;
+            _receivedSequence = 0;
+            _persistedRecordCount = 0;
+            _persistenceFaulted = false;
         }
 
         _completionStarted = false;
         _lifecycleCompleted = false;
         _persisted = false;
+        _captureStarted = false;
         _liveSessionId = Guid.NewGuid().ToString("D");
         _startedUtc = _timeProvider.GetUtcNow();
         Interlocked.Exchange(ref _queueDepth, 0);
@@ -1070,6 +1298,15 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
         string Code,
         string Stage,
         Exception Exception);
+
+    /// <summary>
+    /// A queued record and the receive position it was assigned on the delivery thread.
+    /// Carrying the sequence through the queue is what lets the consumer write evidence
+    /// with a stable identity without ever calling back into the callback thread.
+    /// </summary>
+    private readonly record struct LiveQueuedRecord(
+        long ReceivedSequence,
+        LiveEventRecord Record);
 
     /// <summary>Immutable count set; only ever replaced under <see cref="_sessionLock"/>.</summary>
     private readonly record struct Counters(
