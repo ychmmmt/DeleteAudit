@@ -190,6 +190,9 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             BeginSession();
             SetState(LiveMonitoringState.Starting);
 
+            try
+            {
+
             // Fail closed before anything subscribes: if the session summary cannot be
             // stored, no watcher is created and no live event is read.
             try
@@ -297,11 +300,49 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                 SessionFaulted()
                     ? LiveMonitoringState.Error
                     : LiveMonitoringState.Running);
+            }
+            catch (OperationCanceledException)
+            {
+                // A cancelled Start must never escape half-built: it could otherwise
+                // leave a live watcher, an orphaned consumer, and a start row with no
+                // completion, with the service still believing a session is running.
+                await AbortCancelledStartAsync().ConfigureAwait(false);
+                throw;
+            }
         }
         finally
         {
             _transitionGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Cleans up a Start that was cancelled part-way. Cancellation before the start row
+    /// was persisted is a plain user cancellation: nothing was recorded, so the session
+    /// simply returns to Stopped. Once the start row exists the capture is on record, so
+    /// the session is torn down and completed as an error instead.
+    /// </summary>
+    private async Task AbortCancelledStartAsync()
+    {
+        if (!_captureStarted)
+        {
+            StopAccepting();
+            await ReleasePipelineAsync().ConfigureAwait(false);
+            _completionStarted = true;
+            _lifecycleCompleted = true;
+            SetState(LiveMonitoringState.Stopped);
+            return;
+        }
+
+        AddDiagnostic(
+            "live_start_cancelled",
+            "Starting the live capture was cancelled after the session start was recorded.",
+            ImportDiagnosticSeverity.Error,
+            "subscribe");
+        MarkFaulted("实时接入启动被取消。");
+        // CancellationToken.None: teardown and the error completion must still run even
+        // though the caller's token is already cancelled.
+        await CompleteSessionAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
     public async Task StopAsync(CancellationToken cancellationToken = default)
@@ -441,7 +482,12 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             .ConfigureAwait(false);
 
         _lifecycleCompleted = true;
-        SetState(finalState);
+
+        // A session that could not record its own completion has not stopped cleanly, so
+        // the UI must not say "Stopped". The database rolled the whole completion back:
+        // what remains is a start with no completion, i.e. an incomplete capture.
+        // Completion is attempted exactly once — a repeated Stop does not retry it.
+        SetState(_persisted ? finalState : LiveMonitoringState.Error);
     }
 
     private void StopAccepting()
@@ -555,14 +601,15 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                 .ConfigureAwait(false))
             {
                 Interlocked.Decrement(ref _queueDepth);
+
+                // Two failure domains, deliberately kept apart. Classifying one record can
+                // fail on its own and must not stop the session; persisting a batch is a
+                // storage fault and must fault the session. Sharing one catch would let a
+                // storage failure be filed as a parse error and silently lose the batch.
+                LiveCaptureRecord processed;
                 try
                 {
-                    var processed = Classify(queued);
-                    batch.Add(processed);
-                    if (batch.Count >= LiveMonitoringLimits.MaxCaptureBatchRecords)
-                    {
-                        await FlushAsync(batch, cancellationToken).ConfigureAwait(false);
-                    }
+                    processed = Classify(queued);
                 }
                 catch (Exception exception)
                 {
@@ -574,6 +621,14 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                         exception.Message,
                         ImportDiagnosticSeverity.Error,
                         "parse");
+                    continue;
+                }
+
+                batch.Add(processed);
+                if (batch.Count >= LiveMonitoringLimits.MaxCaptureBatchRecords)
+                {
+                    // FlushAsync owns every persistence failure and never rethrows.
+                    await FlushAsync(batch, cancellationToken).ConfigureAwait(false);
                 }
             }
         }
@@ -607,23 +662,42 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             return;
         }
 
+        // The buffer is kept intact until the append has actually succeeded, so a failure
+        // can never make records disappear before the fault is recorded.
         var pending = batch.ToArray();
-        batch.Clear();
         try
         {
             await _repository
                 .AppendRecordsAsync(pending, cancellationToken)
                 .ConfigureAwait(false);
+            batch.Clear();
             lock (_sessionLock)
             {
                 _persistedRecordCount += pending.Length;
             }
         }
-        catch (Exception exception) when (IsExpectedFailure(exception))
+        catch (Exception exception)
         {
-            OnPersistenceFault(exception.Message);
+            // Anything thrown by AppendRecordsAsync is a persistence fault, whatever its
+            // type. Matching on a fixed allow-list let TimeoutException,
+            // ObjectDisposedException and OperationCanceledException escape and be filed
+            // as parse errors, silently dropping the batch — never again.
+            batch.Clear();
+            OnPersistenceFault(DescribeAppendFailure(exception, cancellationToken));
         }
     }
+
+    /// <summary>
+    /// Describes an append failure for the diagnostic record. A genuinely requested
+    /// cancellation is named as such; everything else keeps its real root cause. The
+    /// message shown to the user is truncated by the caller.
+    /// </summary>
+    private static string DescribeAppendFailure(
+        Exception exception,
+        CancellationToken cancellationToken) =>
+        exception is OperationCanceledException && cancellationToken.IsCancellationRequested
+            ? $"The live evidence append was cancelled: {exception.Message}"
+            : $"{exception.GetType().Name}: {exception.Message}";
 
     private bool PersistenceFaulted()
     {
@@ -905,11 +979,22 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
 
         lock (_sessionLock)
         {
-            if (generation != _generation || !_acceptingEvents)
+            if (generation != _generation)
             {
-                // A late callback from a torn-down watcher, or an event that arrived
-                // after this session stopped accepting. It belongs to no live session,
-                // so it changes no session count and is never reported as a queue drop.
+                // A callback from a watcher that belonged to an earlier session. It is not
+                // this session's event, so it must not touch a single one of this
+                // session's counters — counting it here would attribute another session's
+                // record to whichever session happens to be running now, and that number
+                // is persisted. It consumes no sequence and is never stored.
+                return;
+            }
+
+            if (!_acceptingEvents)
+            {
+                // This session's own event, arriving after it stopped accepting. It is
+                // genuinely late for this session, so LateDiscarded is the right counter.
+                // It stays outside the balance equation, consumes no sequence and is
+                // never stored.
                 _counters = _counters with
                 {
                     LateDiscarded = _counters.LateDiscarded + 1
@@ -1110,7 +1195,9 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
         }
         catch (Exception exception) when (IsExpectedFailure(exception))
         {
-            SetLastError(
+            // The completion and the summary rolled back together, so nothing was stored.
+            // Mark the session faulted so the published state cannot claim a clean stop.
+            MarkFaulted(
                 $"监控会话未能写入数据库：{LiveMonitoringLimits.TruncateMessage(exception.Message)}");
             AddDiagnostic(
                 "live_session_persist_failed",
