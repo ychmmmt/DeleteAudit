@@ -1644,15 +1644,29 @@ public sealed class LiveMonitoringServiceTests
     }
 
     [Fact]
-    public async Task LivePageAlwaysDisclosesThatOnlyTheSessionSummaryIsSaved()
+    public async Task LivePageDisclosesWhatIsStoredAndWhatIsStillMissing()
     {
         await using var service = CreateService(FakeProbe.AllAvailable(), out _, out _);
         using var viewModel = CreateViewModel(service);
 
-        Assert.Contains("仅保存监控会话摘要", viewModel.Disclosure, StringComparison.Ordinal);
+        // What Phase 2B.1 now actually does.
         Assert.Contains("原始 XML", viewModel.Disclosure, StringComparison.Ordinal);
-        Assert.Contains("不会保存", viewModel.Disclosure, StringComparison.Ordinal);
-        Assert.Contains("无法在", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("分类结果", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("会写入本机查看器数据库", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("会保留", viewModel.Disclosure, StringComparison.Ordinal);
+        // What it still does not do.
+        Assert.Contains("尚未接入", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("风险评估", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("缺口", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("异常中断", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("不上传", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("尚未投影", viewModel.Disclosure, StringComparison.Ordinal);
+        // The retired Phase 2A claim must not come back: live detail is no longer lost
+        // on stop, so the page may not keep saying that it is.
+        Assert.DoesNotContain(
+            "实时事件原始 XML、删除事实、关联结果和风险结果不会保存",
+            viewModel.Disclosure,
+            StringComparison.Ordinal);
         Assert.Contains("不能阻止、恢复或完整取证", viewModel.Disclaimer, StringComparison.Ordinal);
 
         // The disclosure is a plain always-present string, not a colour or a state.
