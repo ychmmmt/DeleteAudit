@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using DeleteAudit.Application.LiveMonitoring;
 using DeleteAudit.Domain;
 using DeleteAudit.Infrastructure.Viewing;
@@ -110,35 +112,55 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
             .BeginTransactionAsync(cancellationToken)
             .ConfigureAwait(false);
 
-        using (var command = connection.CreateCommand())
+        try
         {
-            command.Transaction = (SqliteTransaction)transaction;
-            // Plain INSERT on purpose: a duplicate session id is a real defect and must
-            // surface, never be ignored or replaced.
-            command.CommandText = """
-                INSERT INTO live_capture_sessions (
-                    live_session_id,
-                    started_utc,
-                    queue_capacity,
-                    application_version)
-                VALUES (
-                    $live_session_id,
-                    $started_utc,
-                    $queue_capacity,
-                    $application_version);
-                """;
-            command.Parameters.Add("$live_session_id", SqliteType.Text).Value =
-                start.LiveSessionId;
-            command.Parameters.Add("$started_utc", SqliteType.Text).Value =
-                Format(start.StartedUtc);
-            command.Parameters.Add("$queue_capacity", SqliteType.Integer).Value =
-                start.QueueCapacity;
-            command.Parameters.Add("$application_version", SqliteType.Text).Value =
-                start.ApplicationVersion;
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-        }
+            using (var command = connection.CreateCommand())
+            {
+                command.Transaction = (SqliteTransaction)transaction;
+                // Plain INSERT on purpose: a duplicate session id is a real defect and
+                // must surface, never be ignored or replaced.
+                command.CommandText = """
+                    INSERT INTO live_capture_sessions (
+                        live_session_id,
+                        started_utc,
+                        queue_capacity,
+                        application_version)
+                    VALUES (
+                        $live_session_id,
+                        $started_utc,
+                        $queue_capacity,
+                        $application_version);
+                    """;
+                command.Parameters.Add("$live_session_id", SqliteType.Text).Value =
+                    start.LiveSessionId;
+                command.Parameters.Add("$started_utc", SqliteType.Text).Value =
+                    Format(start.StartedUtc);
+                command.Parameters.Add("$queue_capacity", SqliteType.Integer).Value =
+                    start.QueueCapacity;
+                command.Parameters.Add("$application_version", SqliteType.Text).Value =
+                    start.ApplicationVersion;
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Explicit and symmetric with the other write paths. A rollback failure must
+            // never replace the original exception, so it is swallowed on purpose here.
+            try
+            {
+                await transaction
+                    .RollbackAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception rollbackFailure)
+            {
+                _ = rollbackFailure;
+            }
+
+            throw;
+        }
     }
 
     public async Task AppendRecordsAsync(
@@ -168,6 +190,9 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 nameof(records));
         }
 
+        // Everything below runs before a connection is opened, so a rejected batch never
+        // reaches SQLite at all. The repository verifies the caller's claims rather than
+        // trusting them: it never repairs or substitutes what it was handed.
         long previousSequence = 0;
         foreach (var record in records)
         {
@@ -182,6 +207,31 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
             {
                 throw new ArgumentException(
                     "Records must be ordered by a strictly increasing received sequence.",
+                    nameof(records));
+            }
+
+            // The evidence id is derived, not free-form: it must be exactly the session
+            // and the receive position it claims. SQLite can only enforce uniqueness, so
+            // this consistency is checked here.
+            var expectedId = LiveEvidenceIdentity.Create(
+                record.LiveSessionId,
+                record.ReceivedSequence);
+            if (!string.Equals(record.LiveEvidenceId, expectedId, StringComparison.Ordinal))
+            {
+                throw new ArgumentException(
+                    "A record's live evidence id does not match its session and received sequence.",
+                    nameof(records));
+            }
+
+            // The digest must belong to the XML actually being stored. Recomputed here so
+            // a wrong digest can never be committed alongside the evidence it describes.
+            var expectedDigest = SHA256.HashData(Encoding.UTF8.GetBytes(record.RawXml));
+            if (!CryptographicOperations.FixedTimeEquals(
+                    record.RawXmlSha256 ?? [],
+                    expectedDigest))
+            {
+                throw new ArgumentException(
+                    "A record's raw XML digest does not match its raw XML.",
                     nameof(records));
             }
 

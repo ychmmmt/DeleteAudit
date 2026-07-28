@@ -243,6 +243,50 @@ public sealed class SqliteLiveMonitoringRepositoryTests
     }
 
     [Fact]
+    public async Task AForgedEvidenceIdIsRejectedBeforeAnyWrite()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var sessionId = await StartCaptureAsync(repository);
+        await repository.AppendRecordsAsync([CaptureRecord(sessionId, 1)]);
+
+        // The id must be exactly session + ":" + sequence; a free-form one is a defect.
+        var forged = CaptureRecord(sessionId, 2) with { LiveEvidenceId = $"{sessionId}:999" };
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => repository.AppendRecordsAsync([forged, CaptureRecord(sessionId, 3)]));
+
+        // Rejected before SQLite was touched: nothing new, nothing disturbed.
+        Assert.Equal([$"{sessionId}:1"], await ReadEvidenceIdsAsync(location));
+    }
+
+    [Fact]
+    public async Task AMismatchedRawXmlDigestIsRejectedBeforeAnyWrite()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var sessionId = await StartCaptureAsync(repository);
+        await repository.AppendRecordsAsync([CaptureRecord(sessionId, 1)]);
+
+        // A digest that belongs to different content must never be stored beside this XML.
+        var tampered = CaptureRecord(sessionId, 2, "<Event>real</Event>") with
+        {
+            RawXmlSha256 = SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes("<Event>other</Event>"))
+        };
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => repository.AppendRecordsAsync([tampered]));
+
+        Assert.Equal([$"{sessionId}:1"], await ReadEvidenceIdsAsync(location));
+        Assert.Equal("<Event />", await TextAsync(
+            location,
+            "SELECT raw_xml FROM live_capture_records WHERE received_sequence = 1;"));
+    }
+
+    [Fact]
     public async Task RepositoryUsesNeitherIgnoreNorReplace()
     {
         // Structural guard: evidence must never be silently skipped or overwritten.
