@@ -23,5 +23,6 @@
     <Content Include="..\..\db\schema.sql" Link="Fixtures\schema.sql" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\db\migrations\0002_phase_1b_offline_import.sql" Link="Fixtures\0002_phase_1b_offline_import.sql" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\db\migrations\0003_phase_2a_live_monitoring.sql" Link="Fixtures\0003_phase_2a_live_monitoring.sql" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\db\migrations\0004_phase_2b_live_evidence.sql" Link="Fixtures\0004_phase_2b_live_evidence.sql" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

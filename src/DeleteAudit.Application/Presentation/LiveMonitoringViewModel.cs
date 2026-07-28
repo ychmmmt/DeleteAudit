@@ -8,12 +8,17 @@ namespace DeleteAudit.Application.Presentation;
 public sealed class LiveMonitoringViewModel : ViewModelBase, IDisposable
 {
     /// <summary>
-    /// Always visible on the live page. States plainly what is and is not kept, so the
-    /// counts below can never be read as a stored audit record.
+    /// Always visible on the live page. States plainly what is kept, what is not, and
+    /// where the gaps come from, so the counts below can never be read as a complete
+    /// audit record.
     /// </summary>
     public const string PersistenceDisclosure =
-        "Phase 2A 实时接入预览：当前仅保存监控会话摘要。实时事件原始 XML、删除事实、关联结果和风险结果不会保存；"
-        + "停止监控或关闭应用后，无法在“删除事件”或“原始证据”页面回看本次实时事件详情。";
+        "Phase 2B.1 实时接入：你手动开始后，本次接收到的受支持事件的原始 XML 与分类结果会写入本机查看器数据库；"
+        + "停止或关闭应用后，已成功保存的实时明细会保留。仅保存监控会话摘要与这些接收明细——"
+        + "实时关联、删除会话聚合和风险评估尚未接入，不会保存。"
+        + "队列溢出、超大记录、写入失败或进程异常终止都可能造成缺口，因此接收序号可能不连续；"
+        + "没有完成记录的会话表示本次接入可能异常中断。本程序不上传任何数据。"
+        + "本轮仅完成持久化基础，尚未投影到“删除事件”或“原始证据”页面。";
 
     public const string CapabilityDisclaimer =
         "实时监控能力取决于系统当前已有的事件日志配置；未安装 Sysmon或未启用文件系统审计时，可能无法记录删除操作。"

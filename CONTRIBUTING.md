@@ -31,6 +31,25 @@ set DELETEAUDIT_REPOSITORY_ROOT=C:\path\to\your\checkout
 If neither the environment variable nor the solution lookup resolves a root, the
 application fails closed with an explicit error rather than guessing a path.
 
+## Creating the database for the first time
+
+The runtime never creates a database and never applies a migration: it only checks
+that the objects it needs exist, and fails closed when they do not. Applying the
+scripts is an explicit step you (or a test fixture) perform, in this order:
+
+```text
+db/schema.sql
+db/migrations/0002_phase_1b_offline_import.sql
+db/migrations/0003_phase_2a_live_monitoring.sql
+db/migrations/0004_phase_2b_live_evidence.sql
+```
+
+- Live monitoring **fails closed** when `0004` has not been applied, and reports which
+  migration is missing.
+- These scripts are not idempotent — re-running one against a database that already
+  has its objects will conflict. Apply each one once, in order.
+- **Back up your viewer database before applying anything** to it.
+
 ## Build rules
 
 - `TreatWarningsAsErrors` is **true** and `AnalysisLevel` is `8.0-recommended`.

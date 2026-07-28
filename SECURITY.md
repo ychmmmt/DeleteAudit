@@ -17,8 +17,10 @@ delete audit trail, and it cannot prevent, block, or recover deletions.
   subscribes read-only, in-process, to Windows event log channels that already
   exist on the machine (`Microsoft-Windows-Sysmon/Operational` and `Security`),
   filtered server-side to Sysmon 1/23/26 and Security 4663.
-- Only a **session summary** is stored for live monitoring. Live event XML,
-  delete facts, correlation results and risk results are **not** stored.
+- Live capture (Phase 2B.1) stores, in the local viewer database, the raw XML and
+  the classification of each supported event received after you start it, plus a
+  session summary. Correlation results, delete sessions and risk results are still
+  **not** produced or stored for live capture.
 
 ## What it deliberately does not do
 
@@ -50,6 +52,20 @@ narrower than it may look, so it is stated here explicitly:
 Copying the file to your own machine first avoids all of this. The user-facing
 explanation is in the README:
 [中文](README.md#关于网络共享上的文件) · [English](README.en.md#about-files-on-a-network-share).
+
+## What live capture stores, and what that is worth
+
+- Live detail is written **only to the local viewer database** inside the
+  repository's `artifacts` directory. Nothing is uploaded.
+- The record can have **bounded gaps**: queue overflow, an oversized event, a failed
+  write or an abrupt process termination all leave a gap, and up to 63 classified
+  records may be held in memory before a batch is written. A capture session with no
+  completion row did not finish cleanly and must be read that way.
+- The database is **not a tamper-proof medium**. A local administrator, or any
+  process with write access to the file, can modify, replace or delete it. There is
+  no signature, no external anchoring and no tamper-evident chain for live capture.
+- Consequently DeleteAudit must **not** be treated as a sole or authoritative source
+  of evidence.
 
 ## Supported versions
 

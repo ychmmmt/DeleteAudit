@@ -869,6 +869,709 @@ public sealed class LiveMonitoringServiceTests
             item => item.Code == "live_snapshot_observer_failed");
     }
 
+    // ---------- Phase 2B.1 live evidence ----------
+
+    [Fact]
+    public async Task SchemaAndSessionStartHappenBeforeAnyProbeOrWatcher()
+    {
+        var probe = FakeProbe.AllAvailable();
+        var repository = new FakeRepository();
+        var source = new FakeLiveEventSource();
+        await using var service = new LiveMonitoringService(probe, source, repository);
+
+        await service.StartAsync();
+
+        // Ordering is what makes this fail closed: nothing is subscribed until the
+        // database has accepted that this session exists.
+        Assert.Equal(1, repository.ValidateCount);
+        Assert.Equal(1, repository.StartCount);
+        Assert.Equal(1, probe.ProbeCount);
+        Assert.Equal(2048, Assert.Single(repository.Starts).QueueCapacity);
+        Assert.Equal(2, source.LiveWatcherCount);
+
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task AFailedSessionStartCreatesNoWatcherAndReportsError()
+    {
+        var probe = FakeProbe.AllAvailable();
+        var repository = new FakeRepository
+        {
+            StartException = new InvalidOperationException("fixture start failure")
+        };
+        var source = new FakeLiveEventSource();
+        await using var service = new LiveMonitoringService(probe, source, repository);
+
+        await service.StartAsync();
+
+        Assert.Equal(0, source.StartCount);
+        Assert.Equal(0, source.LiveWatcherCount);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        // Nothing was started, so nothing may claim to have completed — and with no
+        // start row to hang it on, no summary is written either.
+        Assert.Empty(repository.Completions);
+        Assert.Empty(repository.Sessions);
+        Assert.Equal(
+            LiveMonitoringService.SessionStartNotPersistedMessage,
+            service.Snapshot.LastError);
+    }
+
+    [Fact]
+    public async Task NoSubscribableChannelStillLeavesAStartAndAnErrorCompletion()
+    {
+        var probe = FakeProbe.With(
+            Status(LiveMonitoringChannels.SysmonOperational, LiveChannelAvailability.Unavailable),
+            Status(LiveMonitoringChannels.Security, LiveChannelAvailability.AccessDenied));
+        var repository = new FakeRepository();
+        var source = new FakeLiveEventSource();
+        await using var service = new LiveMonitoringService(probe, source, repository);
+
+        await service.StartAsync();
+
+        Assert.Single(repository.Starts);
+        var completion = Assert.Single(repository.Completions);
+        Assert.Equal(LiveMonitoringState.Error, completion.FinalState);
+        Assert.Equal(0, completion.PersistedRecordCount);
+        Assert.Equal(0, source.LiveWatcherCount);
+    }
+
+    [Fact]
+    public async Task ReceivedSequenceStartsAtOneAndIncreasesStrictly()
+    {
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        for (var index = 1; index <= 3; index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        observer.WaitForCount(3, Patience);
+        await service.StopAsync();
+
+        Assert.Equal(
+            new long[] { 1, 2, 3 },
+            repository.Records.Select(record => record.ReceivedSequence).ToArray());
+        Assert.All(
+            repository.Records,
+            record => Assert.Equal(
+                $"{record.LiveSessionId}:{record.ReceivedSequence}",
+                record.LiveEvidenceId));
+    }
+
+    [Fact]
+    public async Task AnOversizedRecordConsumesASequenceAndLeavesAGap()
+    {
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        // One code unit above the ceiling: received and counted, but never queued,
+        // never parsed and never stored.
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            new string('x', LiveMonitoringLimits.MaxEventXmlCharacters + 1)));
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(3)));
+        observer.WaitForCount(2, Patience);
+        await service.StopAsync();
+
+        Assert.Equal(
+            new long[] { 1, 3 },
+            repository.Records.Select(record => record.ReceivedSequence).ToArray());
+        var completion = Assert.Single(repository.Completions);
+        Assert.Equal(3, completion.Counters.Received);
+        Assert.Equal(1, completion.Counters.Error);
+        Assert.Equal(2, completion.PersistedRecordCount);
+        Assert.True(completion.Counters.IsBalanced);
+    }
+
+    [Fact]
+    public async Task AFullQueueConsumesASequenceAndLeavesAGap()
+    {
+        var source = new FakeLiveEventSource();
+        // Capacity 1 plus a parked consumer guarantees the second record finds the queue
+        // full without any timing guess.
+        using var appendGate = new ManualResetEventSlim(false);
+        var parked = new FakeRepository { AppendGate = appendGate };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            parked,
+            new LiveMonitoringOptions(QueueCapacity: 1));
+        await service.StartAsync();
+
+        for (var index = 1; index <= 200; index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        appendGate.Set();
+        await service.StopAsync();
+
+        var completion = Assert.Single(parked.Completions);
+        Assert.Equal(200, completion.Counters.Received);
+        Assert.True(completion.Counters.Dropped > 0);
+        Assert.True(completion.Counters.IsBalanced);
+        // Dropped records consumed a sequence, so the stored ones are not contiguous.
+        Assert.Equal(
+            completion.PersistedRecordCount,
+            parked.Records.Count);
+        Assert.True(
+            parked.Records.Count < 200,
+            "a full queue must drop records rather than block the callback");
+    }
+
+    [Fact]
+    public async Task ABatchIsFlushedWhenItFillsAndAgainOnStop()
+    {
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        const int Total = LiveMonitoringLimits.MaxCaptureBatchRecords + 3;
+        for (var index = 1; index <= Total; index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        observer.WaitForCount(Total, Patience);
+        await service.StopAsync();
+
+        // One full batch plus the remainder flushed by Stop.
+        Assert.Equal(
+            [LiveMonitoringLimits.MaxCaptureBatchRecords, 3],
+            repository.BatchSizes);
+        Assert.Equal(Total, repository.Records.Count);
+        Assert.Equal(Total, Assert.Single(repository.Completions).PersistedRecordCount);
+    }
+
+    [Fact]
+    public async Task EachRecordIsParsedOnceAndCarriesItsParserIdentity()
+    {
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(7)));
+        observer.WaitForCount(1, Patience);
+        await service.StopAsync();
+
+        var stored = Assert.Single(repository.Records);
+        var classified = Assert.Single(observer.Classifications);
+        // The same single parse fed both the observer and the stored row.
+        Assert.Equal(LiveEventOutcome.DeleteFact, stored.Outcome);
+        Assert.Equal(classified.Outcome, stored.Outcome);
+        Assert.False(string.IsNullOrWhiteSpace(stored.ParserRawEventId));
+        Assert.Equal(26, stored.ParsedEventId);
+        Assert.Equal(32, stored.RawXmlSha256.Length);
+        Assert.Equal(classified.Record.RawXml, stored.RawXml);
+    }
+
+    [Fact]
+    public async Task AFailedAppendFaultsTheSessionAndStopsEveryWatcher()
+    {
+        var source = new FakeLiveEventSource();
+        var repository = new FakeRepository
+        {
+            AppendException = new InvalidOperationException("fixture append failure")
+        };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        await service.StopAsync();
+
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Equal(0, source.LiveWatcherCount);
+        var completion = Assert.Single(repository.Completions);
+        Assert.Equal(LiveMonitoringState.Error, completion.FinalState);
+        // Nothing was stored, and the completion says so instead of claiming success.
+        Assert.Equal(0, completion.PersistedRecordCount);
+        Assert.True(completion.Counters.IsBalanced);
+        Assert.Contains(
+            repository.LastDiagnostics,
+            item => item.Code == "live_evidence_persist_failed");
+    }
+
+    [Fact]
+    public async Task RepeatedStopWritesExactlyOneCompletionAndOneSummary()
+    {
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out _,
+            out var repository);
+
+        await service.StartAsync();
+        await service.StopAsync();
+        await service.StopAsync();
+        await service.DisposeAsync();
+
+        Assert.Single(repository.Completions);
+        Assert.Single(repository.Sessions);
+        Assert.Equal(1, repository.SaveCount);
+    }
+
+    [Fact]
+    public async Task CompletionIsWrittenAfterTheConsumerHasDrained()
+    {
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository);
+        await service.StartAsync();
+
+        for (var index = 1; index <= 5; index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        // No wait on the observer: Stop itself must drain and flush before completing.
+        await service.StopAsync();
+
+        var completion = Assert.Single(repository.Completions);
+        Assert.Equal(5, completion.Counters.Received);
+        Assert.Equal(5, repository.Records.Count);
+        Assert.Equal(5, completion.PersistedRecordCount);
+        Assert.True(completion.IsConsistent);
+    }
+
+    [Fact]
+    public async Task ALateCallbackNeitherConsumesASequenceNorIsPersisted()
+    {
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        var watcher = source.Watcher(0);
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        await service.StopAsync();
+
+        // A watcher that was torn down still calls back; it belongs to no session.
+        watcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(2)));
+
+        Assert.Single(repository.Records);
+        Assert.Equal(1, Assert.Single(repository.Completions).PersistedRecordCount);
+    }
+
+    // ---------- Phase 2B.1 fail-closed persistence ----------
+
+    public static TheoryData<Exception> NonWhitelistedAppendFailures() =>
+    [
+        new TimeoutException("fixture append timeout"),
+        new ObjectDisposedException("fixture disposed connection"),
+        // A cancellation that nobody requested: still a storage failure, not a stop.
+        new OperationCanceledException("fixture unrequested cancellation")
+    ];
+
+    [Theory]
+    [MemberData(nameof(NonWhitelistedAppendFailures))]
+    public async Task AnyAppendFailureFaultsTheSessionWhateverItsType(Exception failure)
+    {
+        // Regression guard for the defect where an exception outside the old allow-list
+        // escaped FlushAsync, was filed as a parse error, and silently dropped the batch.
+        var source = new FakeLiveEventSource();
+        var repository = new FakeRepository { AppendException = failure };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        const int Batch = LiveMonitoringLimits.MaxCaptureBatchRecords;
+        for (var index = 1; index <= Batch; index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        observer.WaitForCount(Batch, Patience);
+        await service.StopAsync();
+
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Equal(0, source.LiveWatcherCount);
+        Assert.Empty(repository.Records);
+        var completion = Assert.Single(repository.Completions);
+        Assert.Equal(LiveMonitoringState.Error, completion.FinalState);
+        Assert.Equal(0, completion.PersistedRecordCount);
+        Assert.Equal(Batch, completion.Counters.DeleteFact);
+        Assert.True(completion.Counters.IsBalanced);
+        Assert.Equal(
+            LiveMonitoringState.Error,
+            Assert.Single(repository.Sessions).FinalState);
+        // Named as a storage fault, never as a parse failure.
+        Assert.Contains(
+            repository.LastDiagnostics,
+            item => item.Code == "live_evidence_persist_failed");
+        Assert.DoesNotContain(
+            repository.LastDiagnostics,
+            item => item.Code == "live_event_processing_failed");
+    }
+
+    [Fact]
+    public async Task AFaultedSessionStopsAttemptingFurtherAppends()
+    {
+        var source = new FakeLiveEventSource();
+        var repository = new FakeRepository
+        {
+            AppendException = new TimeoutException("fixture append timeout")
+        };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        const int Total = (LiveMonitoringLimits.MaxCaptureBatchRecords * 2) + 5;
+        for (var index = 1; index <= Total; index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        observer.WaitForCount(LiveMonitoringLimits.MaxCaptureBatchRecords, Patience);
+        await service.StopAsync();
+
+        // Exactly one append was attempted; the fault stopped every later one.
+        Assert.Equal(1, repository.AppendCount);
+        Assert.Equal(0, Assert.Single(repository.Completions).PersistedRecordCount);
+    }
+
+    [Fact]
+    public async Task AFailedCompletionIsReportedAsErrorAndNotRetried()
+    {
+        var source = new FakeLiveEventSource();
+        var repository = new FakeRepository
+        {
+            SaveException = new InvalidOperationException("fixture completion failure")
+        };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        await service.StartAsync();
+
+        await service.StopAsync();
+        await service.StopAsync();
+
+        // Nothing was stored, so the session did not stop cleanly and must not say it did.
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.False(string.IsNullOrWhiteSpace(service.Snapshot.LastError));
+        Assert.False(service.SessionPersisted);
+        Assert.Empty(repository.Completions);
+        Assert.Empty(repository.Sessions);
+        // Completion is attempted exactly once; a repeated Stop does not retry it.
+        Assert.Equal(1, repository.SaveCount);
+        // The start row and any committed evidence stay: an incomplete capture.
+        Assert.Single(repository.Starts);
+    }
+
+    // ---------- Phase 2B.1 start cancellation lifecycle ----------
+
+    [Fact]
+    public async Task CancellingBeforeTheStartIsRecordedLeavesNothingBehind()
+    {
+        using var gate = new TestGate();
+        var repository = new FakeRepository { StartCaptureGate = gate };
+        var source = new FakeLiveEventSource();
+        var probe = FakeProbe.AllAvailable();
+        await using var service = new LiveMonitoringService(probe, source, repository);
+        using var cts = new CancellationTokenSource();
+
+        // Run on the pool: StartAsync executes synchronously up to its first real
+        // await, so a gated fake would otherwise block the test's own thread.
+        var starting = Task.Run(() => service.StartAsync(cts.Token));
+        // Execution is parked inside StartCaptureSessionAsync, before it records anything.
+        await gate.Entered;
+        await cts.CancelAsync();
+        gate.Release();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+
+        // Nothing was recorded, so there is nothing to complete and nothing to explain.
+        Assert.Empty(repository.Starts);
+        Assert.Empty(repository.Completions);
+        Assert.Empty(repository.Sessions);
+        Assert.Equal(0, repository.SaveCount);
+        Assert.Equal(0, source.StartCount);
+        Assert.Equal(0, source.LiveWatcherCount);
+        Assert.Equal(0, probe.ProbeCount);
+        // A user cancellation is not a database failure and not a faulted capture.
+        Assert.Equal(LiveMonitoringState.Stopped, service.Snapshot.State);
+    }
+
+    [Fact]
+    public async Task CancellingAfterTheStartIsRecordedCompletesTheSessionAsError()
+    {
+        using var probeGate = new ManualResetEventSlim(false);
+        var repository = new FakeRepository();
+        var source = new FakeLiveEventSource();
+        await using var service = new LiveMonitoringService(
+            new BlockingProbe(probeGate, TimeSpan.FromSeconds(10)),
+            source,
+            repository);
+        using var cts = new CancellationTokenSource();
+
+        var starting = service.StartAsync(cts.Token);
+        // The start row is already written; the probe has not returned yet.
+        await WaitForAsync(() => repository.Starts.Count == 1);
+        await cts.CancelAsync();
+        probeGate.Set();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+
+        Assert.Single(repository.Starts);
+        var completion = Assert.Single(repository.Completions);
+        var summary = Assert.Single(repository.Sessions);
+        Assert.Equal(LiveMonitoringState.Error, completion.FinalState);
+        Assert.Equal(LiveMonitoringState.Error, summary.FinalState);
+        Assert.Equal(completion.Counters, summary.Counters);
+        Assert.Equal(0, completion.PersistedRecordCount);
+        Assert.Empty(repository.Records);
+        Assert.Equal(0, source.StartCount);
+        Assert.Equal(0, source.LiveWatcherCount);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Contains(
+            repository.LastDiagnostics,
+            item => item.Code == "live_start_cancelled");
+    }
+
+    [Fact]
+    public async Task CancellingAfterTheSourcePartiallyStartsReleasesEveryWatcher()
+    {
+        using var gate = new TestGate();
+        var repository = new FakeRepository();
+        var source = new FakeLiveEventSource { StartGate = gate };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var cts = new CancellationTokenSource();
+
+        var starting = Task.Run(() => service.StartAsync(cts.Token));
+        // Watchers already exist at the gate; the cancellation lands on a live source.
+        await gate.Entered;
+        Assert.Equal(2, source.LiveWatcherCount);
+        await cts.CancelAsync();
+        gate.Release();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+
+        // Everything the half-started source created is released.
+        Assert.Equal(0, source.LiveWatcherCount);
+        Assert.All(source.Watchers, watcher => Assert.True(watcher.IsDisposed));
+        Assert.Equal(1, source.StopCount);
+        Assert.Single(repository.Starts);
+        Assert.Equal(
+            LiveMonitoringState.Error,
+            Assert.Single(repository.Completions).FinalState);
+        Assert.Equal(
+            LiveMonitoringState.Error,
+            Assert.Single(repository.Sessions).FinalState);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+
+        // Completing again must not produce a second completion or summary.
+        await service.StopAsync();
+        await service.DisposeAsync();
+        Assert.Single(repository.Completions);
+        Assert.Single(repository.Sessions);
+    }
+
+    [Fact]
+    public async Task ACancelledStartWhoseCompletionAlsoFailsStaysIncompleteAndError()
+    {
+        using var gate = new TestGate();
+        var repository = new FakeRepository
+        {
+            SaveException = new InvalidOperationException("fixture completion failure")
+        };
+        var source = new FakeLiveEventSource { StartGate = gate };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var cts = new CancellationTokenSource();
+
+        var starting = Task.Run(() => service.StartAsync(cts.Token));
+        await gate.Entered;
+        await cts.CancelAsync();
+        gate.Release();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+
+        // The start stands on its own with no completion: an incomplete capture.
+        Assert.Single(repository.Starts);
+        Assert.Empty(repository.Completions);
+        Assert.Empty(repository.Sessions);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.False(string.IsNullOrWhiteSpace(service.Snapshot.LastError));
+        Assert.False(service.SessionPersisted);
+        Assert.Equal(0, source.LiveWatcherCount);
+        // Exactly one attempt; a later Stop does not retry it.
+        await service.StopAsync();
+        Assert.Equal(1, repository.SaveCount);
+    }
+
+    [Fact]
+    public async Task ACancelledStartDoesNotContaminateTheNextSession()
+    {
+        using var gate = new TestGate();
+        var repository = new FakeRepository();
+        var source = new FakeLiveEventSource { StartGate = gate };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var cts = new CancellationTokenSource();
+
+        var starting = Task.Run(() => service.StartAsync(cts.Token));
+        await gate.Entered;
+        await cts.CancelAsync();
+        gate.Release();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+        var cancelledSessionId = Assert.Single(repository.Starts).LiveSessionId;
+
+        // Session B runs normally on a source that no longer gates.
+        var sourceB = new FakeLiveEventSource();
+        await using var serviceB = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            sourceB,
+            repository);
+        using var observer = new ClassificationObserver(serviceB);
+        await serviceB.StartAsync();
+        sourceB.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        await serviceB.StopAsync();
+
+        var sessionB = repository.Completions[^1];
+        Assert.NotEqual(cancelledSessionId, sessionB.LiveSessionId);
+        Assert.Equal(LiveMonitoringState.Stopped, sessionB.FinalState);
+        Assert.Equal(1, sessionB.Counters.Received);
+        Assert.Equal(1, sessionB.Counters.DeleteFact);
+        Assert.Equal(0, sessionB.Counters.LateDiscarded);
+        Assert.Equal(0, sessionB.Counters.Error);
+        Assert.Equal(1, sessionB.PersistedRecordCount);
+
+        // B numbers its own evidence from 1 and shares no identity with the cancelled one.
+        var recordsB = repository.Records
+            .Where(record => record.LiveSessionId == sessionB.LiveSessionId)
+            .ToArray();
+        Assert.Equal(new long[] { 1 }, recordsB.Select(r => r.ReceivedSequence).ToArray());
+        Assert.All(
+            repository.Records,
+            record => Assert.NotEqual(cancelledSessionId, record.LiveSessionId));
+    }
+
+    // ---------- Phase 2B.1 callback identity ----------
+
+    [Fact]
+    public async Task AnOldSessionCallbackChangesNoCounterOfTheNewSession()
+    {
+        var source = new FakeLiveEventSource();
+        var repository = new FakeRepository();
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var observer = new ClassificationObserver(service);
+
+        await service.StartAsync();
+        var sessionAWatcher = source.Watcher(0);
+        await service.StopAsync();
+
+        await service.StartAsync();
+        // The torn-down session A watcher fires while session B is running.
+        sessionAWatcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(99)));
+        source.Watcher(0).Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        await service.StopAsync();
+
+        var sessionB = repository.Completions[^1];
+        Assert.Equal(1, sessionB.Counters.Received);
+        Assert.Equal(1, sessionB.Counters.DeleteFact);
+        Assert.Equal(0, sessionB.Counters.ProcessContext);
+        Assert.Equal(0, sessionB.Counters.SecurityEvidence);
+        Assert.Equal(0, sessionB.Counters.Ignored);
+        Assert.Equal(0, sessionB.Counters.Error);
+        Assert.Equal(0, sessionB.Counters.Dropped);
+        // The heart of the fix: another session's record must not land here.
+        Assert.Equal(0, sessionB.Counters.LateDiscarded);
+        Assert.Equal(1, sessionB.PersistedRecordCount);
+        Assert.Equal(0, repository.Sessions[^1].Counters.LateDiscarded);
+
+        // Session B numbers its own records from 1, and stored exactly one.
+        var sessionBRecords = repository.Records
+            .Where(record => record.LiveSessionId == sessionB.LiveSessionId)
+            .ToArray();
+        Assert.Equal(new long[] { 1 }, sessionBRecords.Select(r => r.ReceivedSequence).ToArray());
+    }
+
+    [Fact]
+    public async Task ThisSessionsOwnLateCallbackStillCountsAsLateDiscarded()
+    {
+        var source = new FakeLiveEventSource();
+        var repository = new FakeRepository();
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        var watcher = source.Watcher(0);
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        await service.StopAsync();
+
+        // Same generation, but the session has stopped accepting.
+        watcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(2)));
+
+        var counters = service.Snapshot.Counters;
+        Assert.Equal(1, counters.Received);
+        Assert.Equal(1, counters.LateDiscarded);
+        Assert.True(counters.IsBalanced);
+        // It consumed no sequence and was never stored.
+        Assert.Equal(new long[] { 1 }, repository.Records.Select(r => r.ReceivedSequence).ToArray());
+    }
+
     // ---------- queue options ----------
 
     [Fact]
@@ -1030,7 +1733,7 @@ public sealed class LiveMonitoringServiceTests
     [Fact]
     public async Task FaultAndUserStopRaceSaveExactlyOneErrorSession()
     {
-        // The fault teardown is parked inside SaveSessionAsync while the user's Stop
+        // The fault teardown is parked inside CompleteSessionAsync while the user's Stop
         // runs, so both paths are genuinely in flight at the same time.
         using var saveGate = new ManualResetEventSlim(false);
         var repository = new FakeRepository { SaveGate = saveGate };
@@ -1153,8 +1856,52 @@ public sealed class LiveMonitoringServiceTests
         var counters = service.Snapshot.Counters;
         Assert.Equal(1, counters.Received);
         Assert.Equal(1, counters.DeleteFact);
-        Assert.Equal(1, counters.LateDiscarded);
+        // The old watcher's record belonged to the previous session, so it must not move
+        // any counter of this one — including LateDiscarded, which is persisted.
+        Assert.Equal(0, counters.LateDiscarded);
         Assert.True(counters.IsBalanced);
+    }
+
+    [Fact]
+    public void PublicDocsNoLongerClaimLiveDetailIsDiscarded()
+    {
+        // Phase 2B.1 persists live detail, so every retired Phase 2A-only sentence has
+        // become a false public claim. These are exact retired sentences, not loose scans.
+        var root = RepositoryRoot();
+        foreach (var (file, retired) in new[]
+                 {
+                     ("README.md", "本次实时事件的明细不会保留"),
+                     ("README.en.md", "the detail of those live events is not kept"),
+                     ("README.en.md", "only a session summary is saved"),
+                     ("README.en.md", "Live event detail is **not retained** today"),
+                     ("README.fil.md", "hindi itinatago ang detalye ng mga live event"),
+                     ("SECURITY.md", "Only a **session summary** is stored for live monitoring")
+                 })
+        {
+            Assert.DoesNotContain(
+                retired,
+                File.ReadAllText(Path.Combine(root, file)),
+                StringComparison.Ordinal);
+        }
+
+        // Each language must state the new behaviour and its documented limits.
+        foreach (var (file, required) in new[]
+                 {
+                     ("README.md", "会写入本机的 SQLite 数据库"),
+                     ("README.md", "63 条"),
+                     ("README.en.md", "written to a local SQLite database"),
+                     ("README.en.md", "63 classified records"),
+                     ("README.fil.md", "isinusulat sa lokal na SQLite database"),
+                     ("README.fil.md", "63 na naklasipikang record"),
+                     ("SECURITY.md", "not a tamper-proof medium"),
+                     ("CONTRIBUTING.md", "0004_phase_2b_live_evidence.sql")
+                 })
+        {
+            Assert.Contains(
+                required,
+                File.ReadAllText(Path.Combine(root, file)),
+                StringComparison.Ordinal);
+        }
     }
 
     [Fact]
@@ -1325,15 +2072,29 @@ public sealed class LiveMonitoringServiceTests
     }
 
     [Fact]
-    public async Task LivePageAlwaysDisclosesThatOnlyTheSessionSummaryIsSaved()
+    public async Task LivePageDisclosesWhatIsStoredAndWhatIsStillMissing()
     {
         await using var service = CreateService(FakeProbe.AllAvailable(), out _, out _);
         using var viewModel = CreateViewModel(service);
 
-        Assert.Contains("仅保存监控会话摘要", viewModel.Disclosure, StringComparison.Ordinal);
+        // What Phase 2B.1 now actually does.
         Assert.Contains("原始 XML", viewModel.Disclosure, StringComparison.Ordinal);
-        Assert.Contains("不会保存", viewModel.Disclosure, StringComparison.Ordinal);
-        Assert.Contains("无法在", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("分类结果", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("会写入本机查看器数据库", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("会保留", viewModel.Disclosure, StringComparison.Ordinal);
+        // What it still does not do.
+        Assert.Contains("尚未接入", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("风险评估", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("缺口", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("异常中断", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("不上传", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("尚未投影", viewModel.Disclosure, StringComparison.Ordinal);
+        // The retired Phase 2A claim must not come back: live detail is no longer lost
+        // on stop, so the page may not keep saying that it is.
+        Assert.DoesNotContain(
+            "实时事件原始 XML、删除事实、关联结果和风险结果不会保存",
+            viewModel.Disclosure,
+            StringComparison.Ordinal);
         Assert.Contains("不能阻止、恢复或完整取证", viewModel.Disclaimer, StringComparison.Ordinal);
 
         // The disclosure is a plain always-present string, not a colour or a state.
@@ -1355,7 +2116,10 @@ public sealed class LiveMonitoringServiceTests
             StringComparison.Ordinal);
         Assert.DoesNotContain("当前仍没有实时监控", readme, StringComparison.Ordinal);
         Assert.Contains("默认不读取", readme, StringComparison.Ordinal);
-        Assert.Contains("仅保存监控会话摘要", readme, StringComparison.Ordinal);
+        // Phase 2B.1 changed what is kept: the README now states that live detail is
+        // written locally, not that only a summary survives.
+        Assert.Contains("会写入本机的 SQLite 数据库", readme, StringComparison.Ordinal);
+        Assert.Contains("会话摘要", readme, StringComparison.Ordinal);
         Assert.Contains("尚未接入", readme, StringComparison.Ordinal);
         Assert.Contains("Phase 2B", readme, StringComparison.Ordinal);
     }
@@ -1419,6 +2183,21 @@ public sealed class LiveMonitoringServiceTests
 
         Assert.NotNull(directory);
         return directory.FullName;
+    }
+
+    /// <summary>
+    /// Spins until a condition the fakes publish becomes true. Used only where the state
+    /// being waited for has no signal of its own; the deadline exists to fail a broken
+    /// test rather than to time anything.
+    /// </summary>
+    private static async Task WaitForAsync(Func<bool> condition)
+    {
+        var deadline = Environment.TickCount64 + (long)Patience.TotalMilliseconds;
+        while (!condition())
+        {
+            Assert.True(Environment.TickCount64 < deadline, "condition never became true");
+            await Task.Yield();
+        }
     }
 
     private static LiveMonitoringService CreateService(

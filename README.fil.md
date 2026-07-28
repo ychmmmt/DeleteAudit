@@ -16,7 +16,7 @@ Tool ito para **tumingin at mag-ayos**. Hindi ito panangga. Hindi nito mapipigil
 
 - **Offline import** — isang `.xml` o `.evtx` na log file sa bawat pagkakataon, ikaw ang pumipili.
 - **Tingnan at ayusin** — dumaan sa mga na-import na resulta ayon sa oras, path at status, at buksan ang mga delete event at ang raw na ebidensiya ng mga ito.
-- **Live ingestion preview** — pagkatapos mong pindutin ang start sa live na pahina, nagsu-subscribe ito nang read-only sa mga log channel na nandiyan na sa makina mo, at ipinapakita ang bilang para sa session na iyon. **Kapag itinigil o isinara mo na, hindi itinatago ang detalye ng mga live event na iyon** — isang session summary lang ang naiitala.
+- **Live ingestion (Phase 2B.1)** — pagkatapos mong pindutin ang start sa live na pahina, nagsu-subscribe ito nang read-only sa mga log channel na nandiyan na sa makina mo. **Mula sa sandaling simulan mo, isinusulat sa lokal na SQLite database ang raw XML at ang klasipikasyon ng bawat suportadong event na natanggap**, at **nananatili** ang mga detalyeng matagumpay na naitala kahit itigil o isara mo na ang app. May naiitala ring session summary.
 - **Talaan ng import** — bawat import ay may talaan at isang manifest file, para matiyak mo kung ano talaga ang pumasok.
 
 ## Para kanino ito
@@ -32,8 +32,10 @@ Tool ito para **tumingin at mag-ayos**. Hindi ito panangga. Hindi nito mapipigil
 - Runtime: **.NET 8**.
 - **Hindi ito kumpleto o production-grade na forensic system**, at hindi ito sinusukat sa pamantayan ng komersiyal na digital forensics na produkto.
 - Hindi nito mapipigilan ang aksidenteng pagbura, at hindi rin nito mahaharang ang determinadong umaatake o ang pakikialam sa ebidensiya.
-- Sa ngayon, **hindi itinatago** ang detalye ng live na event — session summary lang ang naiimbak.
-- Sa kasalukuyan, kinikilala at binibilang lang ng live ingestion ang mga event; ang correlation, session aggregation, pagtatasa ng panganib at pangmatagalang pag-iimbak ay **hindi pa nakakabit** sa live na daloy, at nakalaan pa sa **Phase 2B** o mas huli.
+- **Wala pang screen para sa live na kasaysayan.** Hindi pa naipapakita ang bagong naitalang live na detalye sa pahinang "delete events" o "raw evidence"; sa ngayon, direkta lang sa database ito matitingnan.
+- Sa kasalukuyan, tumatanggap, nagklaklasipika at nag-iimbak lang ang live ingestion; ang correlation, session aggregation at pagtatasa ng panganib ay **hindi pa nakakabit** sa live na daloy, at nakalaan sa mas huling bahagi ng **Phase 2B**.
+- **Puwedeng may mga puwang.** Ang pag-apaw ng queue, sobrang laking event, bigong pagsulat, o biglaang pagkamatay ng proseso ay nag-iiwan ng puwang; kapag tahimik ang makina, hanggang 63 na naklasipikang record ang nasa memory hanggang mapuno ang batch o itigil mo. Ang session na walang completion record ay nangangahulugang hindi maayos na natapos ang capture na iyon.
+- **Walang signature, walang external anchoring, walang tamper-evident chain.** Hindi tamper-proof na medium ang database.
 - **Source code lamang** ang inilalabas ng repository na ito. **Walang** handang gamitin at nakapirmang (signed) Windows installer.
 - Pinakahuling beripikasyon: **174 unit test, 55 integration test, 229 lahat, pasado lahat**, na may build na 0 warning at 0 error.
 

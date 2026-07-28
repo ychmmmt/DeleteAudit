@@ -44,6 +44,32 @@ public static class LiveMonitoringLimits
     /// <summary>Maximum diagnostics retained in memory (and persisted) per session.</summary>
     public const int MaxDiagnostics = 256;
 
+    /// <summary>
+    /// Maximum captured records held in memory before the consumer flushes them to the
+    /// database. A hard cap, not a tuning knob: it bounds both the transaction size and
+    /// how much a crash can lose.
+    /// </summary>
+    public const int MaxCaptureBatchRecords = 64;
+
+    /// <summary>Maximum characters persisted from a captured record's detail text.</summary>
+    public const int MaxCaptureDetailCharacters = 2_048;
+
+    /// <summary>Maximum characters persisted from a captured record's error code.</summary>
+    public const int MaxCaptureErrorCodeCharacters = 128;
+
+    public static string? TruncateDetail(string? detail) =>
+        string.IsNullOrWhiteSpace(detail)
+            ? null
+            : Truncate(detail.Trim(), MaxCaptureDetailCharacters);
+
+    public static string? TruncateErrorCode(string? code) =>
+        string.IsNullOrWhiteSpace(code)
+            ? null
+            : Truncate(code.Trim(), MaxCaptureErrorCodeCharacters);
+
+    private static string Truncate(string value, int limit) =>
+        value.Length <= limit ? value : value[..limit];
+
     /// <summary>Maximum characters retained from any diagnostic message.</summary>
     public const int MaxDiagnosticMessageCharacters = 2_048;
 
