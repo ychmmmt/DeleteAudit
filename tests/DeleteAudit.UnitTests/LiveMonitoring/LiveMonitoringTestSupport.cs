@@ -72,6 +72,33 @@ internal sealed class BlockingProbe(ManualResetEventSlim gate, TimeSpan patience
 }
 
 /// <summary>
+/// A deterministic pause point inside a fake. The test awaits <see cref="Entered"/> to
+/// know exactly where execution is parked, does whatever it needs to (typically cancel a
+/// token), then calls <see cref="Release"/>. No wall-clock waiting is involved: the
+/// patience value only stops a broken test from hanging forever.
+/// </summary>
+internal sealed class TestGate : IDisposable
+{
+    private readonly TaskCompletionSource _entered =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly ManualResetEventSlim _release = new(false);
+
+    /// <summary>Completes the moment the fake reaches the gate.</summary>
+    public Task Entered => _entered.Task;
+
+    /// <summary>Called from inside the fake: announce arrival, then park.</summary>
+    public void ArriveAndWait(TimeSpan patience)
+    {
+        _entered.TrySetResult();
+        _release.Wait(patience);
+    }
+
+    public void Release() => _release.Set();
+
+    public void Dispose() => _release.Dispose();
+}
+
+/// <summary>
 /// Models one watcher per subscribed channel, including delivery after disposal so
 /// late-callback behaviour can be tested.
 /// </summary>
@@ -96,6 +123,15 @@ internal sealed class FakeLiveEventSource : ILiveEventSource
     /// where a real fault is already recorded while the UI state says otherwise.
     /// </summary>
     public string? FaultDuringStart { get; init; }
+
+    /// <summary>
+    /// When set, StartAsync creates its watchers, then parks at the gate before finishing.
+    /// This is what makes "cancelled after the source partially started" deterministic:
+    /// the resources exist, and the test controls exactly when the cancellation lands.
+    /// </summary>
+    public TestGate? StartGate { get; init; }
+
+    public TimeSpan GatePatience { get; init; } = TimeSpan.FromSeconds(10);
 
     public LiveEventSubscription? LastSubscription { get; private set; }
 
@@ -148,6 +184,18 @@ internal sealed class FakeLiveEventSource : ILiveEventSource
             }
 
             IsRunning = true;
+        }
+
+        if (StartGate is not null)
+        {
+            // Watchers already exist at this point, so a cancellation observed below is a
+            // genuine "partially started source" and must still be fully released.
+            StartGate.ArriveAndWait(GatePatience);
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return Task.FromException(
+                    new OperationCanceledException(cancellationToken));
+            }
         }
 
         if (FaultDuringStart is not null)
@@ -263,6 +311,12 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
     /// <summary>Held open to park an append mid-flight.</summary>
     public ManualResetEventSlim? AppendGate { get; init; }
 
+    /// <summary>
+    /// When set, StartCaptureSessionAsync parks before recording anything, so a test can
+    /// cancel while the start row does not yet exist.
+    /// </summary>
+    public TestGate? StartCaptureGate { get; init; }
+
     public TimeSpan SaveGatePatience { get; init; } = TimeSpan.FromSeconds(10);
 
     public int SaveCount { get; private set; }
@@ -356,6 +410,13 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
         LiveCaptureSessionStart start,
         CancellationToken cancellationToken = default)
     {
+        if (StartCaptureGate is not null)
+        {
+            // Parked before anything is recorded: a cancellation observed here leaves no
+            // start row at all.
+            StartCaptureGate.ArriveAndWait(SaveGatePatience);
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
         lock (_sync)
         {

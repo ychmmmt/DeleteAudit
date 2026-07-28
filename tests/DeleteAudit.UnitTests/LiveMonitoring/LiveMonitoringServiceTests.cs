@@ -1300,6 +1300,203 @@ public sealed class LiveMonitoringServiceTests
         Assert.Single(repository.Starts);
     }
 
+    // ---------- Phase 2B.1 start cancellation lifecycle ----------
+
+    [Fact]
+    public async Task CancellingBeforeTheStartIsRecordedLeavesNothingBehind()
+    {
+        using var gate = new TestGate();
+        var repository = new FakeRepository { StartCaptureGate = gate };
+        var source = new FakeLiveEventSource();
+        var probe = FakeProbe.AllAvailable();
+        await using var service = new LiveMonitoringService(probe, source, repository);
+        using var cts = new CancellationTokenSource();
+
+        // Run on the pool: StartAsync executes synchronously up to its first real
+        // await, so a gated fake would otherwise block the test's own thread.
+        var starting = Task.Run(() => service.StartAsync(cts.Token));
+        // Execution is parked inside StartCaptureSessionAsync, before it records anything.
+        await gate.Entered;
+        await cts.CancelAsync();
+        gate.Release();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+
+        // Nothing was recorded, so there is nothing to complete and nothing to explain.
+        Assert.Empty(repository.Starts);
+        Assert.Empty(repository.Completions);
+        Assert.Empty(repository.Sessions);
+        Assert.Equal(0, repository.SaveCount);
+        Assert.Equal(0, source.StartCount);
+        Assert.Equal(0, source.LiveWatcherCount);
+        Assert.Equal(0, probe.ProbeCount);
+        // A user cancellation is not a database failure and not a faulted capture.
+        Assert.Equal(LiveMonitoringState.Stopped, service.Snapshot.State);
+    }
+
+    [Fact]
+    public async Task CancellingAfterTheStartIsRecordedCompletesTheSessionAsError()
+    {
+        using var probeGate = new ManualResetEventSlim(false);
+        var repository = new FakeRepository();
+        var source = new FakeLiveEventSource();
+        await using var service = new LiveMonitoringService(
+            new BlockingProbe(probeGate, TimeSpan.FromSeconds(10)),
+            source,
+            repository);
+        using var cts = new CancellationTokenSource();
+
+        var starting = service.StartAsync(cts.Token);
+        // The start row is already written; the probe has not returned yet.
+        await WaitForAsync(() => repository.Starts.Count == 1);
+        await cts.CancelAsync();
+        probeGate.Set();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+
+        Assert.Single(repository.Starts);
+        var completion = Assert.Single(repository.Completions);
+        var summary = Assert.Single(repository.Sessions);
+        Assert.Equal(LiveMonitoringState.Error, completion.FinalState);
+        Assert.Equal(LiveMonitoringState.Error, summary.FinalState);
+        Assert.Equal(completion.Counters, summary.Counters);
+        Assert.Equal(0, completion.PersistedRecordCount);
+        Assert.Empty(repository.Records);
+        Assert.Equal(0, source.StartCount);
+        Assert.Equal(0, source.LiveWatcherCount);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Contains(
+            repository.LastDiagnostics,
+            item => item.Code == "live_start_cancelled");
+    }
+
+    [Fact]
+    public async Task CancellingAfterTheSourcePartiallyStartsReleasesEveryWatcher()
+    {
+        using var gate = new TestGate();
+        var repository = new FakeRepository();
+        var source = new FakeLiveEventSource { StartGate = gate };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var cts = new CancellationTokenSource();
+
+        var starting = Task.Run(() => service.StartAsync(cts.Token));
+        // Watchers already exist at the gate; the cancellation lands on a live source.
+        await gate.Entered;
+        Assert.Equal(2, source.LiveWatcherCount);
+        await cts.CancelAsync();
+        gate.Release();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+
+        // Everything the half-started source created is released.
+        Assert.Equal(0, source.LiveWatcherCount);
+        Assert.All(source.Watchers, watcher => Assert.True(watcher.IsDisposed));
+        Assert.Equal(1, source.StopCount);
+        Assert.Single(repository.Starts);
+        Assert.Equal(
+            LiveMonitoringState.Error,
+            Assert.Single(repository.Completions).FinalState);
+        Assert.Equal(
+            LiveMonitoringState.Error,
+            Assert.Single(repository.Sessions).FinalState);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+
+        // Completing again must not produce a second completion or summary.
+        await service.StopAsync();
+        await service.DisposeAsync();
+        Assert.Single(repository.Completions);
+        Assert.Single(repository.Sessions);
+    }
+
+    [Fact]
+    public async Task ACancelledStartWhoseCompletionAlsoFailsStaysIncompleteAndError()
+    {
+        using var gate = new TestGate();
+        var repository = new FakeRepository
+        {
+            SaveException = new InvalidOperationException("fixture completion failure")
+        };
+        var source = new FakeLiveEventSource { StartGate = gate };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var cts = new CancellationTokenSource();
+
+        var starting = Task.Run(() => service.StartAsync(cts.Token));
+        await gate.Entered;
+        await cts.CancelAsync();
+        gate.Release();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+
+        // The start stands on its own with no completion: an incomplete capture.
+        Assert.Single(repository.Starts);
+        Assert.Empty(repository.Completions);
+        Assert.Empty(repository.Sessions);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.False(string.IsNullOrWhiteSpace(service.Snapshot.LastError));
+        Assert.False(service.SessionPersisted);
+        Assert.Equal(0, source.LiveWatcherCount);
+        // Exactly one attempt; a later Stop does not retry it.
+        await service.StopAsync();
+        Assert.Equal(1, repository.SaveCount);
+    }
+
+    [Fact]
+    public async Task ACancelledStartDoesNotContaminateTheNextSession()
+    {
+        using var gate = new TestGate();
+        var repository = new FakeRepository();
+        var source = new FakeLiveEventSource { StartGate = gate };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var cts = new CancellationTokenSource();
+
+        var starting = Task.Run(() => service.StartAsync(cts.Token));
+        await gate.Entered;
+        await cts.CancelAsync();
+        gate.Release();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+        var cancelledSessionId = Assert.Single(repository.Starts).LiveSessionId;
+
+        // Session B runs normally on a source that no longer gates.
+        var sourceB = new FakeLiveEventSource();
+        await using var serviceB = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            sourceB,
+            repository);
+        using var observer = new ClassificationObserver(serviceB);
+        await serviceB.StartAsync();
+        sourceB.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        await serviceB.StopAsync();
+
+        var sessionB = repository.Completions[^1];
+        Assert.NotEqual(cancelledSessionId, sessionB.LiveSessionId);
+        Assert.Equal(LiveMonitoringState.Stopped, sessionB.FinalState);
+        Assert.Equal(1, sessionB.Counters.Received);
+        Assert.Equal(1, sessionB.Counters.DeleteFact);
+        Assert.Equal(0, sessionB.Counters.LateDiscarded);
+        Assert.Equal(0, sessionB.Counters.Error);
+        Assert.Equal(1, sessionB.PersistedRecordCount);
+
+        // B numbers its own evidence from 1 and shares no identity with the cancelled one.
+        var recordsB = repository.Records
+            .Where(record => record.LiveSessionId == sessionB.LiveSessionId)
+            .ToArray();
+        Assert.Equal(new long[] { 1 }, recordsB.Select(r => r.ReceivedSequence).ToArray());
+        Assert.All(
+            repository.Records,
+            record => Assert.NotEqual(cancelledSessionId, record.LiveSessionId));
+    }
+
     // ---------- Phase 2B.1 callback identity ----------
 
     [Fact]
@@ -1986,6 +2183,21 @@ public sealed class LiveMonitoringServiceTests
 
         Assert.NotNull(directory);
         return directory.FullName;
+    }
+
+    /// <summary>
+    /// Spins until a condition the fakes publish becomes true. Used only where the state
+    /// being waited for has no signal of its own; the deadline exists to fail a broken
+    /// test rather than to time anything.
+    /// </summary>
+    private static async Task WaitForAsync(Func<bool> condition)
+    {
+        var deadline = Environment.TickCount64 + (long)Patience.TotalMilliseconds;
+        while (!condition())
+        {
+            Assert.True(Environment.TickCount64 < deadline, "condition never became true");
+            await Task.Yield();
+        }
     }
 
     private static LiveMonitoringService CreateService(
