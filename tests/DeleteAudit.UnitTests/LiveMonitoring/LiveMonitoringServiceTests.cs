@@ -1666,6 +1666,48 @@ public sealed class LiveMonitoringServiceTests
     }
 
     [Fact]
+    public void PublicDocsNoLongerClaimLiveDetailIsDiscarded()
+    {
+        // Phase 2B.1 persists live detail, so every retired Phase 2A-only sentence has
+        // become a false public claim. These are exact retired sentences, not loose scans.
+        var root = RepositoryRoot();
+        foreach (var (file, retired) in new[]
+                 {
+                     ("README.md", "本次实时事件的明细不会保留"),
+                     ("README.en.md", "the detail of those live events is not kept"),
+                     ("README.en.md", "only a session summary is saved"),
+                     ("README.en.md", "Live event detail is **not retained** today"),
+                     ("README.fil.md", "hindi itinatago ang detalye ng mga live event"),
+                     ("SECURITY.md", "Only a **session summary** is stored for live monitoring")
+                 })
+        {
+            Assert.DoesNotContain(
+                retired,
+                File.ReadAllText(Path.Combine(root, file)),
+                StringComparison.Ordinal);
+        }
+
+        // Each language must state the new behaviour and its documented limits.
+        foreach (var (file, required) in new[]
+                 {
+                     ("README.md", "会写入本机的 SQLite 数据库"),
+                     ("README.md", "63 条"),
+                     ("README.en.md", "written to a local SQLite database"),
+                     ("README.en.md", "63 classified records"),
+                     ("README.fil.md", "isinusulat sa lokal na SQLite database"),
+                     ("README.fil.md", "63 na naklasipikang record"),
+                     ("SECURITY.md", "not a tamper-proof medium"),
+                     ("CONTRIBUTING.md", "0004_phase_2b_live_evidence.sql")
+                 })
+        {
+            Assert.Contains(
+                required,
+                File.ReadAllText(Path.Combine(root, file)),
+                StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public async Task RecordsRejectedDuringStopAreNotCountedAsQueueFullDrops()
     {
         await using var service = CreateService(FakeProbe.AllAvailable(), out var source, out _);
@@ -1877,7 +1919,10 @@ public sealed class LiveMonitoringServiceTests
             StringComparison.Ordinal);
         Assert.DoesNotContain("当前仍没有实时监控", readme, StringComparison.Ordinal);
         Assert.Contains("默认不读取", readme, StringComparison.Ordinal);
-        Assert.Contains("仅保存监控会话摘要", readme, StringComparison.Ordinal);
+        // Phase 2B.1 changed what is kept: the README now states that live detail is
+        // written locally, not that only a summary survives.
+        Assert.Contains("会写入本机的 SQLite 数据库", readme, StringComparison.Ordinal);
+        Assert.Contains("会话摘要", readme, StringComparison.Ordinal);
         Assert.Contains("尚未接入", readme, StringComparison.Ordinal);
         Assert.Contains("Phase 2B", readme, StringComparison.Ordinal);
     }

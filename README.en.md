@@ -16,7 +16,7 @@ It is a tool for **looking at and organising** logs. It is not a protection tool
 
 - **Offline import** — one `.xml` or `.evtx` log file at a time, chosen by you.
 - **Browse and organise** — page through imported results by time, path and status, and open the delete events and their raw evidence.
-- **Live ingestion preview** — after you press start on the live page, it subscribes read-only to log channels that already exist on your machine and shows counters for that session. **Once you stop or close it, the detail of those live events is not kept** — only a session summary is saved.
+- **Live ingestion (Phase 2B.1)** — after you press start on the live page, it subscribes read-only to log channels that already exist on your machine. **From the moment you start it, the raw XML and the classification of each supported event it receives are written to a local SQLite database**, and detail that was committed successfully **is kept** after you stop or close the app. A session summary is saved as well.
 - **Import records** — every import produces a record and a manifest file, so you can check exactly what went in.
 
 ## Who it is for
@@ -32,8 +32,10 @@ It is a tool for **looking at and organising** logs. It is not a protection tool
 - Runtime: **.NET 8**.
 - **Not a complete or production-grade forensic system**, and not held to the standard of a commercial digital forensics product.
 - It cannot prevent accidental deletion, and it cannot stop a determined attacker or evidence tampering.
-- Live event detail is **not retained** today — only a session summary is stored.
-- Live ingestion currently only recognises and counts events; correlation, session aggregation, risk assessment and long-term storage are **not wired into** the live path yet, and are deferred to **Phase 2B** or later.
+- **There is no live history screen yet.** Newly stored live detail is not projected onto the "delete events" or "raw evidence" pages; for now it can only be queried directly from the database.
+- Live ingestion currently receives, classifies and stores; correlation, session aggregation and risk assessment are **not wired into** the live path yet and are deferred to a later part of **Phase 2B**.
+- **There can be gaps.** Queue overflow, oversized events, a failed write or an abrupt process termination all leave gaps, and on a quiet machine up to 63 classified records sit in memory until a batch fills or you stop. A session with no completion record means that capture did not finish cleanly.
+- **No signature, no external anchoring, no tamper-evident chain.** The database is not a tamper-proof medium.
 - This repository ships **source code only**. There is **no** ready-to-run, signed Windows installer.
 - Latest verification: **174 unit tests, 55 integration tests, 229 in total, all passing**, with a 0 warning / 0 error build.
 
