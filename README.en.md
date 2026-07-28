@@ -16,7 +16,7 @@ It is a tool for **looking at and organising** logs. It is not a protection tool
 
 - **Offline import** — one `.xml` or `.evtx` log file at a time, chosen by you.
 - **Browse and organise** — page through imported results by time, path and status, and open the delete events and their raw evidence.
-- **Live ingestion (Phase 2B.1)** — after you press start on the live page, it subscribes read-only to log channels that already exist on your machine. **From the moment you start it, the raw XML and the classification of each supported event it receives are written to a local SQLite database**, and detail that was committed successfully **is kept** after you stop or close the app. A session summary is saved as well.
+- **Live ingestion (Phase 2B.2.1)** — after you press start on the live page, it subscribes read-only to log channels that already exist on your machine. **From the moment you start it, the raw XML, parsing and classification results, and related live evidence for each supported event it receives are written to a local SQLite database**, and detail that was committed successfully **is kept** after you stop or close the app. A session summary is saved as well.
 - **Import records** — every import produces a record and a manifest file, so you can check exactly what went in.
 
 ## Who it is for
@@ -34,10 +34,12 @@ It is a tool for **looking at and organising** logs. It is not a protection tool
 - It cannot prevent accidental deletion, and it cannot stop a determined attacker or evidence tampering.
 - **There is no live history screen yet.** Newly stored live detail is not projected onto the "delete events" or "raw evidence" pages; for now it can only be queried directly from the database.
 - Live ingestion currently receives, classifies and stores; correlation, session aggregation and risk assessment are **not wired into** the live path yet and are deferred to a later part of **Phase 2B**.
-- **There can be gaps.** Queue overflow, oversized events, a failed write or an abrupt process termination all leave gaps, and on a quiet machine up to 63 classified records sit in memory until a batch fills or you stop. A session with no completion record means that capture did not finish cleanly.
+- **Writes have a fixed batch deadline, not a strict timing guarantee.** A batch enters persistence immediately at 64 records. A partial batch is normally scheduled for persistence about five seconds after its first record enters an empty batch; later records in that batch do not restart the deadline. Operating-system and thread scheduling, SQLite I/O, or a fault can make completion later.
+- **There can still be gaps.** An abrupt process termination can still lose up to 63 uncommitted records; queue overflow, oversized events, or a failed write also leave gaps. A session with no completion record means that capture did not finish cleanly.
+- **The completion record is attempted once, with no automatic retry.** If that save fails, the session shows `Error`; records committed successfully beforehand are kept.
 - **No signature, no external anchoring, no tamper-evident chain.** The database is not a tamper-proof medium.
 - This repository ships **source code only**. There is **no** ready-to-run, signed Windows installer.
-- Latest verification: **174 unit tests, 55 integration tests, 229 in total, all passing**, with a 0 warning / 0 error build.
+- Latest verification: **229 unit tests, 105 integration tests, 334 in total, all passing**, with a 0 warning / 0 error build.
 
 Per-phase acceptance records, the design overview and the threat model live in [`docs/`](docs/).
 

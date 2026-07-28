@@ -8,10 +8,11 @@ public sealed class MainWindowViewModel : ViewModelBase
 {
     /// <summary>
     /// Always visible at the top of the window. It must describe what the application
-    /// actually does right now — including that live event detail is not retained.
+    /// actually does right now, including the locally persisted live evidence boundary.
     /// </summary>
     public const string CapabilityBanner =
-        "当前支持离线日志分析，以及用户手动开启的实时事件接入预览；实时事件详情暂不持久保存。";
+        "当前支持离线日志分析，以及用户手动开启的实时事件接入预览；接收到的受支持事件原始 XML、"
+        + "解析与分类结果及相关实时证据会持久保存到本机查看器数据库，但尚无实时历史查看界面。";
 
     private readonly IViewerQueryService _queryService;
     private readonly string _bannerMessage = CapabilityBanner;

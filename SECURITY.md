@@ -17,10 +17,11 @@ delete audit trail, and it cannot prevent, block, or recover deletions.
   subscribes read-only, in-process, to Windows event log channels that already
   exist on the machine (`Microsoft-Windows-Sysmon/Operational` and `Security`),
   filtered server-side to Sysmon 1/23/26 and Security 4663.
-- Live capture (Phase 2B.1) stores, in the local viewer database, the raw XML and
-  the classification of each supported event received after you start it, plus a
-  session summary. Correlation results, delete sessions and risk results are still
-  **not** produced or stored for live capture.
+- Live capture (Phase 2B.2.1) stores, in the local viewer database, the raw XML,
+  parsing and classification results, and related live evidence for each supported
+  event received after you start it, plus a session summary. Correlation results,
+  delete sessions and risk results are still **not** produced or stored for live
+  capture, and there is no Live History UI.
 
 ## What it deliberately does not do
 
@@ -57,10 +58,18 @@ explanation is in the README:
 
 - Live detail is written **only to the local viewer database** inside the
   repository's `artifacts` directory. Nothing is uploaded.
-- The record can have **bounded gaps**: queue overflow, an oversized event, a failed
-  write or an abrupt process termination all leave a gap, and up to 63 classified
-  records may be held in memory before a batch is written. A capture session with no
-  completion row did not finish cleanly and must be read that way.
+- A batch enters persistence immediately at 64 records. A partial batch is normally
+  scheduled for persistence about five seconds after its first record enters an empty
+  batch; later records in the same batch do not restart that deadline. This is not a
+  strict five-second guarantee: operating-system and thread scheduling, SQLite I/O, or
+  a fault can make completion later.
+- The record can still have **bounded gaps**: an abrupt process termination may lose
+  up to 63 uncommitted records, and queue overflow, an oversized event, or a failed
+  write also leaves a gap. A capture session with no completion row did not finish
+  cleanly and must be read that way.
+- A completion save is attempted once and is not retried automatically. If it fails,
+  the session is shown as `Error`; records committed successfully before that failure
+  are kept.
 - The database is **not a tamper-proof medium**. A local administrator, or any
   process with write access to the file, can modify, replace or delete it. There is
   no signature, no external anchoring and no tamper-evident chain for live capture.
@@ -88,8 +97,8 @@ volunteer Alpha project there is no guaranteed response window.
 ## Scope notes
 
 Findings that describe the documented Alpha limitations above (for example
-"live event detail is not persisted" or "there is no tamper-evident chain for
-live capture") are known design boundaries, not vulnerabilities. Findings that
+"there is no Live History UI" or "there is no tamper-evident chain for live
+capture") are known design boundaries, not vulnerabilities. Findings that
 show the application exceeding its documented boundaries — for example reading
 an event log channel without user action, escaping its controlled data
 directory, or writing outside the repository — are in scope and welcome.

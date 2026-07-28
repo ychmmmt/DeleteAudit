@@ -13,6 +13,181 @@ public sealed class LiveMonitoringServiceTests
 {
     private static readonly TimeSpan Patience = TimeSpan.FromSeconds(10);
 
+    // ---------- deterministic timer support ----------
+
+    [Fact]
+    public void CaptureFlushIntervalIsFixedAndPositive()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(5), LiveMonitoringLimits.CaptureFlushInterval);
+        Assert.True(LiveMonitoringLimits.CaptureFlushInterval > TimeSpan.Zero);
+    }
+
+    [Fact]
+    public async Task ManualTimerDoesNotFireBeforeItsDueTimeAndFiresAtTheDeadline()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        var callbackCount = 0;
+        using var timer = time.CreateTimer(
+            _ => Interlocked.Increment(ref callbackCount),
+            null,
+            TimeSpan.FromSeconds(5),
+            Timeout.InfiniteTimeSpan);
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(4));
+        Assert.Equal(0, callbackCount);
+        Assert.Equal(1, time.ActiveTimerCount);
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(1, callbackCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task DisposedManualTimerNeverFires()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        var callbackCount = 0;
+        var timer = time.CreateTimer(
+            _ => Interlocked.Increment(ref callbackCount),
+            null,
+            TimeSpan.FromSeconds(5),
+            Timeout.InfiniteTimeSpan);
+
+        timer.Dispose();
+        await time.AdvanceAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(0, callbackCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task ConcurrentDisposeWaitsForACommittedCallbackBeforeReturning()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        using var callbackCommitted = new ManualResetEventSlim(false);
+        using var releaseCallback = new ManualResetEventSlim(false);
+        using var disposeWaiting = new ManualResetEventSlim(false);
+        var callbackCount = 0;
+        var callbackWaitTimedOut = 0;
+        time.BeforeTimerCallback = () =>
+        {
+            callbackCommitted.Set();
+            if (!releaseCallback.Wait(Patience))
+            {
+                Interlocked.Exchange(ref callbackWaitTimedOut, 1);
+            }
+        };
+        time.BeforeTimerDisposeWait = disposeWaiting.Set;
+        var timer = time.CreateTimer(
+            _ => Interlocked.Increment(ref callbackCount),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var advancing = time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        Assert.True(callbackCommitted.Wait(Patience));
+        var disposing = Task.Run(() =>
+        {
+            timer.Dispose();
+        });
+        Assert.True(disposeWaiting.Wait(Patience));
+        Assert.False(disposing.IsCompleted);
+
+        releaseCallback.Set();
+        await Task.WhenAll(advancing, disposing);
+        await time.AdvanceAsync(TimeSpan.FromDays(1));
+
+        Assert.Equal(1, callbackCount);
+        Assert.Equal(0, callbackWaitTimedOut);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task CancellingProviderBackedDelayRemovesItsTimer()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        using var cancellation = new CancellationTokenSource();
+        var delay = Task.Delay(
+            TimeSpan.FromSeconds(5),
+            time,
+            cancellation.Token);
+
+        await cancellation.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => delay);
+        await time.AdvanceAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(delay.IsCanceled);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task ManualTimersFireInDueTimeThenRegistrationOrder()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        var order = new List<string>();
+        using var laterFirst = time.CreateTimer(
+            _ => order.Add("five-first"),
+            null,
+            TimeSpan.FromSeconds(5),
+            Timeout.InfiniteTimeSpan);
+        using var earlier = time.CreateTimer(
+            _ => order.Add("three"),
+            null,
+            TimeSpan.FromSeconds(3),
+            Timeout.InfiniteTimeSpan);
+        using var laterSecond = time.CreateTimer(
+            _ => order.Add("five-second"),
+            null,
+            TimeSpan.FromSeconds(5),
+            Timeout.InfiniteTimeSpan);
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(["three", "five-first", "five-second"], order);
+    }
+
+    [Fact]
+    public async Task ManualTimerCallbackDoesNotReenterTheAdvancingThread()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        var advancingThread = Environment.CurrentManagedThreadId;
+        var callbackThread = 0;
+        using var timer = time.CreateTimer(
+            _ => callbackThread = Environment.CurrentManagedThreadId,
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+
+        Assert.NotEqual(0, callbackThread);
+        Assert.NotEqual(advancingThread, callbackThread);
+    }
+
+    [Fact]
+    public async Task ManualOneShotTimerFiresOnlyOnce()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        var callbackCount = 0;
+        using var timer = time.CreateTimer(
+            _ => Interlocked.Increment(ref callbackCount),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await time.AdvanceAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, callbackCount);
+    }
+
     // ---------- channel detection ----------
 
     [Fact]
@@ -1063,6 +1238,435 @@ public sealed class LiveMonitoringServiceTests
     }
 
     [Fact]
+    public async Task SingleRecordFlushesWhenItsDeadlineExpiresWithoutStop()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        Assert.Equal(0, repository.AppendCount);
+        Assert.Equal(1, time.CreatedTimerCount);
+        await time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        Assert.Equal([1], repository.BatchSizes);
+        Assert.Single(repository.Records);
+        Assert.Equal(LiveMonitoringState.Running, service.Snapshot.State);
+        Assert.Equal(0, time.ActiveTimerCount);
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task SixtyThreeRecordsFlushTogetherAtTheDeadlineWithoutStop()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        for (var index = 1;
+             index < LiveMonitoringLimits.MaxCaptureBatchRecords;
+             index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        observer.WaitForCount(
+            LiveMonitoringLimits.MaxCaptureBatchRecords - 1,
+            Patience);
+        Assert.Equal(0, repository.AppendCount);
+        Assert.Equal(1, time.CreatedTimerCount);
+
+        await time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        Assert.Equal([LiveMonitoringLimits.MaxCaptureBatchRecords - 1], repository.BatchSizes);
+        Assert.Equal(
+            LiveMonitoringLimits.MaxCaptureBatchRecords - 1,
+            repository.Records.Count);
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task FullBatchFlushesImmediatelyWithoutAdvancingTime()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        for (var index = 1;
+             index <= LiveMonitoringLimits.MaxCaptureBatchRecords;
+             index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        observer.WaitForCount(LiveMonitoringLimits.MaxCaptureBatchRecords, Patience);
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        Assert.Equal([LiveMonitoringLimits.MaxCaptureBatchRecords], repository.BatchSizes);
+        Assert.Equal(1, time.CreatedTimerCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task LaterRecordsDoNotResetTheFirstRecordDeadline()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        for (var second = 1; second <= 4; second++)
+        {
+            await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(second + 1)));
+            observer.WaitForCount(second + 1, Patience);
+            Assert.Equal(1, time.CreatedTimerCount);
+            Assert.Equal(0, repository.AppendCount);
+        }
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        Assert.Equal([5], repository.BatchSizes);
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task FullBatchAndDeadlineRaceNeverDuplicatesEvidence()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        for (var index = 1;
+             index < LiveMonitoringLimits.MaxCaptureBatchRecords;
+             index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        observer.WaitForCount(
+            LiveMonitoringLimits.MaxCaptureBatchRecords - 1,
+            Patience);
+        var advancing = time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(
+                LiveMonitoringLimits.MaxCaptureBatchRecords)));
+        observer.WaitForCount(LiveMonitoringLimits.MaxCaptureBatchRecords, Patience);
+        await advancing;
+        await service.StopAsync();
+
+        Assert.Equal(
+            LiveMonitoringLimits.MaxCaptureBatchRecords,
+            repository.Records.Count);
+        Assert.Equal(
+            LiveMonitoringLimits.MaxCaptureBatchRecords,
+            repository.Records.Select(record => record.ReceivedSequence).Distinct().Count());
+        Assert.Equal(
+            LiveMonitoringLimits.MaxCaptureBatchRecords,
+            repository.BatchSizes.Sum());
+        Assert.Single(repository.Completions);
+    }
+
+    [Fact]
+    public async Task AdvancingTimeWithAnEmptyBatchNeverCallsAppend()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out _,
+            out var repository,
+            timeProvider: time);
+        await service.StartAsync();
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(0, time.CreatedTimerCount);
+        Assert.Equal(0, repository.AppendCount);
+        await service.StopAsync();
+        Assert.Equal(0, repository.AppendCount);
+    }
+
+    [Fact]
+    public async Task StopAndDeadlineRaceFlushAndCompleteExactlyOnce()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        var watcher = source.Watcher(0);
+        watcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        var advancing = time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        var stopping = service.StopAsync();
+        await Task.WhenAll(advancing, stopping);
+
+        Assert.Single(repository.Records);
+        Assert.Equal(1, repository.AppendCount);
+        Assert.Single(repository.Completions);
+        Assert.Single(repository.Sessions);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task SourceFaultBeforeDeadlineFlushesWithoutAdvancingTime()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        source.Fault("live_watcher_failed", "fixture fault before deadline");
+        await service.StopAsync();
+
+        Assert.Single(repository.Records);
+        Assert.Single(repository.Completions);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Equal(1, time.CreatedTimerCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task SourceFaultAndDeadlineRaceEndsInErrorWithoutDuplicateEvidence()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        var watcher = source.Watcher(0);
+        watcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        var advancing = time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        source.Fault("live_watcher_failed", "fixture deadline race");
+        await advancing;
+        await service.StopAsync();
+
+        Assert.Single(repository.Records);
+        Assert.Single(repository.Completions);
+        Assert.Equal(
+            LiveMonitoringState.Error,
+            Assert.Single(repository.Sessions).FinalState);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task PersistenceFaultAtDeadlineCreatesNoFurtherAppendOrDeadline()
+    {
+        var time = CaptureTime();
+        var source = new FakeLiveEventSource();
+        var repository = new FakeRepository
+        {
+            AppendException = new InvalidOperationException(
+                "fixture timed append failure")
+        };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        var watcher = source.Watcher(0);
+        watcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        await time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        await WaitForAsync(() => repository.AppendCount == 1);
+        await service.StopAsync();
+        var timersAfterFault = time.CreatedTimerCount;
+        watcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(2)));
+
+        Assert.Equal(1, repository.AppendCount);
+        Assert.Equal(timersAfterFault, time.CreatedTimerCount);
+        Assert.Empty(repository.Records);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task DisposeAndDeadlineRaceLeavesNoWatcherConsumerOrTimer()
+    {
+        var time = CaptureTime();
+        var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        var advancing = time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        var disposing = service.DisposeAsync().AsTask();
+        await Task.WhenAll(advancing, disposing);
+
+        Assert.Single(repository.Records);
+        Assert.Single(repository.Completions);
+        Assert.Equal(0, source.LiveWatcherCount);
+        Assert.Equal(1, source.DisposeCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+        Assert.True(service.LifecycleCompleted);
+    }
+
+    [Fact]
+    public async Task ChannelCompletionBeforeDeadlineFlushesImmediately()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        await service.StopAsync();
+
+        Assert.Single(repository.Records);
+        Assert.Equal([1], repository.BatchSizes);
+        Assert.Equal(1, time.CreatedTimerCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task NextPartialBatchGetsANewDeadlineFromItsFirstRecord()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        await time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(2)));
+        observer.WaitForCount(2, Patience);
+        Assert.Equal(2, time.CreatedTimerCount);
+        await time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        await WaitForAsync(() => repository.AppendCount == 2);
+
+        Assert.Equal([1, 1], repository.BatchSizes);
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task StableLowTrafficProducesTwoFixedDeadlineCycles()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        for (var second = 1; second <= 4; second++)
+        {
+            await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(second + 1)));
+            observer.WaitForCount(second + 1, Patience);
+        }
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(6)));
+        observer.WaitForCount(6, Patience);
+        for (var second = 6; second <= 9; second++)
+        {
+            await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(second + 1)));
+            observer.WaitForCount(second + 1, Patience);
+        }
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await WaitForAsync(() => repository.AppendCount == 2);
+
+        Assert.Equal([5, 5], repository.BatchSizes);
+        Assert.Equal(2, time.CreatedTimerCount);
+        Assert.Equal(10, repository.Records.Count);
+        await service.StopAsync();
+    }
+
+    [Fact]
     public async Task EachRecordIsParsedOnceAndCarriesItsParserIdentity()
     {
         await using var service = CreateService(
@@ -1298,6 +1902,107 @@ public sealed class LiveMonitoringServiceTests
         Assert.Equal(1, repository.SaveCount);
         // The start row and any committed evidence stay: an incomplete capture.
         Assert.Single(repository.Starts);
+    }
+
+    [Fact]
+    public async Task AppendFaultRemainsLastErrorWhenCompletionAlsoFails()
+    {
+        const string AppendFailure = "specific append failure A";
+        const string CompletionFailure = "generic completion failure B";
+        var repository = new FakeRepository
+        {
+            AppendException = new InvalidOperationException(AppendFailure),
+            SaveException = new InvalidOperationException(CompletionFailure)
+        };
+        var source = new FakeLiveEventSource();
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        await service.StopAsync();
+
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Contains(AppendFailure, service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            CompletionFailure,
+            service.Snapshot.LastError,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_evidence_persist_failed"
+                && item.Message.Contains(AppendFailure, StringComparison.Ordinal));
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_session_persist_failed"
+                && item.Message.Contains(CompletionFailure, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CompletionFaultIsLastErrorWhenThereIsNoEarlierCause()
+    {
+        const string CompletionFailure = "completion-only failure B";
+        var repository = new FakeRepository
+        {
+            SaveException = new InvalidOperationException(CompletionFailure)
+        };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            new FakeLiveEventSource(),
+            repository);
+        await service.StartAsync();
+
+        await service.StopAsync();
+
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Contains(
+            CompletionFailure,
+            service.Snapshot.LastError,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_session_persist_failed"
+                && item.Message.Contains(CompletionFailure, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task SourceFaultRemainsLastErrorWhenCompletionAlsoFails()
+    {
+        const string SourceFailure = "specific source failure A";
+        const string CompletionFailure = "generic completion failure B";
+        var repository = new FakeRepository
+        {
+            SaveException = new InvalidOperationException(CompletionFailure)
+        };
+        var source = new FakeLiveEventSource();
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        await service.StartAsync();
+
+        source.Fault("live_watcher_failed", SourceFailure);
+        await service.StopAsync();
+
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Contains(SourceFailure, service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            CompletionFailure,
+            service.Snapshot.LastError,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_watcher_failed"
+                && item.Message.Contains(SourceFailure, StringComparison.Ordinal));
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_session_persist_failed"
+                && item.Message.Contains(CompletionFailure, StringComparison.Ordinal));
     }
 
     // ---------- Phase 2B.1 start cancellation lifecycle ----------
@@ -1588,6 +2293,93 @@ public sealed class LiveMonitoringServiceTests
         Assert.Equal(2048, options.Capacity);
     }
 
+    [Fact]
+    public async Task WatcherPublishThreadNeverRunsAppendOrCompletion()
+    {
+        using var appendGate = new ManualResetEventSlim(false);
+        using var completionGate = new ManualResetEventSlim(false);
+        using var keepPublisherAlive = new ManualResetEventSlim(false);
+        var repository = new FakeRepository
+        {
+            AppendGate = appendGate,
+            SaveGate = completionGate
+        };
+        var source = new FakeLiveEventSource();
+        var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        var publishReturned = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var publisherThreadId = 0;
+        var publisher = new Thread(() =>
+        {
+            try
+            {
+                publisherThreadId = Environment.CurrentManagedThreadId;
+                for (var index = 1;
+                     index <= LiveMonitoringLimits.MaxCaptureBatchRecords;
+                     index++)
+                {
+                    source.Publish(LiveEventFixtures.SysmonRecord(
+                        LiveEventFixtures.SysmonDelete(index)));
+                }
+
+                publishReturned.TrySetResult();
+                keepPublisherAlive.Wait(Patience);
+            }
+            catch (Exception exception)
+            {
+                publishReturned.TrySetException(exception);
+            }
+        })
+        {
+            IsBackground = false,
+            Name = "DeleteAudit fixture watcher publisher"
+        };
+
+        try
+        {
+            await service.StartAsync();
+            publisher.Start();
+
+            await publishReturned.Task.WaitAsync(Patience);
+            await repository.FirstAppendEntered.WaitAsync(Patience);
+
+            Assert.True(publishReturned.Task.IsCompletedSuccessfully);
+            Assert.NotEqual(0, publisherThreadId);
+            Assert.DoesNotContain(publisherThreadId, repository.AppendThreadIds);
+
+            var stopping = service.StopAsync();
+            Assert.False(stopping.IsCompleted);
+            appendGate.Set();
+            await repository.FirstCompletionEntered.WaitAsync(Patience);
+
+            Assert.DoesNotContain(
+                publisherThreadId,
+                repository.CompletionThreadIds);
+            completionGate.Set();
+            await stopping;
+
+            Assert.Equal(1, repository.AppendCount);
+            Assert.Equal(1, repository.SaveCount);
+            Assert.Single(repository.Completions);
+            Assert.Equal(0, source.LiveWatcherCount);
+        }
+        finally
+        {
+            appendGate.Set();
+            completionGate.Set();
+            keepPublisherAlive.Set();
+            if (publisher.IsAlive)
+            {
+                Assert.True(publisher.Join(Patience));
+            }
+
+            await service.DisposeAsync();
+        }
+    }
+
     // ---------- XAML structure ----------
 
     [Fact]
@@ -1875,7 +2667,8 @@ public sealed class LiveMonitoringServiceTests
                      ("README.en.md", "only a session summary is saved"),
                      ("README.en.md", "Live event detail is **not retained** today"),
                      ("README.fil.md", "hindi itinatago ang detalye ng mga live event"),
-                     ("SECURITY.md", "Only a **session summary** is stored for live monitoring")
+                     ("SECURITY.md", "Only a **session summary** is stored for live monitoring"),
+                     ("SECURITY.md", "live event detail is not persisted")
                  })
         {
             Assert.DoesNotContain(
@@ -1890,9 +2683,9 @@ public sealed class LiveMonitoringServiceTests
                      ("README.md", "会写入本机的 SQLite 数据库"),
                      ("README.md", "63 条"),
                      ("README.en.md", "written to a local SQLite database"),
-                     ("README.en.md", "63 classified records"),
+                     ("README.en.md", "63 uncommitted records"),
                      ("README.fil.md", "isinusulat sa lokal na SQLite database"),
-                     ("README.fil.md", "63 na naklasipikang record"),
+                     ("README.fil.md", "63 na hindi pa na-commit na record"),
                      ("SECURITY.md", "not a tamper-proof medium"),
                      ("CONTRIBUTING.md", "0004_phase_2b_live_evidence.sql")
                  })
@@ -1902,6 +2695,94 @@ public sealed class LiveMonitoringServiceTests
                 File.ReadAllText(Path.Combine(root, file)),
                 StringComparison.Ordinal);
         }
+    }
+
+    [Theory]
+    [InlineData(
+        "README.md",
+        "达到 64 条时会立即进入持久化",
+        "第一条进入空批次起，通常约 5 秒",
+        "同批后续记录不会重新开始期限",
+        "仍可能丢失最多 63 条尚未提交的记录",
+        "只尝试保存一次",
+        "不会自动重试",
+        "此前已经成功提交的记录仍会保留",
+        "显示 `Error`",
+        "不是严格时限保证")]
+    [InlineData(
+        "README.en.md",
+        "enters persistence immediately at 64 records",
+        "about five seconds after its first record enters an empty batch",
+        "later records in that batch do not restart the deadline",
+        "still lose up to 63 uncommitted records",
+        "completion record is attempted once",
+        "no automatic retry",
+        "records committed successfully beforehand are kept",
+        "session shows `Error`",
+        "not a strict timing guarantee")]
+    [InlineData(
+        "README.fil.md",
+        "Agad na pumapasok sa persistence ang batch kapag umabot sa 64 record",
+        "mga limang segundo matapos pumasok ang unang record sa bakanteng batch",
+        "hindi inuulit ng mga kasunod na record ang deadline",
+        "maaari pa ring mawala ang hanggang 63 na hindi pa na-commit na record",
+        "Isang beses lang sinusubukang i-save ang completion record",
+        "walang awtomatikong retry",
+        "nananatili ang mga record na matagumpay nang na-commit",
+        "`Error` ang ipinapakita",
+        "hindi ito mahigpit na garantiya sa oras")]
+    [InlineData(
+        "SECURITY.md",
+        "enters persistence immediately at 64 records",
+        "about five seconds after its first record enters an empty batch",
+        "later records in the same batch do not restart that deadline",
+        "may lose up to 63 uncommitted records",
+        "completion save is attempted once",
+        "not retried automatically",
+        "records committed successfully before that failure are kept",
+        "shown as `Error`",
+        "not a strict five-second guarantee")]
+    public void PublicDocsDescribeBoundedLatencyWithoutErasingResidualRisk(
+        string file,
+        string immediateBatch,
+        string partialBatch,
+        string fixedDeadline,
+        string residualLoss,
+        string completionAttempt,
+        string noRetry,
+        string committedRecords,
+        string errorState,
+        string nonGuarantee)
+    {
+        var document = string.Join(
+            " ",
+            File.ReadAllText(Path.Combine(RepositoryRoot(), file))
+                .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        foreach (var required in new[]
+                 {
+                     immediateBatch,
+                     partialBatch,
+                     fixedDeadline,
+                     residualLoss,
+                     completionAttempt,
+                     noRetry,
+                     committedRecords,
+                     errorState,
+                     nonGuarantee
+                 })
+        {
+            Assert.Contains(required, document, StringComparison.Ordinal);
+        }
+
+        Assert.DoesNotContain(
+            "guaranteed within five seconds",
+            document,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(
+            "63-record crash-loss window has been eliminated",
+            document,
+            StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -2068,7 +2949,11 @@ public sealed class LiveMonitoringServiceTests
 
         Assert.DoesNotContain("当前尚未实时监控", banner, StringComparison.Ordinal);
         Assert.Contains("实时事件接入预览", banner, StringComparison.Ordinal);
-        Assert.Contains("实时事件详情暂不持久保存", banner, StringComparison.Ordinal);
+        Assert.DoesNotContain("实时事件详情暂不持久保存", banner, StringComparison.Ordinal);
+        Assert.Contains("原始 XML", banner, StringComparison.Ordinal);
+        Assert.Contains("解析与分类结果", banner, StringComparison.Ordinal);
+        Assert.Contains("持久保存到本机查看器数据库", banner, StringComparison.Ordinal);
+        Assert.Contains("尚无实时历史查看界面", banner, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -2089,6 +2974,17 @@ public sealed class LiveMonitoringServiceTests
         Assert.Contains("异常中断", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("不上传", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("尚未投影", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("达到 64 条时立即", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("第一条进入空批次起通常约 5 秒", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("后续记录不会重新开始期限", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("实际完成时间稍晚", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("不是严格的五秒保证", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("最多 63 条尚未提交记录", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("只尝试保存一次且不自动重试", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("显示 Error", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("已经成功提交的记录仍会保留", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("SQLite 不是防篡改介质", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("不是完整或生产级取证系统", viewModel.Disclosure, StringComparison.Ordinal);
         // The retired Phase 2A claim must not come back: live detail is no longer lost
         // on stop, so the page may not keep saying that it is.
         Assert.DoesNotContain(
@@ -2204,12 +3100,21 @@ public sealed class LiveMonitoringServiceTests
         ILiveEventChannelProbe probe,
         out FakeLiveEventSource source,
         out FakeRepository repository,
-        LiveMonitoringOptions? options = null)
+        LiveMonitoringOptions? options = null,
+        TimeProvider? timeProvider = null)
     {
         source = new FakeLiveEventSource();
         repository = new FakeRepository();
-        return new LiveMonitoringService(probe, source, repository, options);
+        return new LiveMonitoringService(
+            probe,
+            source,
+            repository,
+            options,
+            timeProvider);
     }
+
+    private static ManualTimerTimeProvider CaptureTime() =>
+        new(new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
 
     private static LiveMonitoringViewModel CreateViewModel(ILiveMonitoringService service) =>
         new(service, new InlineDispatcher());

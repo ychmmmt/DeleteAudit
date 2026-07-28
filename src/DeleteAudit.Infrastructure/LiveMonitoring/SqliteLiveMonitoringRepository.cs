@@ -20,20 +20,160 @@ namespace DeleteAudit.Infrastructure.LiveMonitoring;
 /// </remarks>
 public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
 {
+    private const string SummaryMigration =
+        "db/migrations/0003_phase_2a_live_monitoring.sql";
+
+    private const string EvidenceMigration =
+        "db/migrations/0004_phase_2b_live_evidence.sql";
+
     /// <summary>Phase 2A summary tables, from 0003.</summary>
-    private static readonly string[] SummaryTables =
+    private static readonly TableRequirement[] SummaryTables =
     [
-        "live_monitoring_sessions",
-        "live_monitoring_channels",
-        "live_monitoring_diagnostics"
+        new(
+            "live_monitoring_sessions",
+            SummaryMigration,
+            IsWithoutRowId: false,
+            [
+                C("live_session_id", "TEXT", true, 1),
+                C("started_utc", "TEXT", true),
+                C("stopped_utc", "TEXT", false),
+                C("final_state", "TEXT", true),
+                C("received_count", "INTEGER", true),
+                C("delete_fact_count", "INTEGER", true),
+                C("process_context_count", "INTEGER", true),
+                C("security_evidence_count", "INTEGER", true),
+                C("ignored_count", "INTEGER", true),
+                C("error_count", "INTEGER", true),
+                C("dropped_count", "INTEGER", true),
+                C("late_discarded_count", "INTEGER", true),
+                C("suppressed_diagnostic_count", "INTEGER", true),
+                C("queue_capacity", "INTEGER", true),
+                C("application_version", "TEXT", true)
+            ],
+            [],
+            []),
+        new(
+            "live_monitoring_channels",
+            SummaryMigration,
+            IsWithoutRowId: true,
+            [
+                C("live_session_id", "TEXT", true, 1),
+                C("channel_name", "TEXT", true, 2),
+                C("availability", "TEXT", true),
+                C("detail", "TEXT", false)
+            ],
+            [
+                new ForeignKeyRequirement(
+                    "live_session_id",
+                    "live_monitoring_sessions",
+                    "live_session_id")
+            ],
+            []),
+        new(
+            "live_monitoring_diagnostics",
+            SummaryMigration,
+            IsWithoutRowId: false,
+            [
+                C("live_diagnostic_id", "TEXT", true, 1),
+                C("live_session_id", "TEXT", true),
+                C("stage", "TEXT", true),
+                C("severity", "TEXT", true),
+                C("code", "TEXT", true),
+                C("message", "TEXT", true),
+                C("occurred_utc", "TEXT", true)
+            ],
+            [
+                new ForeignKeyRequirement(
+                    "live_session_id",
+                    "live_monitoring_sessions",
+                    "live_session_id")
+            ],
+            [])
     ];
 
     /// <summary>Phase 2B.1 live evidence tables, from 0004.</summary>
-    private static readonly string[] EvidenceTables =
+    private static readonly TableRequirement[] EvidenceTables =
     [
-        "live_capture_sessions",
-        "live_capture_records",
-        "live_capture_completions"
+        new(
+            "live_capture_sessions",
+            EvidenceMigration,
+            IsWithoutRowId: false,
+            [
+                C("live_session_id", "TEXT", true, 1),
+                C("started_utc", "TEXT", true),
+                C("queue_capacity", "INTEGER", true),
+                C("application_version", "TEXT", true)
+            ],
+            [],
+            []),
+        new(
+            "live_capture_records",
+            EvidenceMigration,
+            IsWithoutRowId: false,
+            [
+                C("live_evidence_id", "TEXT", true, 1),
+                C("live_session_id", "TEXT", true),
+                C("received_sequence", "INTEGER", true),
+                C("event_record_id", "INTEGER", false),
+                C("provider_name", "TEXT", false),
+                C("channel_name", "TEXT", true),
+                C("machine_name", "TEXT", false),
+                C("time_created_utc", "TEXT", false),
+                C("observed_utc", "TEXT", true),
+                C("raw_xml", "TEXT", true),
+                C("raw_xml_sha256", "BLOB", true),
+                C("parser_raw_event_id", "TEXT", false),
+                C("parsed_event_id", "INTEGER", false),
+                C("outcome", "TEXT", true),
+                C("error_code", "TEXT", false),
+                C("detail", "TEXT", false)
+            ],
+            [
+                new ForeignKeyRequirement(
+                    "live_session_id",
+                    "live_capture_sessions",
+                    "live_session_id")
+            ],
+            [
+                new UniqueRequirement(
+                    ["live_session_id", "received_sequence"])
+            ]),
+        new(
+            "live_capture_completions",
+            EvidenceMigration,
+            IsWithoutRowId: false,
+            [
+                C("live_session_id", "TEXT", true, 1),
+                C("stopped_utc", "TEXT", true),
+                C("final_state", "TEXT", true),
+                C("received_count", "INTEGER", true),
+                C("delete_fact_count", "INTEGER", true),
+                C("process_context_count", "INTEGER", true),
+                C("security_evidence_count", "INTEGER", true),
+                C("ignored_count", "INTEGER", true),
+                C("error_count", "INTEGER", true),
+                C("dropped_count", "INTEGER", true),
+                C("late_discarded_count", "INTEGER", true),
+                C("suppressed_diagnostic_count", "INTEGER", true),
+                C("persisted_record_count", "INTEGER", true)
+            ],
+            [
+                new ForeignKeyRequirement(
+                    "live_session_id",
+                    "live_capture_sessions",
+                    "live_session_id")
+            ],
+            [])
+    ];
+
+    private static readonly TriggerRequirement[] EvidenceTriggers =
+    [
+        new("live_capture_sessions_no_update", "live_capture_sessions", "UPDATE"),
+        new("live_capture_sessions_no_delete", "live_capture_sessions", "DELETE"),
+        new("live_capture_records_no_update", "live_capture_records", "UPDATE"),
+        new("live_capture_records_no_delete", "live_capture_records", "DELETE"),
+        new("live_capture_completions_no_update", "live_capture_completions", "UPDATE"),
+        new("live_capture_completions_no_delete", "live_capture_completions", "DELETE")
     ];
 
     private readonly ViewerDataLocation _location;
@@ -45,50 +185,532 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
 
     public async Task ValidateSchemaAsync(CancellationToken cancellationToken = default)
     {
-        var databasePath = RequireDatabase();
+        _ = RequireDatabase();
 
         await using var connection = _location.CreateReadOnlyConnection();
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+        foreach (var table in SummaryTables)
+        {
+            await ValidateTableAsync(connection, table, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        foreach (var table in EvidenceTables)
+        {
+            await ValidateTableAsync(connection, table, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        foreach (var trigger in EvidenceTriggers)
+        {
+            await ValidateTriggerAsync(connection, trigger, cancellationToken)
+                .ConfigureAwait(false);
+        }
+    }
+
+    private static async Task ValidateTableAsync(
+        SqliteConnection connection,
+        TableRequirement requirement,
+        CancellationToken cancellationToken)
+    {
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT type
+                FROM main.sqlite_master
+                WHERE name = $name COLLATE NOCASE;
+                """;
+            command.Parameters.Add("$name", SqliteType.Text).Value = requirement.Name;
+            var type = await command
+                .ExecuteScalarAsync(cancellationToken)
+                .ConfigureAwait(false) as string;
+            if (!string.Equals(type, "table", StringComparison.OrdinalIgnoreCase))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    type is null
+                        ? "the required table is missing"
+                        : $"the object is type '{type}', not a table");
+            }
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT type, wr, strict
+                FROM pragma_table_list($table)
+                WHERE schema = 'main';
+                """;
+            command.Parameters.Add("$table", SqliteType.Text).Value = requirement.Name;
+            await using var reader = await command
+                .ExecuteReaderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    "table metadata is unavailable");
+            }
+
+            if (!string.Equals(
+                    reader.GetString(0),
+                    "table",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    "table metadata does not describe a normal table");
+            }
+
+            var withoutRowId = reader.GetInt64(1) != 0;
+            if (withoutRowId != requirement.IsWithoutRowId)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"WITHOUT ROWID flag is {(withoutRowId ? "enabled" : "disabled")}");
+            }
+
+            if (reader.GetInt64(2) != 1)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    "STRICT table enforcement is missing");
+            }
+        }
+
+        var columns = await ReadColumnsAsync(
+                connection,
+                requirement.Name,
+                cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var expected in requirement.Columns)
+        {
+            if (!columns.TryGetValue(expected.Name, out var actual))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"required column '{expected.Name}' is missing");
+            }
+
+            if (!string.Equals(
+                    actual.DeclaredType,
+                    expected.DeclaredType,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"column '{expected.Name}' has declared type/affinity "
+                    + $"'{actual.DeclaredType}', expected '{expected.DeclaredType}'");
+            }
+
+            if (actual.IsNotNull != expected.IsNotNull)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"column '{expected.Name}' NOT NULL flag is "
+                    + $"{(actual.IsNotNull ? "enabled" : "missing")}");
+            }
+
+            if (actual.PrimaryKeyOrdinal != expected.PrimaryKeyOrdinal)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"column '{expected.Name}' has primary-key ordinal "
+                    + $"{actual.PrimaryKeyOrdinal}, expected "
+                    + $"{expected.PrimaryKeyOrdinal}");
+            }
+        }
+
+        if (columns.Count != requirement.Columns.Count)
+        {
+            throw SchemaNotReady(
+                requirement,
+                $"expected exactly {requirement.Columns.Count} columns but found "
+                + $"{columns.Count}");
+        }
+
+        var foreignKeys = await ReadForeignKeysAsync(
+                connection,
+                requirement.Name,
+                cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var expected in requirement.ForeignKeys)
+        {
+            if (!foreignKeys.Contains(expected))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"required foreign key '{expected.FromColumn}' to "
+                    + $"'{expected.ToTable}.{expected.ToColumn}' is missing or malformed");
+            }
+        }
+
+        if (foreignKeys.Count != requirement.ForeignKeys.Count)
+        {
+            throw SchemaNotReady(
+                requirement,
+                $"expected exactly {requirement.ForeignKeys.Count} foreign key(s) "
+                + $"but found {foreignKeys.Count}");
+        }
+
+        foreach (var unique in requirement.UniqueConstraints)
+        {
+            if (!await HasUniqueIndexAsync(
+                    connection,
+                    requirement.Name,
+                    unique.Columns,
+                    cancellationToken)
+                .ConfigureAwait(false))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    "required UNIQUE index on "
+                    + $"({string.Join(", ", unique.Columns)}) is missing");
+            }
+        }
+    }
+
+    private static async Task<Dictionary<string, ColumnMetadata>> ReadColumnsAsync(
+        SqliteConnection connection,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
         using var command = connection.CreateCommand();
         command.CommandText = """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table';
+            SELECT name, type, "notnull", pk
+            FROM pragma_table_info($table, $schema)
+            ORDER BY cid;
             """;
-
-        var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        command.Parameters.Add("$table", SqliteType.Text).Value = tableName;
+        command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
+        var columns = new Dictionary<string, ColumnMetadata>(
+            StringComparer.OrdinalIgnoreCase);
         await using var reader = await command
             .ExecuteReaderAsync(cancellationToken)
             .ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            present.Add(reader.GetString(0));
+            var name = reader.GetString(0);
+            columns.Add(
+                name,
+                new ColumnMetadata(
+                    reader.GetString(1).Trim(),
+                    reader.GetInt64(2) != 0,
+                    reader.GetInt32(3)));
         }
 
-        // Reported separately so the message names the migration that is actually
-        // missing instead of a generic "schema is wrong".
-        var missingSummary = SummaryTables
-            .Where(table => !present.Contains(table))
-            .ToArray();
-        if (missingSummary.Length != 0)
-        {
-            throw new InvalidOperationException(
-                "The live monitoring schema increment is missing required tables: "
-                + $"{string.Join(", ", missingSummary)}. Apply db/migrations/0003_phase_2a_live_monitoring.sql explicitly.");
-        }
-
-        var missingEvidence = EvidenceTables
-            .Where(table => !present.Contains(table))
-            .ToArray();
-        if (missingEvidence.Length != 0)
-        {
-            throw new InvalidOperationException(
-                "The live evidence schema increment is missing required tables: "
-                + $"{string.Join(", ", missingEvidence)}. Apply db/migrations/0004_phase_2b_live_evidence.sql explicitly.");
-        }
-
-        _ = databasePath;
+        return columns;
     }
+
+    private static async Task<IReadOnlyList<ForeignKeyRequirement>> ReadForeignKeysAsync(
+        SqliteConnection connection,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT "table", "from", "to", on_update, on_delete, match
+            FROM pragma_foreign_key_list($table, $schema)
+            ORDER BY id, seq;
+            """;
+        command.Parameters.Add("$table", SqliteType.Text).Value = tableName;
+        command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
+        var foreignKeys = new List<ForeignKeyRequirement>();
+        await using var reader = await command
+            .ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var onUpdate = reader.GetString(3);
+            var onDelete = reader.GetString(4);
+            var match = reader.GetString(5);
+            if (!string.Equals(onUpdate, "NO ACTION", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(onDelete, "NO ACTION", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(match, "NONE", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            foreignKeys.Add(new ForeignKeyRequirement(
+                reader.GetString(1),
+                reader.GetString(0),
+                reader.GetString(2)));
+        }
+
+        return foreignKeys;
+    }
+
+    private static async Task<bool> HasUniqueIndexAsync(
+        SqliteConnection connection,
+        string tableName,
+        IReadOnlyList<string> expectedColumns,
+        CancellationToken cancellationToken)
+    {
+        var candidates = new List<string>();
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT name
+                FROM pragma_index_list($table, $schema)
+                WHERE "unique" = 1
+                  AND partial = 0
+                  AND origin = 'u';
+                """;
+            command.Parameters.Add("$table", SqliteType.Text).Value = tableName;
+            command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
+            await using var reader = await command
+                .ExecuteReaderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                candidates.Add(reader.GetString(0));
+            }
+        }
+
+        foreach (var candidate in candidates)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT name
+                FROM pragma_index_info($index, $schema)
+                ORDER BY seqno;
+                """;
+            command.Parameters.Add("$index", SqliteType.Text).Value = candidate;
+            command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
+            var actualColumns = new List<string>();
+            await using var reader = await command
+                .ExecuteReaderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (!reader.IsDBNull(0))
+                {
+                    actualColumns.Add(reader.GetString(0));
+                }
+            }
+
+            if (actualColumns.SequenceEqual(
+                    expectedColumns,
+                    StringComparer.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static async Task ValidateTriggerAsync(
+        SqliteConnection connection,
+        TriggerRequirement requirement,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT type, tbl_name, COALESCE(sql, '')
+            FROM main.sqlite_master
+            WHERE name = $name COLLATE NOCASE;
+            """;
+        command.Parameters.Add("$name", SqliteType.Text).Value = requirement.Name;
+        await using var reader = await command
+            .ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            throw TriggerNotReady(requirement, "the required trigger is missing");
+        }
+
+        if (!string.Equals(
+                reader.GetString(0),
+                "trigger",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw TriggerNotReady(requirement, "the object is not a trigger");
+        }
+
+        if (!string.Equals(
+                reader.GetString(1),
+                requirement.TableName,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw TriggerNotReady(
+                requirement,
+                $"it is bound to '{reader.GetString(1)}', not "
+                + $"'{requirement.TableName}'");
+        }
+
+        var tokens = TokenizeTriggerSql(reader.GetString(2));
+        if (!ContainsTokenSequence(
+                tokens,
+                ["BEFORE", requirement.EventName, "ON", requirement.TableName])
+            || tokens.Contains("WHEN", StringComparer.OrdinalIgnoreCase)
+            || !ContainsTokenSequence(tokens, ["SELECT", "RAISE", "ABORT"]))
+        {
+            throw TriggerNotReady(
+                requirement,
+                $"definition must be unconditional {requirement.EventName} "
+                + "and fail closed with SELECT RAISE(ABORT, ...)");
+        }
+    }
+
+    private static string[] TokenizeTriggerSql(string sql)
+    {
+        var normalized = new StringBuilder(sql.Length);
+        for (var index = 0; index < sql.Length; index++)
+        {
+            var character = sql[index];
+            if (character == '\'')
+            {
+                normalized.Append(' ');
+                while (++index < sql.Length)
+                {
+                    if (sql[index] != '\'')
+                    {
+                        continue;
+                    }
+
+                    if (index + 1 < sql.Length && sql[index + 1] == '\'')
+                    {
+                        index++;
+                        continue;
+                    }
+
+                    break;
+                }
+
+                continue;
+            }
+
+            if (character == '-'
+                && index + 1 < sql.Length
+                && sql[index + 1] == '-')
+            {
+                normalized.Append(' ');
+                index += 2;
+                while (index < sql.Length && sql[index] is not '\r' and not '\n')
+                {
+                    index++;
+                }
+
+                continue;
+            }
+
+            if (character == '/'
+                && index + 1 < sql.Length
+                && sql[index + 1] == '*')
+            {
+                normalized.Append(' ');
+                index += 2;
+                while (index + 1 < sql.Length
+                       && !(sql[index] == '*' && sql[index + 1] == '/'))
+                {
+                    index++;
+                }
+
+                if (index + 1 < sql.Length)
+                {
+                    index++;
+                }
+
+                continue;
+            }
+
+            normalized.Append(
+                char.IsAsciiLetterOrDigit(character) || character == '_'
+                    ? character
+                    : ' ');
+        }
+
+        return normalized
+            .ToString()
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+    }
+
+    private static bool ContainsTokenSequence(
+        IReadOnlyList<string> tokens,
+        IReadOnlyList<string> expected)
+    {
+        for (var start = 0; start <= tokens.Count - expected.Count; start++)
+        {
+            var matches = true;
+            for (var offset = 0; offset < expected.Count; offset++)
+            {
+                if (!string.Equals(
+                        tokens[start + offset],
+                        expected[offset],
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+
+            if (matches)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static InvalidOperationException SchemaNotReady(
+        TableRequirement requirement,
+        string detail) =>
+        new(
+            $"Runtime structural readiness check failed for table "
+            + $"'{requirement.Name}': {detail}. Apply {requirement.Migration} "
+            + "explicitly. This runtime structural readiness check does not prove "
+            + "database integrity, tamper resistance, or migration authenticity.");
+
+    private static InvalidOperationException TriggerNotReady(
+        TriggerRequirement requirement,
+        string detail) =>
+        new(
+            $"Runtime structural readiness check failed for trigger "
+            + $"'{requirement.Name}' on table '{requirement.TableName}': {detail}. "
+            + $"Apply {EvidenceMigration} explicitly. This runtime structural "
+            + "readiness check does not prove database integrity, tamper resistance, "
+            + "or migration authenticity.");
+
+    private static ColumnRequirement C(
+        string name,
+        string declaredType,
+        bool isNotNull,
+        int primaryKeyOrdinal = 0) =>
+        new(name, declaredType, isNotNull, primaryKeyOrdinal);
+
+    private sealed record TableRequirement(
+        string Name,
+        string Migration,
+        bool IsWithoutRowId,
+        IReadOnlyList<ColumnRequirement> Columns,
+        IReadOnlyList<ForeignKeyRequirement> ForeignKeys,
+        IReadOnlyList<UniqueRequirement> UniqueConstraints);
+
+    private sealed record ColumnRequirement(
+        string Name,
+        string DeclaredType,
+        bool IsNotNull,
+        int PrimaryKeyOrdinal);
+
+    private sealed record ColumnMetadata(
+        string DeclaredType,
+        bool IsNotNull,
+        int PrimaryKeyOrdinal);
+
+    private sealed record ForeignKeyRequirement(
+        string FromColumn,
+        string ToTable,
+        string ToColumn);
+
+    private sealed record UniqueRequirement(IReadOnlyList<string> Columns);
+
+    private sealed record TriggerRequirement(
+        string Name,
+        string TableName,
+        string EventName);
 
     public async Task StartCaptureSessionAsync(
         LiveCaptureSessionStart start,

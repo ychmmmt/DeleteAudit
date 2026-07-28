@@ -54,6 +54,141 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         Assert.Equal(3, await CountLiveTablesAsync(location));
     }
 
+    [Theory]
+    [InlineData(EvidenceSchemaMutation.MissingColumn, "provider_name")]
+    [InlineData(EvidenceSchemaMutation.WrongType, "raw_xml_sha256")]
+    [InlineData(EvidenceSchemaMutation.MissingNotNull, "channel_name")]
+    [InlineData(EvidenceSchemaMutation.WrongPrimaryKey, "live_evidence_id")]
+    [InlineData(EvidenceSchemaMutation.MissingUnique, "live_session_id, received_sequence")]
+    [InlineData(EvidenceSchemaMutation.MissingForeignKey, "live_session_id")]
+    [InlineData(
+        EvidenceSchemaMutation.MissingUpdateTrigger,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.MissingDeleteTrigger,
+        "live_capture_records_no_delete")]
+    [InlineData(
+        EvidenceSchemaMutation.WrongTriggerBinding,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.TriggerWithoutRaise,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.ConditionalTrigger,
+        "live_capture_records_no_update")]
+    [InlineData(EvidenceSchemaMutation.MissingStrict, "live_capture_sessions")]
+    public async Task MalformedEvidenceSchemaFailsClosedWithSpecificObjectAndMigration(
+        EvidenceSchemaMutation mutation,
+        string expectedObject)
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(
+            location,
+            applyLiveMigration: true,
+            evidenceMigrationTransform: sql => MutateEvidenceMigration(sql, mutation));
+        var repository = new SqliteLiveMonitoringRepository(location);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => repository.ValidateSchemaAsync());
+
+        Assert.Contains(expectedObject, exception.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            "db/migrations/0004_phase_2b_live_evidence.sql",
+            exception.Message,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "runtime structural readiness check",
+            exception.Message,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(
+            "does not prove database integrity, tamper resistance, or migration authenticity",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task MalformedSummarySchemaNamesThe0003ObjectAndMigration()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(
+            location,
+            applyLiveMigration: true,
+            liveMigrationTransform: sql => ReplaceRequiredOnce(
+                sql,
+                "started_utc             TEXT NOT NULL,",
+                "started_utc             BLOB NOT NULL,"));
+        var repository = new SqliteLiveMonitoringRepository(location);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => repository.ValidateSchemaAsync());
+
+        Assert.Contains(
+            "live_monitoring_sessions",
+            exception.Message,
+            StringComparison.Ordinal);
+        Assert.Contains("started_utc", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            "db/migrations/0003_phase_2a_live_monitoring.sql",
+            exception.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "0004_phase_2b_live_evidence.sql",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadinessUsesReadOnlyConnectionAndContainsNoWritePath()
+    {
+        var source = await File.ReadAllTextAsync(Path.Combine(
+            RepositoryRoot.Value,
+            "src",
+            "DeleteAudit.Infrastructure",
+            "LiveMonitoring",
+            "SqliteLiveMonitoringRepository.cs"));
+        var start = source.IndexOf(
+            "public async Task ValidateSchemaAsync",
+            StringComparison.Ordinal);
+        var end = source.IndexOf(
+            "public async Task StartCaptureSessionAsync",
+            start,
+            StringComparison.Ordinal);
+
+        Assert.True(start >= 0);
+        Assert.True(end > start);
+        var readinessPath = source[start..end];
+        Assert.Contains(
+            "_location.CreateReadOnlyConnection()",
+            readinessPath,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "OpenWritableAsync",
+            readinessPath,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "ExecuteNonQuery",
+            readinessPath,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadinessLeavesSchemaAndBusinessDataUnchanged()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        await repository.StartCaptureSessionAsync(new LiveCaptureSessionStart(
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            StartedUtc,
+            2048,
+            "readiness-snapshot"));
+        var before = await ReadReadinessSnapshotAsync(location);
+
+        await repository.ValidateSchemaAsync();
+
+        Assert.Equal(before, await ReadReadinessSnapshotAsync(location));
+    }
+
     [Fact]
     public async Task SessionChannelsAndDiagnosticsArePersistedExactly()
     {
@@ -684,7 +819,9 @@ public sealed class SqliteLiveMonitoringRepositoryTests
     private static async Task CreateDatabaseAsync(
         ViewerDataLocation location,
         bool applyLiveMigration,
-        bool? applyEvidenceMigration = null)
+        bool? applyEvidenceMigration = null,
+        Func<string, string>? liveMigrationTransform = null,
+        Func<string, string>? evidenceMigrationTransform = null)
     {
         await using var connection = CreateWritableConnection(location.DatabasePath);
         await connection.OpenAsync();
@@ -697,19 +834,144 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         };
         if (applyLiveMigration)
         {
-            scripts.Add(await File.ReadAllTextAsync(
-                Path.Combine(fixtures, "0003_phase_2a_live_monitoring.sql")));
+            var migration = (await File.ReadAllTextAsync(
+                    Path.Combine(fixtures, "0003_phase_2a_live_monitoring.sql")))
+                .ReplaceLineEndings("\n");
+            scripts.Add(liveMigrationTransform?.Invoke(migration) ?? migration);
         }
 
         if (applyEvidenceMigration ?? applyLiveMigration)
         {
-            scripts.Add(await File.ReadAllTextAsync(
-                Path.Combine(fixtures, "0004_phase_2b_live_evidence.sql")));
+            var migration = (await File.ReadAllTextAsync(
+                    Path.Combine(fixtures, "0004_phase_2b_live_evidence.sql")))
+                .ReplaceLineEndings("\n");
+            scripts.Add(evidenceMigrationTransform?.Invoke(migration) ?? migration);
         }
 
         using var command = connection.CreateCommand();
         command.CommandText = string.Join(Environment.NewLine, scripts);
         await command.ExecuteNonQueryAsync();
+    }
+
+    private static string MutateEvidenceMigration(
+        string migration,
+        EvidenceSchemaMutation mutation) =>
+        mutation switch
+        {
+            EvidenceSchemaMutation.MissingColumn => ReplaceRequiredOnce(
+                migration,
+                "    provider_name           TEXT,\n",
+                string.Empty),
+            EvidenceSchemaMutation.WrongType => ReplaceRequiredOnce(
+                migration,
+                "    raw_xml_sha256          BLOB NOT NULL",
+                "    raw_xml_sha256          TEXT NOT NULL"),
+            EvidenceSchemaMutation.MissingNotNull => ReplaceRequiredOnce(
+                migration,
+                "    channel_name            TEXT NOT NULL",
+                "    channel_name            TEXT"),
+            EvidenceSchemaMutation.WrongPrimaryKey => ReplaceRequiredOnce(
+                migration,
+                "    live_evidence_id        TEXT PRIMARY KEY,",
+                "    live_evidence_id        TEXT NOT NULL,"),
+            EvidenceSchemaMutation.MissingUnique => ReplaceRequiredOnce(
+                migration,
+                ",\n    UNIQUE (live_session_id, received_sequence)",
+                string.Empty),
+            EvidenceSchemaMutation.MissingForeignKey => ReplaceRequiredOnce(
+                migration,
+                """
+                CREATE TABLE live_capture_records (
+                    live_evidence_id        TEXT PRIMARY KEY,
+                    live_session_id         TEXT NOT NULL
+                                                REFERENCES live_capture_sessions(live_session_id),
+                """,
+                """
+                CREATE TABLE live_capture_records (
+                    live_evidence_id        TEXT PRIMARY KEY,
+                    live_session_id         TEXT NOT NULL,
+                """),
+            EvidenceSchemaMutation.MissingUpdateTrigger => ReplaceRequiredOnce(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                BEFORE UPDATE ON live_capture_records BEGIN
+                    SELECT RAISE(ABORT, 'live_capture_records is append-only');
+                END;
+                """,
+                string.Empty),
+            EvidenceSchemaMutation.MissingDeleteTrigger => ReplaceRequiredOnce(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_delete
+                BEFORE DELETE ON live_capture_records BEGIN
+                    SELECT RAISE(ABORT, 'live_capture_records is append-only');
+                END;
+                """,
+                string.Empty),
+            EvidenceSchemaMutation.WrongTriggerBinding => ReplaceRequiredOnce(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                BEFORE UPDATE ON live_capture_records
+                """,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                BEFORE UPDATE ON live_capture_sessions
+                """),
+            EvidenceSchemaMutation.TriggerWithoutRaise => ReplaceRequiredOnce(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                BEFORE UPDATE ON live_capture_records BEGIN
+                    SELECT RAISE(ABORT, 'live_capture_records is append-only');
+                END;
+                """,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                BEFORE UPDATE ON live_capture_records BEGIN
+                    SELECT 1;
+                END;
+                """),
+            EvidenceSchemaMutation.ConditionalTrigger => ReplaceRequiredOnce(
+                migration,
+                "BEFORE UPDATE ON live_capture_records BEGIN",
+                "BEFORE UPDATE ON live_capture_records WHEN 1 = 1 BEGIN"),
+            EvidenceSchemaMutation.MissingStrict => ReplaceRequiredOnce(
+                migration,
+                """
+                    application_version     TEXT NOT NULL CHECK (length(application_version) > 0)
+                ) STRICT;
+                """,
+                """
+                    application_version     TEXT NOT NULL CHECK (length(application_version) > 0)
+                );
+                """),
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(mutation),
+                mutation,
+                null)
+        };
+
+    private static string ReplaceRequiredOnce(
+        string source,
+        string oldValue,
+        string newValue)
+    {
+        var index = source.IndexOf(oldValue, StringComparison.Ordinal);
+        Assert.True(
+            index >= 0,
+            $"The fixture text to mutate was not found: {oldValue}");
+        Assert.Equal(
+            -1,
+            source.IndexOf(
+                oldValue,
+                index + oldValue.Length,
+                StringComparison.Ordinal));
+        return string.Concat(
+            source.AsSpan(0, index),
+            newValue,
+            source.AsSpan(index + oldValue.Length));
     }
 
     private static SqliteConnection CreateWritableConnection(string databasePath) =>
@@ -950,6 +1212,76 @@ public sealed class SqliteLiveMonitoringRepositoryTests
 
         return Convert.ToHexString(
             SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(builder.ToString())));
+    }
+
+    private static async Task<string> ReadReadinessSnapshotAsync(
+        ViewerDataLocation location)
+    {
+        await using var connection = location.CreateReadOnlyConnection();
+        await connection.OpenAsync();
+        var builder = new System.Text.StringBuilder();
+        using (var schema = connection.CreateCommand())
+        {
+            schema.CommandText = """
+                SELECT type, name, tbl_name, COALESCE(sql, '')
+                FROM sqlite_master
+                WHERE name LIKE 'live_%'
+                ORDER BY type, name;
+                """;
+            await using var reader = await schema.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                for (var ordinal = 0; ordinal < reader.FieldCount; ordinal++)
+                {
+                    builder
+                        .Append(reader.GetString(ordinal))
+                        .Append('\u001f');
+                }
+
+                builder.Append('\u001e');
+            }
+        }
+
+        using (var data = connection.CreateCommand())
+        {
+            data.CommandText = """
+                SELECT live_session_id, started_utc, queue_capacity, application_version
+                FROM live_capture_sessions
+                ORDER BY live_session_id;
+                """;
+            await using var reader = await data.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                builder
+                    .Append(reader.GetString(0))
+                    .Append('\u001f')
+                    .Append(reader.GetString(1))
+                    .Append('\u001f')
+                    .Append(reader.GetInt64(2))
+                    .Append('\u001f')
+                    .Append(reader.GetString(3))
+                    .Append('\u001e');
+            }
+        }
+
+        return Convert.ToHexString(
+            SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(builder.ToString())));
+    }
+
+    public enum EvidenceSchemaMutation
+    {
+        MissingColumn,
+        WrongType,
+        MissingNotNull,
+        WrongPrimaryKey,
+        MissingUnique,
+        MissingForeignKey,
+        MissingUpdateTrigger,
+        MissingDeleteTrigger,
+        WrongTriggerBinding,
+        TriggerWithoutRaise,
+        ConditionalTrigger,
+        MissingStrict
     }
 
     private sealed record StoredSession(

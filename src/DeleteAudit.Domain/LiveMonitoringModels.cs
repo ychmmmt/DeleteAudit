@@ -51,6 +51,13 @@ public static class LiveMonitoringLimits
     /// </summary>
     public const int MaxCaptureBatchRecords = 64;
 
+    /// <summary>
+    /// Age at which a non-empty partial capture batch is scheduled for persistence.
+    /// The deadline starts when the first record enters an empty batch and is not
+    /// extended by later records.
+    /// </summary>
+    public static readonly TimeSpan CaptureFlushInterval = TimeSpan.FromSeconds(5);
+
     /// <summary>Maximum characters persisted from a captured record's detail text.</summary>
     public const int MaxCaptureDetailCharacters = 2_048;
 
