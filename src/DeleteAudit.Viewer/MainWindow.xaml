@@ -2,7 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:viewer="clr-namespace:DeleteAudit.Viewer"
-        Title="DeleteAudit — 离线查看器"
+        Title="DeleteAudit — 审计查看器"
         Height="760"
         Width="1240"
         MinHeight="620"
@@ -892,6 +892,180 @@
                             <DataGridTextColumn Binding="{Binding MatchedProcessLiveEvidenceId, Converter={StaticResource UnknownValue}}" Header="匹配的进程证据" />
                         </DataGrid.Columns>
                     </DataGrid>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="实时规范投影">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0"
+                            Background="#EEF4FF"
+                            BorderBrush="#2F5BB7"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="10,8">
+                        <TextBlock Text="{Binding LiveProjection.Disclosure}"
+                                   TextWrapping="Wrap" />
+                    </Border>
+
+                    <StackPanel Grid.Row="1" Margin="0,8,0,0">
+                        <TextBlock FontWeight="SemiBold"
+                                   Text="{Binding LiveProjection.SelectedSessionSummary}"
+                                   TextWrapping="Wrap" />
+                        <WrapPanel Margin="0,8,0,0">
+                            <Button AutomationProperties.Name="投影所选实时接入会话"
+                                    Command="{Binding LiveProjection.ProjectCommand}"
+                                    Content="投影所选会话"
+                                    Padding="12,6" />
+                            <Button AutomationProperties.Name="刷新实时规范投影"
+                                    Command="{Binding LiveProjection.RefreshCommand}"
+                                    Content="刷新投影记录"
+                                    Margin="8,0,0,0"
+                                    Padding="12,6" />
+                            <Button AutomationProperties.Name="验证实时投影连续性"
+                                    Command="{Binding LiveProjection.VerifyCommand}"
+                                    Content="验证连续性"
+                                    Margin="8,0,0,0"
+                                    Padding="12,6" />
+                            <TextBlock Margin="12,0,0,0"
+                                       VerticalAlignment="Center"
+                                       Text="正在执行…"
+                                       Visibility="{Binding LiveProjection.IsLoading, Converter={StaticResource BoolToVisibility}}" />
+                        </WrapPanel>
+
+                        <WrapPanel Margin="0,8,0,0">
+                            <TextBlock Style="{StaticResource FilterLabel}"
+                                       Text="来源" />
+                            <ComboBox Width="170"
+                                      AutomationProperties.Name="投影来源筛选"
+                                      ItemsSource="{Binding LiveProjection.SourceOptions}"
+                                      SelectedItem="{Binding LiveProjection.Source, Mode=TwoWay}" />
+                            <TextBlock Margin="12,0,6,0"
+                                       Style="{StaticResource FilterLabel}"
+                                       Text="路径包含" />
+                            <TextBox Width="220"
+                                     AutomationProperties.Name="投影路径筛选"
+                                     Text="{Binding LiveProjection.PathContains, UpdateSourceTrigger=PropertyChanged}" />
+                            <TextBlock Margin="12,0,6,0"
+                                       Style="{StaticResource FilterLabel}"
+                                       Text="进程包含" />
+                            <TextBox Width="220"
+                                     AutomationProperties.Name="投影进程筛选"
+                                     Text="{Binding LiveProjection.ProcessContains, UpdateSourceTrigger=PropertyChanged}" />
+                            <CheckBox Margin="12,0,0,0"
+                                      VerticalAlignment="Center"
+                                      Content="最新序号优先"
+                                      IsChecked="{Binding LiveProjection.Descending}" />
+                            <Button Command="{Binding LiveProjection.ApplyFiltersCommand}"
+                                    Content="应用筛选"
+                                    Margin="12,0,0,0"
+                                    Padding="10,4" />
+                        </WrapPanel>
+                    </StackPanel>
+
+                    <StackPanel Grid.Row="2" Margin="0,8,0,0">
+                        <TextBlock Text="{Binding LiveProjection.AvailabilityMessage}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Margin="0,4,0,0"
+                                   Text="{Binding LiveProjection.LastRunSummary}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Margin="0,4,0,0"
+                                   Text="{Binding LiveProjection.ContinuitySummary}"
+                                   TextWrapping="Wrap" />
+                        <Border Background="#FEE4E2"
+                                BorderBrush="#B42318"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Margin="0,6,0,0"
+                                Padding="10,8"
+                                Visibility="{Binding LiveProjection.IsUnavailable, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B42318"
+                                       Text="{Binding LiveProjection.AvailabilityMessage}"
+                                       TextWrapping="Wrap" />
+                        </Border>
+                        <Border Background="#FEE4E2"
+                                BorderBrush="#B42318"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Margin="0,6,0,0"
+                                Padding="10,8"
+                                Visibility="{Binding LiveProjection.LastRunFailed, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B42318"
+                                       Text="{Binding LiveProjection.LastRunSummary}"
+                                       TextWrapping="Wrap" />
+                        </Border>
+                        <Border Background="#FFF4E5"
+                                BorderBrush="#B54708"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Margin="0,6,0,0"
+                                Padding="10,8"
+                                Visibility="{Binding LiveProjection.ContinuityIsBroken, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B54708"
+                                       Text="{Binding LiveProjection.ContinuitySummary}"
+                                       TextWrapping="Wrap" />
+                        </Border>
+                        <TextBlock Style="{StaticResource ErrorText}"
+                                   Text="{Binding LiveProjection.ErrorMessage}" />
+                        <TextBlock Margin="0,4,0,0"
+                                   Text="该筛选条件下没有投影记录。"
+                                   Visibility="{Binding LiveProjection.IsEmpty, Converter={StaticResource BoolToVisibility}}" />
+                    </StackPanel>
+
+                    <DataGrid Grid.Row="3"
+                              Margin="0,8,0,0"
+                              AutomationProperties.Name="实时规范投影记录列表"
+                              ItemsSource="{Binding LiveProjection.Records}"
+                              Style="{StaticResource VirtualizedDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Binding="{Binding LiveIngestSequence}"
+                                                Header="Live 序号" />
+                            <DataGridTextColumn Binding="{Binding SourceReceivedSequence}"
+                                                Header="接收序号" />
+                            <DataGridTextColumn Binding="{Binding SourceLabel}"
+                                                Header="来源分类" />
+                            <DataGridTextColumn Binding="{Binding EventUtc, Converter={StaticResource UnknownValue}}"
+                                                Header="事件时间 (UTC)" />
+                            <DataGridTextColumn Binding="{Binding NormalizedPath, Converter={StaticResource UnknownValue}}"
+                                                Header="路径"
+                                                Width="*" />
+                            <DataGridTextColumn Binding="{Binding ProcessPath, Converter={StaticResource UnknownValue}}"
+                                                Header="进程" />
+                            <DataGridTextColumn Binding="{Binding ProcessId, Converter={StaticResource UnknownValue}}"
+                                                Header="PID" />
+                            <DataGridTextColumn Binding="{Binding UserName, Converter={StaticResource UnknownValue}}"
+                                                Header="用户" />
+                            <DataGridTextColumn Binding="{Binding LiveEvidenceId}"
+                                                Header="Live evidence ID" />
+                            <DataGridTextColumn Binding="{Binding LiveChannelEpochId}"
+                                                Header="Live epoch ID" />
+                            <DataGridTextColumn Binding="{Binding LiveProjectionId}"
+                                                Header="Projection ID" />
+                            <DataGridTextColumn Binding="{Binding EntryHash}"
+                                                Header="Entry hash" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <DockPanel Grid.Row="4" Margin="0,6,0,0">
+                        <TextBlock VerticalAlignment="Center"
+                                   Text="{Binding LiveProjection.PageStatus}" />
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <Button Command="{Binding LiveProjection.PreviousPageCommand}"
+                                    Content="上一页"
+                                    Padding="10,4" />
+                            <Button Command="{Binding LiveProjection.NextPageCommand}"
+                                    Content="下一页"
+                                    Margin="8,0,0,0"
+                                    Padding="10,4" />
+                        </StackPanel>
+                    </DockPanel>
                 </Grid>
             </TabItem>
         </TabControl>

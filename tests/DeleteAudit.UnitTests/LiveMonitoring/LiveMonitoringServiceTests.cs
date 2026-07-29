@@ -3334,17 +3334,20 @@ public sealed class LiveMonitoringServiceTests
     // ---------- disclosure ----------
 
     [Fact]
-    public void BannerNoLongerClaimsThereIsNoLiveMonitoring()
+    public void BannerDescribesTheCompletedPhase2BLiveSurface()
     {
         var banner = MainWindowViewModel.CapabilityBanner;
 
         Assert.DoesNotContain("当前尚未实时监控", banner, StringComparison.Ordinal);
-        Assert.Contains("实时事件接入预览", banner, StringComparison.Ordinal);
+        Assert.Contains("用户手动开启的实时事件接入", banner, StringComparison.Ordinal);
         Assert.DoesNotContain("实时事件详情暂不持久保存", banner, StringComparison.Ordinal);
         Assert.Contains("原始 XML", banner, StringComparison.Ordinal);
-        Assert.Contains("解析与分类结果", banner, StringComparison.Ordinal);
-        Assert.Contains("持久保存到本机查看器数据库", banner, StringComparison.Ordinal);
-        Assert.Contains("尚无实时历史查看界面", banner, StringComparison.Ordinal);
+        Assert.Contains("解析/分类结果", banner, StringComparison.Ordinal);
+        Assert.Contains("本机查看器", banner, StringComparison.Ordinal);
+        Assert.Contains("实时历史", banner, StringComparison.Ordinal);
+        Assert.Contains("派生分析", banner, StringComparison.Ordinal);
+        Assert.Contains("live-owned", banner, StringComparison.Ordinal);
+        Assert.DoesNotContain("尚无实时历史", banner, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -3358,13 +3361,16 @@ public sealed class LiveMonitoringServiceTests
         Assert.Contains("分类结果", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("会写入本机查看器数据库", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("会保留", viewModel.Disclosure, StringComparison.Ordinal);
-        // What it still does not do.
-        Assert.Contains("尚未接入", viewModel.Disclosure, StringComparison.Ordinal);
-        Assert.Contains("风险评估", viewModel.Disclosure, StringComparison.Ordinal);
+        // What the later Phase 2B pages now do, without blurring their boundaries.
+        Assert.Contains("实时历史", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("风险分析", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("live-owned", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("用户主动", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("不会自动写入或伪装成离线", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("离线身份", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("缺口", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("异常中断", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("不上传", viewModel.Disclosure, StringComparison.Ordinal);
-        Assert.Contains("尚未投影", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("达到 64 条时立即", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("第一条进入空批次起通常约 5 秒", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("后续记录不会重新开始期限", viewModel.Disclosure, StringComparison.Ordinal);
@@ -3374,7 +3380,7 @@ public sealed class LiveMonitoringServiceTests
         Assert.Contains("只尝试保存一次且不自动重试", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("显示 Error", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("已经成功提交的记录仍会保留", viewModel.Disclosure, StringComparison.Ordinal);
-        Assert.Contains("SQLite 不是防篡改介质", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("不是防篡改介质", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("不是完整或生产级取证系统", viewModel.Disclosure, StringComparison.Ordinal);
         // The retired Phase 2A claim must not come back: live detail is no longer lost
         // on stop, so the page may not keep saying that it is.
@@ -3407,21 +3413,27 @@ public sealed class LiveMonitoringServiceTests
         // written locally, not that only a summary survives.
         Assert.Contains("会写入本机的 SQLite 数据库", readme, StringComparison.Ordinal);
         Assert.Contains("会话摘要", readme, StringComparison.Ordinal);
-        Assert.Contains("尚未接入", readme, StringComparison.Ordinal);
+        Assert.Contains("实时历史与派生分析", readme, StringComparison.Ordinal);
+        Assert.Contains("独立实时规范投影", readme, StringComparison.Ordinal);
+        Assert.Contains("不会把实时数据伪装成离线导入", readme, StringComparison.Ordinal);
+        Assert.DoesNotContain("目前没有实时历史", readme, StringComparison.Ordinal);
         Assert.Contains("Phase 2B", readme, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ProjectPlanRecordsPhase2AScopeAndPhase2BDeferrals()
+    public void ProjectPlanRecordsCompletedPhase2BScopeAndSeparation()
     {
         var plan = File.ReadAllText(
             Path.Combine(RepositoryRoot(), "docs", "PROJECT_PLAN.md"));
 
         Assert.Contains("Phase 2A 实现状态", plan, StringComparison.Ordinal);
-        Assert.Contains("只复用 `WindowsEventXmlParser`", plan, StringComparison.Ordinal);
-        Assert.Contains("尚未接入实时管线", plan, StringComparison.Ordinal);
-        Assert.Contains("不会伪造", plan, StringComparison.Ordinal);
-        Assert.Contains("不构成完整的实时删除审计", plan, StringComparison.Ordinal);
+        Assert.Contains("Phase 2B 实现状态", plan, StringComparison.Ordinal);
+        Assert.Contains("WindowsEventXmlParser", plan, StringComparison.Ordinal);
+        Assert.Contains("DeleteEventCorrelator", plan, StringComparison.Ordinal);
+        Assert.Contains("live-owned", plan, StringComparison.Ordinal);
+        Assert.Contains("0005", plan, StringComparison.Ordinal);
+        Assert.Contains("不写、不冒充、也不连接", plan, StringComparison.Ordinal);
+        Assert.Contains("不是防篡改保证", plan, StringComparison.Ordinal);
     }
 
     // ---------- view model ----------

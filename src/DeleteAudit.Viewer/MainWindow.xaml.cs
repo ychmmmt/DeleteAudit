@@ -3,6 +3,7 @@ using DeleteAudit.Application.LiveMonitoring;
 using DeleteAudit.Infrastructure.Analysis;
 using DeleteAudit.Application.Presentation;
 using DeleteAudit.Infrastructure.LiveMonitoring;
+using DeleteAudit.Infrastructure.Projection;
 using DeleteAudit.Infrastructure.Viewing;
 using DeleteAudit.Infrastructure.ViewingImport;
 
@@ -21,6 +22,7 @@ public partial class MainWindow : Window
             new WindowsLiveEventChannelProbe(),
             new WindowsEventLogWatcherSource(),
             new SqliteLiveMonitoringRepository(location));
+        var liveProjection = new SqliteLiveProjectionService(location);
         _viewModel = new MainWindowViewModel(
             new SqliteViewerQueryService(location),
             new OfflineViewerImportService(location),
@@ -29,6 +31,7 @@ public partial class MainWindow : Window
             liveMonitoring,
             new SqliteLiveHistoryQueryService(location),
             new SqliteLiveAnalysisService(location),
+            liveProjection,
             new WpfUiDispatcher(),
             new WpfNetworkPathImportConfirmation(this));
         DataContext = _viewModel;
@@ -39,10 +42,13 @@ public partial class MainWindow : Window
         // outlives the window, and nothing continues in the background.
         var liveMonitoringPage = _viewModel.LiveMonitoring;
         var liveHistoryPage = _viewModel.LiveHistory;
+        var liveProjectionPage = _viewModel.LiveProjection;
         Closed += async (_, _) =>
         {
             liveMonitoringPage.Dispose();
             liveHistoryPage.Dispose();
+            liveProjectionPage.Dispose();
+            liveProjection.Dispose();
             await liveMonitoring.DisposeAsync().ConfigureAwait(true);
         };
     }

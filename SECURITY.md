@@ -17,11 +17,17 @@ delete audit trail, and it cannot prevent, block, or recover deletions.
   subscribes read-only, in-process, to Windows event log channels that already
   exist on the machine (`Microsoft-Windows-Sysmon/Operational` and `Security`),
   filtered server-side to Sysmon 1/23/26 and Security 4663.
-- Live capture (Phase 2B.2.1) stores, in the local viewer database, the raw XML,
+- Live capture (Phase 2B) stores, in the local viewer database, the raw XML,
   parsing and classification results, and related live evidence for each supported
-  event received after you start it, plus a session summary. Correlation results,
-  delete sessions and risk results are still **not** produced or stored for live
-  capture, and there is no Live History UI.
+  event received after you start it, plus a session summary.
+- A read-only Live History page exposes bounded, paged queries and database-side
+  raw-XML previews. An explicit derived-analysis action reparses one selected session
+  and applies the same correlation, delete-session and risk rules as the offline
+  pipeline; those derived results are not written back.
+- An explicit canonical-projection action writes only to the live-owned tables from
+  migration `0005`. Each row retains its `live_evidence_id` and uses a separate live
+  epoch, live ingest sequence and continuity hash. It never writes to or impersonates
+  the offline tables, import identity, sequence or hash chain.
 
 ## What it deliberately does not do
 
@@ -72,7 +78,10 @@ explanation is in the README:
   are kept.
 - The database is **not a tamper-proof medium**. A local administrator, or any
   process with write access to the file, can modify, replace or delete it. There is
-  no signature, no external anchoring and no tamper-evident chain for live capture.
+  no signature or external anchoring. The live-owned projection continuity hash can
+  reveal an ordering break or accidental modification when recomputed from the source,
+  but a writer can rebuild the entire chain consistently. It is therefore not a
+  tamper-proof or independently trusted chain.
 - The append-only SQLite triggers constrain **this application's own write path**. They
   are not a defence against another program that can write to the file: such a writer
   chooses its own connection settings, and SQLite fires delete triggers for `REPLACE`
@@ -104,8 +113,9 @@ volunteer Alpha project there is no guaranteed response window.
 ## Scope notes
 
 Findings that describe the documented Alpha limitations above (for example
-"there is no Live History UI" or "there is no tamper-evident chain for live
-capture") are known design boundaries, not vulnerabilities. Findings that
-show the application exceeding its documented boundaries — for example reading
-an event log channel without user action, escaping its controlled data
-directory, or writing outside the repository — are in scope and welcome.
+"the continuity hash has no signature or external anchor" or "an abrupt process
+termination can lose an uncommitted partial batch") are known design boundaries,
+not vulnerabilities. Findings that show the application exceeding its documented
+boundaries — for example reading an event log channel without user action, mixing
+live projection into offline identities, escaping its controlled data directory,
+or writing outside the repository — are in scope and welcome.

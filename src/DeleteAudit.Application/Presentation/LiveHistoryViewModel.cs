@@ -35,6 +35,7 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
 
     private readonly ILiveHistoryQueryService _queryService;
     private readonly ILiveAnalysisService _analysisService;
+    private readonly Action<string?>? _selectedSessionChanged;
     private readonly ObservableCollection<LiveCaptureSessionRow> _sessions = [];
     private readonly ObservableCollection<LiveCaptureRecordRow> _records = [];
     private readonly ObservableCollection<LiveCaptureDiagnosticRow> _diagnostics = [];
@@ -70,11 +71,13 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
 
     public LiveHistoryViewModel(
         ILiveHistoryQueryService queryService,
-        ILiveAnalysisService analysisService)
+        ILiveAnalysisService analysisService,
+        Action<string?>? selectedSessionChanged = null)
     {
         _queryService = queryService ?? throw new ArgumentNullException(nameof(queryService));
         _analysisService = analysisService
             ?? throw new ArgumentNullException(nameof(analysisService));
+        _selectedSessionChanged = selectedSessionChanged;
 
         // None of these gate on a load being in flight: a newer request replaces an
         // older one rather than being refused, so the user is never locked out of
@@ -229,6 +232,7 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         {
             if (SetProperty(ref _selectedSession, value))
             {
+                _selectedSessionChanged?.Invoke(value?.LiveSessionId);
                 OnPropertyChanged(nameof(SelectedSessionSummary));
                 OnPropertyChanged(nameof(SelectedSessionIsIncomplete));
                 // An analysis belongs to the session it was derived from. Switching

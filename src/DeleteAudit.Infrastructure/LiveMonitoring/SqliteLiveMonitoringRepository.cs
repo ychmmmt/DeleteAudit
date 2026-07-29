@@ -168,12 +168,12 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
 
     private static readonly TriggerRequirement[] EvidenceTriggers =
     [
-        new("live_capture_sessions_no_update", "live_capture_sessions", "UPDATE"),
-        new("live_capture_sessions_no_delete", "live_capture_sessions", "DELETE"),
-        new("live_capture_records_no_update", "live_capture_records", "UPDATE"),
-        new("live_capture_records_no_delete", "live_capture_records", "DELETE"),
-        new("live_capture_completions_no_update", "live_capture_completions", "UPDATE"),
-        new("live_capture_completions_no_delete", "live_capture_completions", "DELETE")
+        new("live_capture_sessions_no_update", "live_capture_sessions", "UPDATE", EvidenceMigration),
+        new("live_capture_sessions_no_delete", "live_capture_sessions", "DELETE", EvidenceMigration),
+        new("live_capture_records_no_update", "live_capture_records", "UPDATE", EvidenceMigration),
+        new("live_capture_records_no_delete", "live_capture_records", "DELETE", EvidenceMigration),
+        new("live_capture_completions_no_update", "live_capture_completions", "UPDATE", EvidenceMigration),
+        new("live_capture_completions_no_delete", "live_capture_completions", "DELETE", EvidenceMigration)
     ];
 
     private readonly ViewerDataLocation _location;
@@ -209,7 +209,7 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         }
     }
 
-    private static async Task ValidateTableAsync(
+    internal static async Task ValidateTableAsync(
         SqliteConnection connection,
         TableRequirement requirement,
         CancellationToken cancellationToken)
@@ -401,20 +401,61 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 + $"but found {foreignKeys.Count}");
         }
 
-        foreach (var unique in requirement.UniqueConstraints)
+        var uniqueConstraints = await ReadUniqueConstraintsAsync(
+                connection,
+                requirement.Name,
+                cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var actual in uniqueConstraints)
         {
-            if (!await HasUniqueIndexAsync(
-                    connection,
-                    requirement.Name,
-                    unique.Columns,
-                    cancellationToken)
-                .ConfigureAwait(false))
+            if (!actual.IsCanonical)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"UNIQUE index '{actual.Name}' is "
+                    + $"{(actual.IsPartial ? "partial" : "not table-declared")} or "
+                    + "contains an expression; expected a non-partial table UNIQUE "
+                    + "constraint over stored columns");
+            }
+        }
+
+        foreach (var expected in requirement.UniqueConstraints)
+        {
+            if (!uniqueConstraints.Any(actual =>
+                    actual.Columns.SequenceEqual(
+                        expected.Columns,
+                        StringComparer.OrdinalIgnoreCase)))
             {
                 throw SchemaNotReady(
                     requirement,
                     "required UNIQUE index on "
-                    + $"({string.Join(", ", unique.Columns)}) is missing");
+                    + $"({string.Join(", ", expected.Columns)}) is missing");
             }
+        }
+
+        var unexpectedUnique = uniqueConstraints
+            .Where(actual => !requirement.UniqueConstraints.Any(expected =>
+                actual.Columns.SequenceEqual(
+                    expected.Columns,
+                    StringComparer.OrdinalIgnoreCase)))
+            .Select(actual =>
+                $"'{actual.Name}' ({string.Join(", ", actual.Columns)})")
+            .OrderBy(text => text, StringComparer.Ordinal)
+            .ToArray();
+        if (unexpectedUnique.Length != 0)
+        {
+            throw SchemaNotReady(
+                requirement,
+                "unexpected UNIQUE constraint(s) are declared: "
+                + string.Join(", ", unexpectedUnique));
+        }
+
+        if (uniqueConstraints.Count != requirement.UniqueConstraints.Count)
+        {
+            throw SchemaNotReady(
+                requirement,
+                $"expected exactly {requirement.UniqueConstraints.Count} UNIQUE "
+                + $"constraint(s) but found {uniqueConstraints.Count}");
         }
     }
 
@@ -489,21 +530,19 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         return foreignKeys;
     }
 
-    private static async Task<bool> HasUniqueIndexAsync(
+    private static async Task<IReadOnlyList<UniqueMetadata>> ReadUniqueConstraintsAsync(
         SqliteConnection connection,
         string tableName,
-        IReadOnlyList<string> expectedColumns,
         CancellationToken cancellationToken)
     {
-        var candidates = new List<string>();
+        var candidates = new List<(string Name, string Origin, bool IsPartial)>();
         using (var command = connection.CreateCommand())
         {
             command.CommandText = """
-                SELECT name
+                SELECT name, origin, partial
                 FROM pragma_index_list($table, $schema)
                 WHERE "unique" = 1
-                  AND partial = 0
-                  AND origin = 'u';
+                  AND origin <> 'pk';
                 """;
             command.Parameters.Add("$table", SqliteType.Text).Value = tableName;
             command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
@@ -512,10 +551,14 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 .ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                candidates.Add(reader.GetString(0));
+                candidates.Add((
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetInt64(2) != 0));
             }
         }
 
+        var results = new List<UniqueMetadata>(candidates.Count);
         foreach (var candidate in candidates)
         {
             using var command = connection.CreateCommand();
@@ -524,9 +567,10 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 FROM pragma_index_info($index, $schema)
                 ORDER BY seqno;
                 """;
-            command.Parameters.Add("$index", SqliteType.Text).Value = candidate;
+            command.Parameters.Add("$index", SqliteType.Text).Value = candidate.Name;
             command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
             var actualColumns = new List<string>();
+            var hasExpression = false;
             await using var reader = await command
                 .ExecuteReaderAsync(cancellationToken)
                 .ConfigureAwait(false);
@@ -536,20 +580,24 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 {
                     actualColumns.Add(reader.GetString(0));
                 }
+                else
+                {
+                    hasExpression = true;
+                }
             }
 
-            if (actualColumns.SequenceEqual(
-                    expectedColumns,
-                    StringComparer.OrdinalIgnoreCase))
-            {
-                return true;
-            }
+            results.Add(new UniqueMetadata(
+                candidate.Name,
+                actualColumns,
+                candidate.Origin,
+                candidate.IsPartial,
+                hasExpression));
         }
 
-        return false;
+        return results;
     }
 
-    private static async Task ValidateTriggerAsync(
+    internal static async Task ValidateTriggerAsync(
         SqliteConnection connection,
         TriggerRequirement requirement,
         CancellationToken cancellationToken)
@@ -993,7 +1041,7 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         new(
             $"Runtime structural readiness check failed for trigger "
             + $"'{requirement.Name}' on table '{requirement.TableName}': {detail}. "
-            + $"Apply {EvidenceMigration} explicitly. This runtime structural "
+            + $"Apply {requirement.Migration} explicitly. This runtime structural "
             + "readiness check does not prove database integrity, tamper resistance, "
             + "or migration authenticity.");
 
@@ -1004,7 +1052,7 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         int primaryKeyOrdinal = 0) =>
         new(name, declaredType, isNotNull, primaryKeyOrdinal);
 
-    private sealed record TableRequirement(
+    internal sealed record TableRequirement(
         string Name,
         string Migration,
         bool IsWithoutRowId,
@@ -1012,7 +1060,7 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         IReadOnlyList<ForeignKeyRequirement> ForeignKeys,
         IReadOnlyList<UniqueRequirement> UniqueConstraints);
 
-    private sealed record ColumnRequirement(
+    internal sealed record ColumnRequirement(
         string Name,
         string DeclaredType,
         bool IsNotNull,
@@ -1029,7 +1077,7 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         int PrimaryKeyOrdinal,
         long Hidden);
 
-    private sealed record ForeignKeyRequirement(
+    internal sealed record ForeignKeyRequirement(
         string FromColumn,
         string ToTable,
         string ToColumn);
@@ -1051,12 +1099,26 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
             && string.Equals(Match, "NONE", StringComparison.OrdinalIgnoreCase);
     }
 
-    private sealed record UniqueRequirement(IReadOnlyList<string> Columns);
+    internal sealed record UniqueRequirement(IReadOnlyList<string> Columns);
 
-    private sealed record TriggerRequirement(
+    private sealed record UniqueMetadata(
+        string Name,
+        IReadOnlyList<string> Columns,
+        string Origin,
+        bool IsPartial,
+        bool HasExpression)
+    {
+        public bool IsCanonical =>
+            string.Equals(Origin, "u", StringComparison.OrdinalIgnoreCase)
+            && !IsPartial
+            && !HasExpression;
+    }
+
+    internal sealed record TriggerRequirement(
         string Name,
         string TableName,
-        string EventName);
+        string EventName,
+        string Migration);
 
     public async Task StartCaptureSessionAsync(
         LiveCaptureSessionStart start,

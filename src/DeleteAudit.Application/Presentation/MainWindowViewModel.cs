@@ -1,6 +1,7 @@
 using DeleteAudit.Application.Analysis;
 using DeleteAudit.Application.Importing;
 using DeleteAudit.Application.LiveMonitoring;
+using DeleteAudit.Application.Projection;
 using DeleteAudit.Application.Viewing;
 
 namespace DeleteAudit.Application.Presentation;
@@ -12,8 +13,9 @@ public sealed class MainWindowViewModel : ViewModelBase
     /// actually does right now, including the locally persisted live evidence boundary.
     /// </summary>
     public const string CapabilityBanner =
-        "当前支持离线日志分析，以及用户手动开启的实时事件接入预览；接收到的受支持事件原始 XML、"
-        + "解析与分类结果及相关实时证据会持久保存到本机查看器数据库，但尚无实时历史查看界面。";
+        "当前支持离线日志分析、用户手动开启的实时事件接入、已保存的实时历史、派生分析和"
+        + "独立 live-owned 规范投影。实时原始 XML、解析/分类结果与相关证据保存在本机查看器"
+        + "数据库；实时接入仍须由用户手动开始，本应用不是完整或防篡改的取证系统。";
 
     private readonly IViewerQueryService _queryService;
     private readonly string _bannerMessage = CapabilityBanner;
@@ -29,6 +31,7 @@ public sealed class MainWindowViewModel : ViewModelBase
         ILiveMonitoringService liveMonitoringService,
         ILiveHistoryQueryService liveHistoryQueryService,
         ILiveAnalysisService liveAnalysisService,
+        ILiveProjectionService liveProjectionService,
         IUiDispatcher uiDispatcher,
         INetworkPathImportConfirmation? networkPathConfirmation = null)
     {
@@ -40,13 +43,16 @@ public sealed class MainWindowViewModel : ViewModelBase
         ArgumentNullException.ThrowIfNull(liveMonitoringService);
         ArgumentNullException.ThrowIfNull(liveHistoryQueryService);
         ArgumentNullException.ThrowIfNull(liveAnalysisService);
+        ArgumentNullException.ThrowIfNull(liveProjectionService);
         ArgumentNullException.ThrowIfNull(uiDispatcher);
 
         RawXml = new RawXmlViewModel(queryService, rawXmlPreviewClipboard);
         LiveMonitoring = new LiveMonitoringViewModel(liveMonitoringService, uiDispatcher);
+        LiveProjection = new LiveProjectionViewModel(liveProjectionService);
         LiveHistory = new LiveHistoryViewModel(
             liveHistoryQueryService,
-            liveAnalysisService);
+            liveAnalysisService,
+            sessionId => LiveProjection.SetSession(sessionId));
         ImportHistory = new ImportHistoryViewModel(queryService);
         DeleteSessions = new DeleteSessionsViewModel(queryService);
         DeleteEvents = new DeleteEventsViewModel(queryService, OpenRawXmlAsync);
@@ -99,6 +105,13 @@ public sealed class MainWindowViewModel : ViewModelBase
     /// evidence tables may legitimately be absent on an older database.
     /// </summary>
     public LiveHistoryViewModel LiveHistory { get; }
+
+    /// <summary>
+    /// Explicit live-owned projection over the capture selected in
+    /// <see cref="LiveHistory"/>. It is not loaded or run by
+    /// <see cref="InitializeAsync"/>.
+    /// </summary>
+    public LiveProjectionViewModel LiveProjection { get; }
 
     public Task InitializeAsync() =>
         RunSafelyAsync(async () =>
