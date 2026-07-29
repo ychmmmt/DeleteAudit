@@ -4,7 +4,7 @@
 
 > Open-source na tool para tingnan at ayusin ang mga log sa Windows. **Alpha / eksperimental.**
 
-Ang DeleteAudit ay isang open-source na tool para sa Windows na ginagamit sa pagtingin at pag-aayos ng mga log. Kaya nitong mag-import ng suportadong local log file, tulungan kang basahin ang resulta ng import, at — kapag ikaw mismo ang nagbukas nito — magpakita ng preview ng live na log ingestion sa sarili mong makina. Alpha pa ang proyekto: maganda itong pang-aral, pang-test, at pansubok ng workflow, at **hindi ito dapat ituring na kumpleto o production-grade na forensic system**.
+Ang DeleteAudit ay isang open-source na tool para sa Windows na ginagamit sa pagtingin at pag-aayos ng mga log. Kaya nitong mag-import ng suportadong local log file, tulungan kang basahin ang resulta ng import, at — kapag ikaw mismo ang nagbukas nito — tumanggap, mag-imbak at magpabasa ng live na log sa sarili mong makina. Alpha pa ang proyekto: maganda itong pang-aral, pang-test, at pansubok ng workflow, at **hindi ito dapat ituring na kumpleto o production-grade na forensic system**.
 
 ## Ano ito
 
@@ -16,7 +16,9 @@ Tool ito para **tumingin at mag-ayos**. Hindi ito panangga. Hindi nito mapipigil
 
 - **Offline import** — isang `.xml` o `.evtx` na log file sa bawat pagkakataon, ikaw ang pumipili.
 - **Tingnan at ayusin** — dumaan sa mga na-import na resulta ayon sa oras, path at status, at buksan ang mga delete event at ang raw na ebidensiya ng mga ito.
-- **Live ingestion (Phase 2B.1)** — pagkatapos mong pindutin ang start sa live na pahina, nagsu-subscribe ito nang read-only sa mga log channel na nandiyan na sa makina mo. **Mula sa sandaling simulan mo, isinusulat sa lokal na SQLite database ang raw XML at ang klasipikasyon ng bawat suportadong event na natanggap**, at **nananatili** ang mga detalyeng matagumpay na naitala kahit itigil o isara mo na ang app. May naiitala ring session summary.
+- **Live ingestion (Phase 2B)** — pagkatapos mong pindutin ang start sa live na pahina, nagsu-subscribe ito nang read-only sa mga log channel na nandiyan na sa makina mo. **Mula sa sandaling simulan mo, isinusulat sa lokal na SQLite database ang raw XML, resulta ng pag-parse at klasipikasyon, at kaugnay na live evidence ng bawat suportadong event na natanggap**, at **nananatili** ang mga detalyeng matagumpay na naitala kahit itigil o isara mo na ang app. May naiitala ring session summary.
+- **Live history at derived analysis** — naka-page ang pagtingin sa naitalang live session, record, diagnostic at limitadong raw-XML preview; kapag hiniling mo, muling pini-parse ang napiling session gamit ang kaparehong deterministic correlation, delete-session at risk rules ng offline path.
+- **Hiwalay na live canonical projection** — kapag hayagan mo itong pinatakbo, inilalagay ang eligible na live evidence sa live-owned na mga table ng migration `0005`, kasama ang `live_evidence_id`, hiwalay na epoch, siksik na live sequence at continuity hash. Hindi nito sinusulatan, ginagaya o ikinakabit ang offline event table, identity, sequence o hash chain.
 - **Talaan ng import** — bawat import ay may talaan at isang manifest file, para matiyak mo kung ano talaga ang pumasok.
 
 ## Para kanino ito
@@ -27,17 +29,19 @@ Tool ito para **tumingin at mag-ayos**. Hindi ito panangga. Hindi nito mapipigil
 
 ## Kasalukuyang kalagayan at limitasyon
 
-- Yugto: **Alpha / eksperimental**, inilabas sa **Phase 2A**.
+- Yugto: **Alpha / eksperimental**, kasalukuyang naipatupad hanggang **Phase 2B**.
 - Sistema: **Windows 10 / Windows 11**.
 - Runtime: **.NET 8**.
 - **Hindi ito kumpleto o production-grade na forensic system**, at hindi ito sinusukat sa pamantayan ng komersiyal na digital forensics na produkto.
 - Hindi nito mapipigilan ang aksidenteng pagbura, at hindi rin nito mahaharang ang determinadong umaatake o ang pakikialam sa ebidensiya.
-- **Wala pang screen para sa live na kasaysayan.** Hindi pa naipapakita ang bagong naitalang live na detalye sa pahinang "delete events" o "raw evidence"; sa ngayon, direkta lang sa database ito matitingnan.
-- Sa kasalukuyan, tumatanggap, nagklaklasipika at nag-iimbak lang ang live ingestion; ang correlation, session aggregation at pagtatasa ng panganib ay **hindi pa nakakabit** sa live na daloy, at nakalaan sa mas huling bahagi ng **Phase 2B**.
-- **Puwedeng may mga puwang.** Ang pag-apaw ng queue, sobrang laking event, bigong pagsulat, o biglaang pagkamatay ng proseso ay nag-iiwan ng puwang; kapag tahimik ang makina, hanggang 63 na naklasipikang record ang nasa memory hanggang mapuno ang batch o itigil mo. Ang session na walang completion record ay nangangahulugang hindi maayos na natapos ang capture na iyon.
-- **Walang signature, walang external anchoring, walang tamper-evident chain.** Hindi tamper-proof na medium ang database.
+- **May tunay nang viewer page para sa live history, derived correlation/session/risk analysis, at canonical projection.** Read-only ang derived analysis at hindi ito isinusulat pabalik. Sa live-owned na `0005` table lang sumusulat ang canonical projection. Hindi ipinapanggap ng alinman na offline import ang live data at hindi ito tahimik na idinadagdag sa offline na “delete events” o “raw evidence” page.
+- **Kailangang hayagang ilapat ng developer o operator ang migration `0005`.** Hindi gumagawa o nagmi-migrate ng schema ang runtime. Kapag wala ang `0005`, live canonical projection page lang ang unavailable; gumagana pa rin ang offline, live preview, history at derived-analysis page.
+- **May nakapirming deadline ang batch, pero hindi ito mahigpit na garantiya sa oras.** Agad na pumapasok sa persistence ang batch kapag umabot sa 64 record. Ang kulang na batch ay karaniwang nakaiskedyul para sa persistence mga limang segundo matapos pumasok ang unang record sa bakanteng batch; hindi inuulit ng mga kasunod na record ang deadline. Maaaring mas mahuli ang pagkumpleto dahil sa pag-iskedyul ng operating system at thread, SQLite I/O, o fault.
+- **Puwede pa ring may mga puwang.** Kapag biglang namatay ang proseso, maaari pa ring mawala ang hanggang 63 na hindi pa na-commit na record; nag-iiwan din ng puwang ang pag-apaw ng queue, sobrang laking event, o bigong pagsulat. Ang session na walang completion record ay nangangahulugang hindi maayos na natapos ang capture na iyon.
+- **Isang beses lang sinusubukang i-save ang completion record at walang awtomatikong retry.** Kapag nabigo iyon, `Error` ang ipinapakita ng session; nananatili ang mga record na matagumpay nang na-commit.
+- **Walang signature, walang external anchoring, at walang tamper-proof na garantiya.** Makatutulong ang live-owned continuity hash na makita ang naputol na pagkakasunod o aksidenteng pagbabago, pero kayang buuin muli ang buong chain ng sinumang may write access sa database. Hindi tamper-proof na medium ang SQLite.
 - **Source code lamang** ang inilalabas ng repository na ito. **Walang** handang gamitin at nakapirmang (signed) Windows installer.
-- Pinakahuling beripikasyon: **174 unit test, 55 integration test, 229 lahat, pasado lahat**, na may build na 0 warning at 0 error.
+- Pinakahuling beripikasyon: **286 unit test, 188 integration test, 474 lahat, dalawang magkasunod na run na pasado lahat**, na may build na 0 warning at 0 error.
 
 Nasa [`docs/`](docs/) ang mga talaan ng bawat yugto, ang pangkalahatang disenyo, at ang threat model.
 
@@ -81,7 +85,7 @@ Patakbuhin ang viewer:
 dotnet run --project src/DeleteAudit.Viewer
 ```
 
-Nananatili sa loob ng `artifacts\` na folder ng repository ang data at output; walang isinusulat sa labas ng checkout. Nasa [CONTRIBUTING.md](CONTRIBUTING.md) ang mga panuntunan sa build, sa test, at sa mga direktoryo.
+Naka-configure sa ignored na `artifacts\` folder ng repository ang application data at synthetic test output; nananatili naman sa `bin/obj` ng bawat project ang karaniwang .NET build products. Para mailagay din sa loob ng checkout ang CLI home, NuGet cache, at temporary directories, itakda muna ang environment na nasa [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Pag-uulat ng problema sa seguridad
 

@@ -20,20 +20,160 @@ namespace DeleteAudit.Infrastructure.LiveMonitoring;
 /// </remarks>
 public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
 {
+    private const string SummaryMigration =
+        "db/migrations/0003_phase_2a_live_monitoring.sql";
+
+    private const string EvidenceMigration =
+        "db/migrations/0004_phase_2b_live_evidence.sql";
+
     /// <summary>Phase 2A summary tables, from 0003.</summary>
-    private static readonly string[] SummaryTables =
+    private static readonly TableRequirement[] SummaryTables =
     [
-        "live_monitoring_sessions",
-        "live_monitoring_channels",
-        "live_monitoring_diagnostics"
+        new(
+            "live_monitoring_sessions",
+            SummaryMigration,
+            IsWithoutRowId: false,
+            [
+                C("live_session_id", "TEXT", true, 1),
+                C("started_utc", "TEXT", true),
+                C("stopped_utc", "TEXT", false),
+                C("final_state", "TEXT", true),
+                C("received_count", "INTEGER", true),
+                C("delete_fact_count", "INTEGER", true),
+                C("process_context_count", "INTEGER", true),
+                C("security_evidence_count", "INTEGER", true),
+                C("ignored_count", "INTEGER", true),
+                C("error_count", "INTEGER", true),
+                C("dropped_count", "INTEGER", true),
+                C("late_discarded_count", "INTEGER", true),
+                C("suppressed_diagnostic_count", "INTEGER", true),
+                C("queue_capacity", "INTEGER", true),
+                C("application_version", "TEXT", true)
+            ],
+            [],
+            []),
+        new(
+            "live_monitoring_channels",
+            SummaryMigration,
+            IsWithoutRowId: true,
+            [
+                C("live_session_id", "TEXT", true, 1),
+                C("channel_name", "TEXT", true, 2),
+                C("availability", "TEXT", true),
+                C("detail", "TEXT", false)
+            ],
+            [
+                new ForeignKeyRequirement(
+                    "live_session_id",
+                    "live_monitoring_sessions",
+                    "live_session_id")
+            ],
+            []),
+        new(
+            "live_monitoring_diagnostics",
+            SummaryMigration,
+            IsWithoutRowId: false,
+            [
+                C("live_diagnostic_id", "TEXT", true, 1),
+                C("live_session_id", "TEXT", true),
+                C("stage", "TEXT", true),
+                C("severity", "TEXT", true),
+                C("code", "TEXT", true),
+                C("message", "TEXT", true),
+                C("occurred_utc", "TEXT", true)
+            ],
+            [
+                new ForeignKeyRequirement(
+                    "live_session_id",
+                    "live_monitoring_sessions",
+                    "live_session_id")
+            ],
+            [])
     ];
 
     /// <summary>Phase 2B.1 live evidence tables, from 0004.</summary>
-    private static readonly string[] EvidenceTables =
+    private static readonly TableRequirement[] EvidenceTables =
     [
-        "live_capture_sessions",
-        "live_capture_records",
-        "live_capture_completions"
+        new(
+            "live_capture_sessions",
+            EvidenceMigration,
+            IsWithoutRowId: false,
+            [
+                C("live_session_id", "TEXT", true, 1),
+                C("started_utc", "TEXT", true),
+                C("queue_capacity", "INTEGER", true),
+                C("application_version", "TEXT", true)
+            ],
+            [],
+            []),
+        new(
+            "live_capture_records",
+            EvidenceMigration,
+            IsWithoutRowId: false,
+            [
+                C("live_evidence_id", "TEXT", true, 1),
+                C("live_session_id", "TEXT", true),
+                C("received_sequence", "INTEGER", true),
+                C("event_record_id", "INTEGER", false),
+                C("provider_name", "TEXT", false),
+                C("channel_name", "TEXT", true),
+                C("machine_name", "TEXT", false),
+                C("time_created_utc", "TEXT", false),
+                C("observed_utc", "TEXT", true),
+                C("raw_xml", "TEXT", true),
+                C("raw_xml_sha256", "BLOB", true),
+                C("parser_raw_event_id", "TEXT", false),
+                C("parsed_event_id", "INTEGER", false),
+                C("outcome", "TEXT", true),
+                C("error_code", "TEXT", false),
+                C("detail", "TEXT", false)
+            ],
+            [
+                new ForeignKeyRequirement(
+                    "live_session_id",
+                    "live_capture_sessions",
+                    "live_session_id")
+            ],
+            [
+                new UniqueRequirement(
+                    ["live_session_id", "received_sequence"])
+            ]),
+        new(
+            "live_capture_completions",
+            EvidenceMigration,
+            IsWithoutRowId: false,
+            [
+                C("live_session_id", "TEXT", true, 1),
+                C("stopped_utc", "TEXT", true),
+                C("final_state", "TEXT", true),
+                C("received_count", "INTEGER", true),
+                C("delete_fact_count", "INTEGER", true),
+                C("process_context_count", "INTEGER", true),
+                C("security_evidence_count", "INTEGER", true),
+                C("ignored_count", "INTEGER", true),
+                C("error_count", "INTEGER", true),
+                C("dropped_count", "INTEGER", true),
+                C("late_discarded_count", "INTEGER", true),
+                C("suppressed_diagnostic_count", "INTEGER", true),
+                C("persisted_record_count", "INTEGER", true)
+            ],
+            [
+                new ForeignKeyRequirement(
+                    "live_session_id",
+                    "live_capture_sessions",
+                    "live_session_id")
+            ],
+            [])
+    ];
+
+    private static readonly TriggerRequirement[] EvidenceTriggers =
+    [
+        new("live_capture_sessions_no_update", "live_capture_sessions", "UPDATE", EvidenceMigration),
+        new("live_capture_sessions_no_delete", "live_capture_sessions", "DELETE", EvidenceMigration),
+        new("live_capture_records_no_update", "live_capture_records", "UPDATE", EvidenceMigration),
+        new("live_capture_records_no_delete", "live_capture_records", "DELETE", EvidenceMigration),
+        new("live_capture_completions_no_update", "live_capture_completions", "UPDATE", EvidenceMigration),
+        new("live_capture_completions_no_delete", "live_capture_completions", "DELETE", EvidenceMigration)
     ];
 
     private readonly ViewerDataLocation _location;
@@ -45,50 +185,995 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
 
     public async Task ValidateSchemaAsync(CancellationToken cancellationToken = default)
     {
-        var databasePath = RequireDatabase();
+        _ = RequireDatabase();
 
         await using var connection = _location.CreateReadOnlyConnection();
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-        using var command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table';
-            """;
 
-        var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var table in SummaryTables)
+        {
+            await ValidateTableAsync(connection, table, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        foreach (var table in EvidenceTables)
+        {
+            await ValidateTableAsync(connection, table, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        foreach (var trigger in EvidenceTriggers)
+        {
+            await ValidateTriggerAsync(connection, trigger, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        await ValidateExactTriggerSetAsync(
+                connection,
+                EvidenceTriggers,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    internal static async Task ValidateTableAsync(
+        SqliteConnection connection,
+        TableRequirement requirement,
+        CancellationToken cancellationToken)
+    {
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT type
+                FROM main.sqlite_master
+                WHERE name = $name COLLATE NOCASE;
+                """;
+            command.Parameters.Add("$name", SqliteType.Text).Value = requirement.Name;
+            var type = await command
+                .ExecuteScalarAsync(cancellationToken)
+                .ConfigureAwait(false) as string;
+            if (!string.Equals(type, "table", StringComparison.OrdinalIgnoreCase))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    type is null
+                        ? "the required table is missing"
+                        : $"the object is type '{type}', not a table");
+            }
+        }
+
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT type, wr, strict
+                FROM pragma_table_list($table)
+                WHERE schema = 'main';
+                """;
+            command.Parameters.Add("$table", SqliteType.Text).Value = requirement.Name;
+            await using var reader = await command
+                .ExecuteReaderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    "table metadata is unavailable");
+            }
+
+            if (!string.Equals(
+                    reader.GetString(0),
+                    "table",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    "table metadata does not describe a normal table");
+            }
+
+            var withoutRowId = reader.GetInt64(1) != 0;
+            if (withoutRowId != requirement.IsWithoutRowId)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"WITHOUT ROWID flag is {(withoutRowId ? "enabled" : "disabled")}");
+            }
+
+            if (reader.GetInt64(2) != 1)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    "STRICT table enforcement is missing");
+            }
+        }
+
+        var columns = await ReadColumnsAsync(
+                connection,
+                requirement.Name,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        // The canonical schema declares only plain stored columns. A generated or hidden
+        // column is rejected by name rather than quietly excluded from the count.
+        var generated = columns
+            .Where(column => column.Value.Hidden != 0)
+            .Select(column => column.Key)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+        if (generated.Length != 0)
+        {
+            throw SchemaNotReady(
+                requirement,
+                "generated or hidden column(s) are declared: "
+                + string.Join(", ", generated));
+        }
+
+        foreach (var expected in requirement.Columns)
+        {
+            if (!columns.TryGetValue(expected.Name, out var actual))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"required column '{expected.Name}' is missing");
+            }
+
+            if (!string.Equals(
+                    actual.DeclaredType,
+                    expected.DeclaredType,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"column '{expected.Name}' has declared type/affinity "
+                    + $"'{actual.DeclaredType}', expected '{expected.DeclaredType}'");
+            }
+
+            if (actual.IsNotNull != expected.IsNotNull)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"column '{expected.Name}' NOT NULL flag is "
+                    + $"{(actual.IsNotNull ? "enabled" : "missing")}");
+            }
+
+            if (actual.PrimaryKeyOrdinal != expected.PrimaryKeyOrdinal)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"column '{expected.Name}' has primary-key ordinal "
+                    + $"{actual.PrimaryKeyOrdinal}, expected "
+                    + $"{expected.PrimaryKeyOrdinal}");
+            }
+        }
+
+        if (columns.Count != requirement.Columns.Count)
+        {
+            throw SchemaNotReady(
+                requirement,
+                $"expected exactly {requirement.Columns.Count} columns but found "
+                + $"{columns.Count}");
+        }
+
+        var foreignKeys = await ReadForeignKeysAsync(
+                connection,
+                requirement.Name,
+                cancellationToken)
+            .ConfigureAwait(false);
+        // Referential actions are part of the shape: a canonical key is plain
+        // NO ACTION / NO ACTION / MATCH NONE, and a non-canonical one is named rather
+        // than dropped, which would have let it hide behind the exact-count comparison.
+        foreach (var actual in foreignKeys)
+        {
+            if (!actual.IsCanonicalAction)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"foreign key '{actual.Key.FromColumn}' to "
+                    + $"'{actual.Key.ToTable}.{actual.Key.ToColumn}' declares "
+                    + $"ON UPDATE {actual.OnUpdate}, ON DELETE {actual.OnDelete}, "
+                    + $"MATCH {actual.Match}; expected NO ACTION, NO ACTION, NONE");
+            }
+        }
+
+        foreach (var expected in requirement.ForeignKeys)
+        {
+            if (!foreignKeys.Any(actual => actual.Key == expected))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"required foreign key '{expected.FromColumn}' to "
+                    + $"'{expected.ToTable}.{expected.ToColumn}' is missing or malformed");
+            }
+        }
+
+        var unexpected = foreignKeys
+            .Where(actual => !requirement.ForeignKeys.Contains(actual.Key))
+            .Select(actual =>
+                $"'{actual.Key.FromColumn}' to "
+                + $"'{actual.Key.ToTable}.{actual.Key.ToColumn}'")
+            .OrderBy(text => text, StringComparer.Ordinal)
+            .ToArray();
+        if (unexpected.Length != 0)
+        {
+            throw SchemaNotReady(
+                requirement,
+                "unexpected foreign key(s) are declared: "
+                + string.Join(", ", unexpected));
+        }
+
+        if (foreignKeys.Count != requirement.ForeignKeys.Count)
+        {
+            throw SchemaNotReady(
+                requirement,
+                $"expected exactly {requirement.ForeignKeys.Count} foreign key(s) "
+                + $"but found {foreignKeys.Count}");
+        }
+
+        var uniqueConstraints = await ReadUniqueConstraintsAsync(
+                connection,
+                requirement.Name,
+                cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var actual in uniqueConstraints)
+        {
+            if (!actual.IsCanonical)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"UNIQUE index '{actual.Name}' is "
+                    + $"{(actual.IsPartial ? "partial" : "not table-declared")} or "
+                    + "contains an expression; expected a non-partial table UNIQUE "
+                    + "constraint over stored columns");
+            }
+        }
+
+        foreach (var expected in requirement.UniqueConstraints)
+        {
+            if (!uniqueConstraints.Any(actual =>
+                    actual.Columns.SequenceEqual(
+                        expected.Columns,
+                        StringComparer.OrdinalIgnoreCase)))
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    "required UNIQUE index on "
+                    + $"({string.Join(", ", expected.Columns)}) is missing");
+            }
+        }
+
+        var unexpectedUnique = uniqueConstraints
+            .Where(actual => !requirement.UniqueConstraints.Any(expected =>
+                actual.Columns.SequenceEqual(
+                    expected.Columns,
+                    StringComparer.OrdinalIgnoreCase)))
+            .Select(actual =>
+                $"'{actual.Name}' ({string.Join(", ", actual.Columns)})")
+            .OrderBy(text => text, StringComparer.Ordinal)
+            .ToArray();
+        if (unexpectedUnique.Length != 0)
+        {
+            throw SchemaNotReady(
+                requirement,
+                "unexpected UNIQUE constraint(s) are declared: "
+                + string.Join(", ", unexpectedUnique));
+        }
+
+        if (uniqueConstraints.Count != requirement.UniqueConstraints.Count)
+        {
+            throw SchemaNotReady(
+                requirement,
+                $"expected exactly {requirement.UniqueConstraints.Count} UNIQUE "
+                + $"constraint(s) but found {uniqueConstraints.Count}");
+        }
+    }
+
+    private static async Task<Dictionary<string, ColumnMetadata>> ReadColumnsAsync(
+        SqliteConnection connection,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        // table_xinfo, not table_info: only the extended pragma reports generated and
+        // hidden columns. Reading the narrow pragma let a table carry an extra generated
+        // column and still satisfy an exact column-set comparison.
+        command.CommandText = """
+            SELECT name, type, "notnull", pk, hidden
+            FROM pragma_table_xinfo($table, $schema)
+            ORDER BY cid;
+            """;
+        command.Parameters.Add("$table", SqliteType.Text).Value = tableName;
+        command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
+        var columns = new Dictionary<string, ColumnMetadata>(
+            StringComparer.OrdinalIgnoreCase);
         await using var reader = await command
             .ExecuteReaderAsync(cancellationToken)
             .ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            present.Add(reader.GetString(0));
+            var name = reader.GetString(0);
+            columns.Add(
+                name,
+                new ColumnMetadata(
+                    reader.GetString(1).Trim(),
+                    reader.GetInt64(2) != 0,
+                    reader.GetInt32(3),
+                    reader.GetInt64(4)));
         }
 
-        // Reported separately so the message names the migration that is actually
-        // missing instead of a generic "schema is wrong".
-        var missingSummary = SummaryTables
-            .Where(table => !present.Contains(table))
-            .ToArray();
-        if (missingSummary.Length != 0)
-        {
-            throw new InvalidOperationException(
-                "The live monitoring schema increment is missing required tables: "
-                + $"{string.Join(", ", missingSummary)}. Apply db/migrations/0003_phase_2a_live_monitoring.sql explicitly.");
-        }
-
-        var missingEvidence = EvidenceTables
-            .Where(table => !present.Contains(table))
-            .ToArray();
-        if (missingEvidence.Length != 0)
-        {
-            throw new InvalidOperationException(
-                "The live evidence schema increment is missing required tables: "
-                + $"{string.Join(", ", missingEvidence)}. Apply db/migrations/0004_phase_2b_live_evidence.sql explicitly.");
-        }
-
-        _ = databasePath;
+        return columns;
     }
+
+    private static async Task<IReadOnlyList<ForeignKeyMetadata>> ReadForeignKeysAsync(
+        SqliteConnection connection,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT "table", "from", "to", on_update, on_delete, match
+            FROM pragma_foreign_key_list($table, $schema)
+            ORDER BY id, seq;
+            """;
+        command.Parameters.Add("$table", SqliteType.Text).Value = tableName;
+        command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
+        var foreignKeys = new List<ForeignKeyMetadata>();
+        await using var reader = await command
+            .ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            // Every declared foreign key is returned, including ones whose referential
+            // actions are not canonical. Dropping those here would have let an extra
+            // ON DELETE CASCADE key hide behind an exact-count comparison.
+            foreignKeys.Add(new ForeignKeyMetadata(
+                new ForeignKeyRequirement(
+                    reader.GetString(1),
+                    reader.GetString(0),
+                    reader.GetString(2)),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetString(5)));
+        }
+
+        return foreignKeys;
+    }
+
+    private static async Task<IReadOnlyList<UniqueMetadata>> ReadUniqueConstraintsAsync(
+        SqliteConnection connection,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
+        var candidates = new List<(string Name, string Origin, bool IsPartial)>();
+        using (var command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT name, origin, partial
+                FROM pragma_index_list($table, $schema)
+                WHERE "unique" = 1
+                  AND origin <> 'pk';
+                """;
+            command.Parameters.Add("$table", SqliteType.Text).Value = tableName;
+            command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
+            await using var reader = await command
+                .ExecuteReaderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                candidates.Add((
+                    reader.GetString(0),
+                    reader.GetString(1),
+                    reader.GetInt64(2) != 0));
+            }
+        }
+
+        var results = new List<UniqueMetadata>(candidates.Count);
+        foreach (var candidate in candidates)
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT name
+                FROM pragma_index_info($index, $schema)
+                ORDER BY seqno;
+                """;
+            command.Parameters.Add("$index", SqliteType.Text).Value = candidate.Name;
+            command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
+            var actualColumns = new List<string>();
+            var hasExpression = false;
+            await using var reader = await command
+                .ExecuteReaderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                if (!reader.IsDBNull(0))
+                {
+                    actualColumns.Add(reader.GetString(0));
+                }
+                else
+                {
+                    hasExpression = true;
+                }
+            }
+
+            results.Add(new UniqueMetadata(
+                candidate.Name,
+                actualColumns,
+                candidate.Origin,
+                candidate.IsPartial,
+                hasExpression));
+        }
+
+        return results;
+    }
+
+    internal static async Task ValidateTriggerAsync(
+        SqliteConnection connection,
+        TriggerRequirement requirement,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT type, tbl_name, COALESCE(sql, '')
+            FROM main.sqlite_master
+            WHERE name = $name COLLATE NOCASE;
+            """;
+        command.Parameters.Add("$name", SqliteType.Text).Value = requirement.Name;
+        await using var reader = await command
+            .ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            throw TriggerNotReady(requirement, "the required trigger is missing");
+        }
+
+        if (!string.Equals(
+                reader.GetString(0),
+                "trigger",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw TriggerNotReady(requirement, "the object is not a trigger");
+        }
+
+        if (!string.Equals(
+                reader.GetString(1),
+                requirement.TableName,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw TriggerNotReady(
+                requirement,
+                $"it is bound to '{reader.GetString(1)}', not "
+                + $"'{requirement.TableName}'");
+        }
+
+        // Whitelist, not blacklist: the stored definition is tokenised into typed tokens
+        // and matched against the one canonical shape. A RAISE that some clause can make
+        // unreachable — WHERE, LIMIT, FROM, CASE — is not that shape, so it is rejected
+        // without having to enumerate the ways of writing one.
+        var tokens = TokenizeSql(reader.GetString(2));
+        if (tokens is null)
+        {
+            throw TriggerNotReady(
+                requirement,
+                "its definition could not be tokenised; an unterminated string, quoted "
+                + "identifier or block comment is present");
+        }
+
+        if (!TryMatchCanonicalTrigger(tokens, requirement, out var mismatch))
+        {
+            throw TriggerNotReady(requirement, mismatch);
+        }
+    }
+
+    internal static async Task ValidateExactTriggerSetAsync(
+        SqliteConnection connection,
+        IReadOnlyList<TriggerRequirement> requirements,
+        CancellationToken cancellationToken)
+    {
+        foreach (var group in requirements.GroupBy(
+                     requirement => requirement.TableName,
+                     StringComparer.OrdinalIgnoreCase))
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT name
+                FROM main.sqlite_master
+                WHERE type = 'trigger'
+                  AND tbl_name = $table COLLATE NOCASE;
+                """;
+            command.Parameters.Add("$table", SqliteType.Text).Value = group.Key;
+            var actual = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            await using var reader = await command
+                .ExecuteReaderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                actual.Add(reader.GetString(0));
+            }
+
+            var expected = group
+                .Select(requirement => requirement.Name)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (!actual.SetEquals(expected))
+            {
+                var unexpected = actual.Except(expected, StringComparer.OrdinalIgnoreCase);
+                var missing = expected.Except(actual, StringComparer.OrdinalIgnoreCase);
+                var detail = string.Join(
+                    "; ",
+                    new[]
+                    {
+                        unexpected.Any()
+                            ? $"unexpected trigger(s): {string.Join(", ", unexpected)}"
+                            : null,
+                        missing.Any()
+                            ? $"missing trigger(s): {string.Join(", ", missing)}"
+                            : null
+                    }.Where(value => value is not null));
+                throw TriggerNotReady(group.First(), detail);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Matches the tokenised trigger against the single accepted definition:
+    /// <code>
+    /// CREATE TRIGGER [IF NOT EXISTS] name BEFORE (UPDATE|DELETE) ON table
+    /// [FOR EACH ROW] BEGIN SELECT RAISE(ABORT, 'literal'); END [;]
+    /// </code>
+    /// Every token must be consumed, so nothing can be appended to the body. The two
+    /// optional clauses are the only ones accepted: both are semantically inert in SQLite
+    /// (<c>FOR EACH ROW</c> is the sole supported granularity) and neither can make the
+    /// RAISE conditional or unreachable.
+    /// </summary>
+    private static bool TryMatchCanonicalTrigger(
+        IReadOnlyList<SqlToken> tokens,
+        TriggerRequirement requirement,
+        out string mismatch)
+    {
+        var position = 0;
+        if (!TakeWord(tokens, ref position, "CREATE")
+            || !TakeWord(tokens, ref position, "TRIGGER"))
+        {
+            mismatch = "its definition does not start with CREATE TRIGGER";
+            return false;
+        }
+
+        if (PeekWord(tokens, position, "IF")
+            && (!TakeWord(tokens, ref position, "IF")
+                || !TakeWord(tokens, ref position, "NOT")
+                || !TakeWord(tokens, ref position, "EXISTS")))
+        {
+            mismatch = "the clause after CREATE TRIGGER is not IF NOT EXISTS";
+            return false;
+        }
+
+        if (!TakeName(tokens, ref position, requirement.Name))
+        {
+            mismatch =
+                $"the declared trigger name is not '{requirement.Name}'; a "
+                + "schema-qualified name is not part of the canonical definition";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, "BEFORE"))
+        {
+            mismatch = "the trigger timing is not BEFORE";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, requirement.EventName))
+        {
+            mismatch = $"the trigger event is not {requirement.EventName}";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, "ON"))
+        {
+            mismatch =
+                $"the {requirement.EventName} event is not followed by ON; a column "
+                + "list such as UPDATE OF <columns> leaves other columns unguarded";
+            return false;
+        }
+
+        if (!TakeName(tokens, ref position, requirement.TableName))
+        {
+            mismatch = $"the declared table is not '{requirement.TableName}'";
+            return false;
+        }
+
+        if (PeekWord(tokens, position, "FOR")
+            && (!TakeWord(tokens, ref position, "FOR")
+                || !TakeWord(tokens, ref position, "EACH")
+                || !TakeWord(tokens, ref position, "ROW")))
+        {
+            mismatch = "the clause before BEGIN is not FOR EACH ROW";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, "BEGIN"))
+        {
+            mismatch =
+                "the header is not followed by BEGIN; a WHEN clause makes the guard "
+                + "conditional and is not accepted";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, "SELECT")
+            || !TakeWord(tokens, ref position, "RAISE")
+            || !TakePunctuator(tokens, ref position, "(")
+            || !TakeWord(tokens, ref position, "ABORT")
+            || !TakePunctuator(tokens, ref position, ","))
+        {
+            mismatch =
+                "the body does not begin with SELECT RAISE(ABORT, ...); only an "
+                + "unconditional ABORT is accepted";
+            return false;
+        }
+
+        if (!TakeKind(tokens, ref position, SqlTokenKind.StringLiteral))
+        {
+            mismatch =
+                "the RAISE message is not a single-quoted string literal; a "
+                + "double-quoted message is not part of the canonical definition";
+            return false;
+        }
+
+        if (!TakePunctuator(tokens, ref position, ")")
+            || !TakePunctuator(tokens, ref position, ";"))
+        {
+            mismatch = "the RAISE call is not closed by ');'";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, "END"))
+        {
+            mismatch =
+                "the body holds more than the single RAISE statement, or a clause "
+                + "such as WHERE, LIMIT, FROM or CASE can stop it from being reached";
+            return false;
+        }
+
+        // SQLite stores the definition without its terminating semicolon, but accept one.
+        if (position < tokens.Count && IsPunctuator(tokens[position], ";"))
+        {
+            position++;
+        }
+
+        if (position != tokens.Count)
+        {
+            mismatch = "the definition carries extra tokens after END";
+            return false;
+        }
+
+        mismatch = string.Empty;
+        return true;
+    }
+
+    private static bool PeekWord(
+        IReadOnlyList<SqlToken> tokens,
+        int position,
+        string expected) =>
+        position < tokens.Count
+        && tokens[position].Kind == SqlTokenKind.Word
+        && string.Equals(tokens[position].Text, expected, StringComparison.OrdinalIgnoreCase);
+
+    private static bool TakeWord(
+        IReadOnlyList<SqlToken> tokens,
+        ref int position,
+        string expected)
+    {
+        if (!PeekWord(tokens, position, expected))
+        {
+            return false;
+        }
+
+        position++;
+        return true;
+    }
+
+    /// <summary>
+    /// Consumes an object name. A bare word and a quoted identifier are both accepted,
+    /// because quoting is the only formatting freedom SQLite has here; the text itself
+    /// must still equal the expected name.
+    /// </summary>
+    private static bool TakeName(
+        IReadOnlyList<SqlToken> tokens,
+        ref int position,
+        string expected)
+    {
+        if (position >= tokens.Count)
+        {
+            return false;
+        }
+
+        var token = tokens[position];
+        if (token.Kind is not (SqlTokenKind.Word or SqlTokenKind.QuotedName)
+            || !string.Equals(token.Text, expected, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        position++;
+        return true;
+    }
+
+    private static bool TakeKind(
+        IReadOnlyList<SqlToken> tokens,
+        ref int position,
+        SqlTokenKind kind)
+    {
+        if (position >= tokens.Count || tokens[position].Kind != kind)
+        {
+            return false;
+        }
+
+        position++;
+        return true;
+    }
+
+    private static bool TakePunctuator(
+        IReadOnlyList<SqlToken> tokens,
+        ref int position,
+        string expected)
+    {
+        if (position >= tokens.Count || !IsPunctuator(tokens[position], expected))
+        {
+            return false;
+        }
+
+        position++;
+        return true;
+    }
+
+    private static bool IsPunctuator(SqlToken token, string expected) =>
+        token.Kind == SqlTokenKind.Punctuator
+        && string.Equals(token.Text, expected, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Splits SQL into typed tokens. String literals, quoted identifiers and comments are
+    /// classified rather than flattened, so keywords hidden inside them can never be read
+    /// as part of the surrounding statement. Returns null when the text does not tokenise
+    /// — an unterminated literal, identifier or comment is treated as not ready.
+    /// </summary>
+    private static List<SqlToken>? TokenizeSql(string sql)
+    {
+        var tokens = new List<SqlToken>();
+        var index = 0;
+        while (index < sql.Length)
+        {
+            var character = sql[index];
+            if (char.IsWhiteSpace(character))
+            {
+                index++;
+                continue;
+            }
+
+            if (character == '-' && index + 1 < sql.Length && sql[index + 1] == '-')
+            {
+                index += 2;
+                while (index < sql.Length && sql[index] is not '\n')
+                {
+                    index++;
+                }
+
+                continue;
+            }
+
+            if (character == '/' && index + 1 < sql.Length && sql[index + 1] == '*')
+            {
+                index += 2;
+                var closed = false;
+                while (index + 1 < sql.Length)
+                {
+                    if (sql[index] == '*' && sql[index + 1] == '/')
+                    {
+                        index += 2;
+                        closed = true;
+                        break;
+                    }
+
+                    index++;
+                }
+
+                if (!closed)
+                {
+                    return null;
+                }
+
+                continue;
+            }
+
+            if (character is '\'' or '"' or '`' or '[')
+            {
+                var closing = character == '[' ? ']' : character;
+                // Only same-character delimiters use doubling to escape themselves;
+                // SQLite's bracket identifiers have no escape at all.
+                if (!TryReadDelimited(
+                        sql,
+                        ref index,
+                        closing,
+                        allowDoubling: character != '[',
+                        out var text))
+                {
+                    return null;
+                }
+
+                tokens.Add(new SqlToken(
+                    character == '\'' ? SqlTokenKind.StringLiteral : SqlTokenKind.QuotedName,
+                    text));
+                continue;
+            }
+
+            if (char.IsAsciiLetter(character) || character == '_')
+            {
+                var start = index;
+                while (index < sql.Length
+                       && (char.IsAsciiLetterOrDigit(sql[index])
+                           || sql[index] is '_' or '$'))
+                {
+                    index++;
+                }
+
+                tokens.Add(new SqlToken(SqlTokenKind.Word, sql[start..index]));
+                continue;
+            }
+
+            if (character is '(' or ')' or ',' or ';' or '.')
+            {
+                tokens.Add(new SqlToken(
+                    SqlTokenKind.Punctuator,
+                    character.ToString()));
+                index++;
+                continue;
+            }
+
+            // Digits, operators and anything else: kept as a distinct token so it cannot
+            // be mistaken for a keyword and cannot be silently dropped.
+            tokens.Add(new SqlToken(SqlTokenKind.Other, character.ToString()));
+            index++;
+        }
+
+        return tokens;
+    }
+
+    /// <summary>
+    /// Reads a delimited run starting at the opening delimiter. On success
+    /// <paramref name="index"/> lands just past the closing delimiter.
+    /// </summary>
+    private static bool TryReadDelimited(
+        string sql,
+        ref int index,
+        char closing,
+        bool allowDoubling,
+        out string text)
+    {
+        var builder = new StringBuilder();
+        var cursor = index + 1;
+        while (cursor < sql.Length)
+        {
+            if (sql[cursor] != closing)
+            {
+                builder.Append(sql[cursor]);
+                cursor++;
+                continue;
+            }
+
+            if (allowDoubling && cursor + 1 < sql.Length && sql[cursor + 1] == closing)
+            {
+                builder.Append(closing);
+                cursor += 2;
+                continue;
+            }
+
+            index = cursor + 1;
+            text = builder.ToString();
+            return true;
+        }
+
+        text = string.Empty;
+        return false;
+    }
+
+    private enum SqlTokenKind
+    {
+        Word,
+        StringLiteral,
+        QuotedName,
+        Punctuator,
+        Other
+    }
+
+    private readonly record struct SqlToken(SqlTokenKind Kind, string Text);
+
+    private static InvalidOperationException SchemaNotReady(
+        TableRequirement requirement,
+        string detail) =>
+        new(
+            $"Runtime structural readiness check failed for table "
+            + $"'{requirement.Name}': {detail}. Apply {requirement.Migration} "
+            + "explicitly. This runtime structural readiness check does not prove "
+            + "database integrity, tamper resistance, or migration authenticity.");
+
+    private static InvalidOperationException TriggerNotReady(
+        TriggerRequirement requirement,
+        string detail) =>
+        new(
+            $"Runtime structural readiness check failed for trigger "
+            + $"'{requirement.Name}' on table '{requirement.TableName}': {detail}. "
+            + $"Apply {requirement.Migration} explicitly. This runtime structural "
+            + "readiness check does not prove database integrity, tamper resistance, "
+            + "or migration authenticity.");
+
+    private static ColumnRequirement C(
+        string name,
+        string declaredType,
+        bool isNotNull,
+        int primaryKeyOrdinal = 0) =>
+        new(name, declaredType, isNotNull, primaryKeyOrdinal);
+
+    internal sealed record TableRequirement(
+        string Name,
+        string Migration,
+        bool IsWithoutRowId,
+        IReadOnlyList<ColumnRequirement> Columns,
+        IReadOnlyList<ForeignKeyRequirement> ForeignKeys,
+        IReadOnlyList<UniqueRequirement> UniqueConstraints);
+
+    internal sealed record ColumnRequirement(
+        string Name,
+        string DeclaredType,
+        bool IsNotNull,
+        int PrimaryKeyOrdinal);
+
+    /// <summary>
+    /// One column as pragma_table_xinfo reports it. <paramref name="Hidden"/> is 0 for a
+    /// normal column; anything else marks a hidden or generated column, which the
+    /// canonical schema never declares.
+    /// </summary>
+    private sealed record ColumnMetadata(
+        string DeclaredType,
+        bool IsNotNull,
+        int PrimaryKeyOrdinal,
+        long Hidden);
+
+    internal sealed record ForeignKeyRequirement(
+        string FromColumn,
+        string ToTable,
+        string ToColumn);
+
+    /// <summary>
+    /// One declared foreign key exactly as SQLite reports it, including its referential
+    /// actions. Actions are carried rather than filtered on so a non-canonical key is
+    /// reported by name instead of disappearing from the comparison.
+    /// </summary>
+    private sealed record ForeignKeyMetadata(
+        ForeignKeyRequirement Key,
+        string OnUpdate,
+        string OnDelete,
+        string Match)
+    {
+        public bool IsCanonicalAction =>
+            string.Equals(OnUpdate, "NO ACTION", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(OnDelete, "NO ACTION", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(Match, "NONE", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal sealed record UniqueRequirement(IReadOnlyList<string> Columns);
+
+    private sealed record UniqueMetadata(
+        string Name,
+        IReadOnlyList<string> Columns,
+        string Origin,
+        bool IsPartial,
+        bool HasExpression)
+    {
+        public bool IsCanonical =>
+            string.Equals(Origin, "u", StringComparison.OrdinalIgnoreCase)
+            && !IsPartial
+            && !HasExpression;
+    }
+
+    internal sealed record TriggerRequirement(
+        string Name,
+        string TableName,
+        string EventName,
+        string Migration);
 
     public async Task StartCaptureSessionAsync(
         LiveCaptureSessionStart start,
@@ -200,6 +1285,13 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
             {
                 throw new ArgumentException(
                     "A batch may not span more than one live session.",
+                    nameof(records));
+            }
+
+            if (string.IsNullOrWhiteSpace(record.ChannelName))
+            {
+                throw new ArgumentException(
+                    "Every record must carry a non-blank channel name.",
                     nameof(records));
             }
 
@@ -669,7 +1761,15 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         {
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
             using var pragma = connection.CreateCommand();
-            pragma.CommandText = "PRAGMA foreign_keys = ON;";
+            // recursive_triggers is defence in depth for this connection only: without it
+            // a REPLACE conflict resolution would delete a row without firing the
+            // append-only delete trigger. This repository never issues REPLACE, and the
+            // setting is per-connection, so it constrains this application's own writes —
+            // it is not, and must not be presented as, protection against another writer.
+            pragma.CommandText = """
+                PRAGMA foreign_keys = ON;
+                PRAGMA recursive_triggers = ON;
+                """;
             await pragma.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             return connection;
         }

@@ -141,6 +141,17 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
     /// </summary>
     internal bool SessionPersisted => _persisted;
 
+    internal IReadOnlyList<LiveMonitoringDiagnostic> SessionDiagnostics
+    {
+        get
+        {
+            lock (_sessionLock)
+            {
+                return [.. _diagnostics];
+            }
+        }
+    }
+
     /// <summary>
     /// The queue options for a live session. Synchronous continuations are disabled
     /// explicitly: the producer calls <c>TryWrite</c> while holding
@@ -367,7 +378,9 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             }
 
             SetState(LiveMonitoringState.Stopping);
-            await CompleteSessionAsync(cancellationToken).ConfigureAwait(false);
+            // Cancellation only governs admission to shutdown. Once shutdown starts it
+            // is irreversible and must persist exactly one completion.
+            await CompleteSessionAsync(CancellationToken.None).ConfigureAwait(false);
         }
         finally
         {
@@ -402,6 +415,10 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             _transitionGate.Release();
         }
 
+        // A persistence fault can be discovered by the draining consumer while Dispose
+        // owns the transition gate. Observe that newly-created teardown task after
+        // releasing the gate and before disposing the gate it must acquire/release.
+        await ObserveFaultShutdownAsync().ConfigureAwait(false);
         await _source.DisposeAsync().ConfigureAwait(false);
         _transitionGate.Dispose();
     }
@@ -552,6 +569,10 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                 }
                 catch (OperationCanceledException)
                 {
+                    // The consumer observes its own cancellation token; a cancelled drain
+                    // is the expected shutdown outcome, not a pipeline failure, so it is
+                    // deliberately not reported as one. Any other exception falls through
+                    // to the handler below and is recorded as live_consumer_failed.
                 }
                 catch (Exception exception)
                 {
@@ -579,14 +600,14 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
     /// <summary>
     /// The single background consumer. Each record is parsed exactly once; that one parse
     /// feeds both the counters and the persisted evidence row. Records accumulate in a
-    /// bounded batch that is flushed when it fills and unconditionally when the stream
-    /// ends, so Stop always writes whatever is still pending.
+    /// bounded batch that is flushed when it fills, when its fixed age deadline expires,
+    /// or unconditionally when the stream ends.
     /// </summary>
     /// <remarks>
-    /// Known limitation: with no timed flush, a quiet session can hold up to
-    /// <see cref="LiveMonitoringLimits.MaxCaptureBatchRecords"/> - 1 classified records in
-    /// memory until it stops. An abrupt process termination loses exactly those, which is
-    /// why a session with no completion row must be read as "did not finish cleanly".
+    /// An abrupt process termination can still lose up to
+    /// <see cref="LiveMonitoringLimits.MaxCaptureBatchRecords"/> - 1 classified records
+    /// that have not committed yet. The deadline bounds normal partial-batch residency;
+    /// it is not a durability guarantee.
     /// </remarks>
     private async Task ConsumeAsync(
         ChannelReader<LiveQueuedRecord> reader,
@@ -594,19 +615,92 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
     {
         var batch = new List<LiveCaptureRecord>(
             LiveMonitoringLimits.MaxCaptureBatchRecords);
+        Task<bool>? readinessTask = null;
+        Task? deadlineTask = null;
+        CancellationTokenSource? deadlineCancellation = null;
+
+        async Task EndDeadlineAsync(bool cancel)
+        {
+            if (deadlineTask is null || deadlineCancellation is null)
+            {
+                return;
+            }
+
+            var task = deadlineTask;
+            var cancellation = deadlineCancellation;
+            deadlineTask = null;
+            deadlineCancellation = null;
+            try
+            {
+                if (cancel)
+                {
+                    await cancellation.CancelAsync().ConfigureAwait(false);
+                }
+
+                await task.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+            {
+                // Expected when a full batch or channel completion retires its deadline.
+            }
+            finally
+            {
+                cancellation.Dispose();
+            }
+        }
+
         try
         {
-            await foreach (var queued in reader
-                .ReadAllAsync(cancellationToken)
-                .ConfigureAwait(false))
+            while (true)
             {
+                readinessTask ??= reader
+                    .WaitToReadAsync(cancellationToken)
+                    .AsTask();
+
+                if (batch.Count == 0)
+                {
+                    if (!await readinessTask.ConfigureAwait(false))
+                    {
+                        break;
+                    }
+
+                    readinessTask = null;
+                }
+                else
+                {
+                    var completed = await Task
+                        .WhenAny(deadlineTask!, readinessTask)
+                        .ConfigureAwait(false);
+
+                    // If both became ready together, the fixed deadline wins. The
+                    // channel readiness task is retained and observed on the next loop.
+                    if (deadlineTask!.IsCompleted || ReferenceEquals(completed, deadlineTask))
+                    {
+                        await EndDeadlineAsync(cancel: false).ConfigureAwait(false);
+                        await FlushAsync(batch, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    if (!await readinessTask.ConfigureAwait(false))
+                    {
+                        break;
+                    }
+
+                    readinessTask = null;
+                }
+
+                if (!reader.TryRead(out var queued))
+                {
+                    continue;
+                }
+
                 Interlocked.Decrement(ref _queueDepth);
 
                 // Two failure domains, deliberately kept apart. Classifying one record can
                 // fail on its own and must not stop the session; persisting a batch is a
                 // storage fault and must fault the session. Sharing one catch would let a
                 // storage failure be filed as a parse error and silently lose the batch.
-                LiveCaptureRecord processed;
+                ClassifiedCapture processed;
                 try
                 {
                     processed = Classify(queued);
@@ -624,21 +718,48 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                     continue;
                 }
 
-                batch.Add(processed);
+                if (!PersistenceFaulted())
+                {
+                    var wasEmpty = batch.Count == 0;
+                    batch.Add(processed.Record);
+                    if (wasEmpty)
+                    {
+                        deadlineCancellation = new CancellationTokenSource();
+                        deadlineTask = Task.Delay(
+                            LiveMonitoringLimits.CaptureFlushInterval,
+                            _timeProvider,
+                            deadlineCancellation.Token);
+                    }
+                }
+
+                // The observer is notified only after the record has entered the batch.
+                // Tests can therefore use the notification as a deterministic boundary.
+                NotifyClassified(processed.Classification);
+
                 if (batch.Count >= LiveMonitoringLimits.MaxCaptureBatchRecords)
                 {
-                    // FlushAsync owns every persistence failure and never rethrows.
+                    await EndDeadlineAsync(cancel: true).ConfigureAwait(false);
                     await FlushAsync(batch, cancellationToken).ConfigureAwait(false);
                 }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            // Only our own cancellation is swallowed, and only to leave the loop: the
+            // finally below still retires the deadline and writes whatever the batch
+            // still holds. A cancellation that did not come from this token does not
+            // match the filter and propagates to ReleasePipelineAsync.
         }
+        finally
+        {
+            // Channel completion, Stop, source fault, cancellation and Dispose all retire
+            // the timer immediately; none waits out the remaining interval.
+            await EndDeadlineAsync(cancel: true).ConfigureAwait(false);
 
-        // Unconditional final flush: the stream has ended, so whatever is still pending
-        // is everything this session has left to record.
-        await FlushAsync(batch, CancellationToken.None).ConfigureAwait(false);
+            // Unconditional final flush: the stream has ended, so whatever is still
+            // pending is everything this session has left to record.
+            await FlushAsync(batch, CancellationToken.None).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -714,7 +835,7 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
     /// the XML is never parsed twice. Observer notifications stay outside the counting
     /// scope.
     /// </summary>
-    private LiveCaptureRecord Classify(LiveQueuedRecord queued)
+    private ClassifiedCapture Classify(LiveQueuedRecord queued)
     {
         var record = queued.Record;
         LiveEventOutcome outcome;
@@ -807,13 +928,13 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                 "parse");
         }
 
-        NotifyClassified(new LiveEventClassification(
+        var classification = new LiveEventClassification(
             record,
             outcome,
             outcome == LiveEventOutcome.DeleteFact,
-            detail is null ? null : LiveMonitoringLimits.TruncateMessage(detail)));
+            detail is null ? null : LiveMonitoringLimits.TruncateMessage(detail));
 
-        return new LiveCaptureRecord(
+        var capture = new LiveCaptureRecord(
             LiveEvidenceIdentity.Create(_liveSessionId!, queued.ReceivedSequence),
             _liveSessionId!,
             queued.ReceivedSequence,
@@ -831,6 +952,7 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             outcome,
             LiveMonitoringLimits.TruncateErrorCode(errorCode),
             LiveMonitoringLimits.TruncateDetail(detail));
+        return new ClassifiedCapture(capture, classification);
     }
 
     /// <summary>
@@ -849,9 +971,7 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
 
             _persistenceFaulted = true;
             _acceptingEvents = false;
-            _sessionFaulted = true;
-            _lastError = LiveMonitoringLimits.TruncateMessage(
-                $"实时证据未能写入数据库：{message}");
+            MarkFaultedCore($"实时证据未能写入数据库：{message}");
             AddDiagnosticCore(
                 "live_evidence_persist_failed",
                 message,
@@ -1034,8 +1154,10 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                 if (!_queueOverflowReported)
                 {
                     _queueOverflowReported = true;
-                    _lastError =
-                        $"事件队列已满（容量 {_options.QueueCapacity}），部分事件已被丢弃。";
+                    // Overflow is a condition, not a session fault. Routed through the
+                    // shared entry point so it can never displace an earlier root cause.
+                    ReportConditionCore(
+                        $"事件队列已满（容量 {_options.QueueCapacity}），部分事件已被丢弃。");
                     AddDiagnosticCore(
                         "live_queue_overflow",
                         $"The bounded queue reached its capacity of {_options.QueueCapacity}; records are being dropped.",
@@ -1058,9 +1180,10 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
     {
         lock (_sessionLock)
         {
-            if (generation != _generation)
+            if (generation != _generation || !_acceptingEvents || _completionStarted)
             {
-                // A stale watcher: it cannot mark a newer session as faulted.
+                // A stale watcher, or a callback arriving after clean shutdown began,
+                // cannot revise the already-linearized session outcome.
                 return;
             }
 
@@ -1073,8 +1196,7 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             }
 
             _acceptingEvents = false;
-            _sessionFaulted = true;
-            _lastError = LiveMonitoringLimits.TruncateMessage(message);
+            MarkFaultedCore(message);
             AddDiagnosticCore(code, message, ImportDiagnosticSeverity.Error, "receive");
             _faultShutdown = Task.Run(HandleFaultAsync, CancellationToken.None);
         }
@@ -1120,9 +1242,16 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
         }
         catch (OperationCanceledException)
         {
+            // This await exists only to observe the shutdown task so its exception is
+            // never unhandled. The fault it is tearing down was already recorded as the
+            // session's root cause and diagnostic before the task was started, so there
+            // is nothing further to report here.
         }
         catch (Exception exception) when (IsExpectedFailure(exception))
         {
+            // Same reason, for the storage and lifecycle failures the shutdown path can
+            // surface. The filter is deliberate: an unexpected exception type is not
+            // swallowed and still propagates to the caller.
         }
     }
 
@@ -1157,7 +1286,7 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             var message =
                 $"监控会话计数不一致（接收 {value.Received}，已分类 {value.Parsed}，"
                 + $"忽略 {value.Ignored}，错误 {value.Error}，丢弃 {value.Dropped}），未能保存会话摘要。";
-            SetLastError(message);
+            MarkFaulted(message);
             AddDiagnostic(
                 "live_session_counters_unbalanced",
                 message,
@@ -1245,17 +1374,42 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
     {
         lock (_sessionLock)
         {
-            _sessionFaulted = true;
+            MarkFaultedCore(message);
+        }
+    }
+
+    /// <summary>
+    /// Records the first causal session fault. Later failures still receive their own
+    /// diagnostics, but cannot replace the more useful root cause already shown to the
+    /// user. Must be called with <see cref="_sessionLock"/> held.
+    /// </summary>
+    private void MarkFaultedCore(string message)
+    {
+        var preserveFirstCause =
+            _sessionFaulted && !string.IsNullOrWhiteSpace(_lastError);
+        _sessionFaulted = true;
+        if (!preserveFirstCause)
+        {
             _lastError = LiveMonitoringLimits.TruncateMessage(message);
         }
     }
 
-    private void SetLastError(string message)
+    /// <summary>
+    /// Records a non-fault condition — currently only queue overflow — that is worth
+    /// showing when nothing else has claimed the field. It never overwrites anything,
+    /// so it cannot displace a fault root cause; conversely a later real fault still
+    /// replaces it, because a fault is the more causal explanation. This is the only
+    /// other writer of <see cref="_lastError"/>: no branch assigns it directly. Must be
+    /// called with <see cref="_sessionLock"/> held.
+    /// </summary>
+    private void ReportConditionCore(string message)
     {
-        lock (_sessionLock)
+        if (_sessionFaulted || !string.IsNullOrWhiteSpace(_lastError))
         {
-            _lastError = LiveMonitoringLimits.TruncateMessage(message);
+            return;
         }
+
+        _lastError = LiveMonitoringLimits.TruncateMessage(message);
     }
 
     private void Count(Func<Counters, Counters> update)
@@ -1394,6 +1548,10 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
     private readonly record struct LiveQueuedRecord(
         long ReceivedSequence,
         LiveEventRecord Record);
+
+    private readonly record struct ClassifiedCapture(
+        LiveCaptureRecord Record,
+        LiveEventClassification Classification);
 
     /// <summary>Immutable count set; only ever replaced under <see cref="_sessionLock"/>.</summary>
     private readonly record struct Counters(

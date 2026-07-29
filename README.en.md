@@ -4,7 +4,7 @@
 
 > An open-source log viewing and organising tool for Windows. **Alpha / experimental.**
 
-DeleteAudit is an open-source log viewing and organising tool for Windows. It imports supported local log files, helps you read what was imported, and — only after you switch it on yourself — previews live log ingestion on your own machine. The project is still Alpha: it is good for learning, testing and trying out a workflow, and **it should not be treated as a complete or production-grade forensic system**.
+DeleteAudit is an open-source log viewing and organising tool for Windows. It imports supported local log files, helps you read what was imported, and — only after you switch it on yourself — ingests, stores and lets you browse live logs on your own machine. The project is still Alpha: it is good for learning, testing and trying out a workflow, and **it should not be treated as a complete or production-grade forensic system**.
 
 ## What this is
 
@@ -16,7 +16,9 @@ It is a tool for **looking at and organising** logs. It is not a protection tool
 
 - **Offline import** — one `.xml` or `.evtx` log file at a time, chosen by you.
 - **Browse and organise** — page through imported results by time, path and status, and open the delete events and their raw evidence.
-- **Live ingestion (Phase 2B.1)** — after you press start on the live page, it subscribes read-only to log channels that already exist on your machine. **From the moment you start it, the raw XML and the classification of each supported event it receives are written to a local SQLite database**, and detail that was committed successfully **is kept** after you stop or close the app. A session summary is saved as well.
+- **Live ingestion (Phase 2B)** — after you press start on the live page, it subscribes read-only to log channels that already exist on your machine. **From the moment you start it, the raw XML, parsing and classification results, and related live evidence for each supported event it receives are written to a local SQLite database**, and detail that was committed successfully **is kept** after you stop or close the app. A session summary is saved as well.
+- **Live history and derived analysis** — page through stored live sessions, records, diagnostics and bounded raw-XML previews; on demand, reparse one selected session and apply the same deterministic correlation, delete-session and risk rules as the offline path.
+- **Separate live canonical projection** — when you explicitly run it, project eligible live evidence into the live-owned tables added by migration `0005`, retaining the `live_evidence_id`, a separate epoch, a dense live sequence and a continuity hash. It never writes to, impersonates or joins the offline event tables, identities, sequence or hash chain.
 - **Import records** — every import produces a record and a manifest file, so you can check exactly what went in.
 
 ## Who it is for
@@ -27,17 +29,19 @@ It is a tool for **looking at and organising** logs. It is not a protection tool
 
 ## Current status and limits
 
-- Stage: **Alpha / experimental**, published at **Phase 2A**.
+- Stage: **Alpha / experimental**, currently implemented through **Phase 2B**.
 - Systems: **Windows 10 / Windows 11**.
 - Runtime: **.NET 8**.
 - **Not a complete or production-grade forensic system**, and not held to the standard of a commercial digital forensics product.
 - It cannot prevent accidental deletion, and it cannot stop a determined attacker or evidence tampering.
-- **There is no live history screen yet.** Newly stored live detail is not projected onto the "delete events" or "raw evidence" pages; for now it can only be queried directly from the database.
-- Live ingestion currently receives, classifies and stores; correlation, session aggregation and risk assessment are **not wired into** the live path yet and are deferred to a later part of **Phase 2B**.
-- **There can be gaps.** Queue overflow, oversized events, a failed write or an abrupt process termination all leave gaps, and on a quiet machine up to 63 classified records sit in memory until a batch fills or you stop. A session with no completion record means that capture did not finish cleanly.
-- **No signature, no external anchoring, no tamper-evident chain.** The database is not a tamper-proof medium.
+- **Live history, derived correlation/session/risk analysis, and canonical projection now have real viewer pages.** Derived analysis is read-only and is not written back. Canonical projection writes only to the live-owned `0005` tables. Neither path disguises live data as an offline import or silently adds it to the offline “delete events” or “raw evidence” pages.
+- **Migration `0005` must be applied explicitly by a developer or operator.** Runtime code never creates or migrates schema. If `0005` is absent, only the live canonical projection page is unavailable; existing offline, live preview, history and derived-analysis pages continue to work.
+- **Writes have a fixed batch deadline, not a strict timing guarantee.** A batch enters persistence immediately at 64 records. A partial batch is normally scheduled for persistence about five seconds after its first record enters an empty batch; later records in that batch do not restart the deadline. Operating-system and thread scheduling, SQLite I/O, or a fault can make completion later.
+- **There can still be gaps.** An abrupt process termination can still lose up to 63 uncommitted records; queue overflow, oversized events, or a failed write also leave gaps. A session with no completion record means that capture did not finish cleanly.
+- **The completion record is attempted once, with no automatic retry.** If that save fails, the session shows `Error`; records committed successfully beforehand are kept.
+- **No signature, no external anchoring, and no tamper-proof guarantee.** The live-owned continuity hash can help expose an ordering break or accidental modification, but anyone with database write access can rebuild the whole chain. SQLite is not a tamper-proof medium.
 - This repository ships **source code only**. There is **no** ready-to-run, signed Windows installer.
-- Latest verification: **174 unit tests, 55 integration tests, 229 in total, all passing**, with a 0 warning / 0 error build.
+- Latest verification: **286 unit tests, 188 integration tests, 474 in total, all passing in two consecutive runs**, with a 0 warning / 0 error build.
 
 Per-phase acceptance records, the design overview and the threat model live in [`docs/`](docs/).
 
@@ -81,7 +85,7 @@ Run the viewer:
 dotnet run --project src/DeleteAudit.Viewer
 ```
 
-Data and output stay inside the repository's `artifacts\` folder; nothing is written outside the checkout. Build rules, test rules and directory conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
+Application data and synthetic test output are configured under the ignored repository `artifacts\` folder; normal .NET build products remain in each project's `bin/obj`. To keep the CLI home, NuGet cache and temporary directories inside the checkout as well, set the environment described in [CONTRIBUTING.md](CONTRIBUTING.md) first.
 
 ## Reporting a security problem
 

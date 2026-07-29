@@ -28,7 +28,7 @@ Phase 1B 的 schema 变化保存在 `db/migrations/0002_phase_1b_offline_import.
 
 数据库与导入输出固定在 `<仓库根>\artifacts\viewer-data`（仓库根由 `DELETEAUDIT_REPOSITORY_ROOT` 或向上查找 `DeleteAudit.sln` 解析，解析失败即 fail closed）。查询连接采用 SQLite `ReadOnly` 模式；导入采用不创建数据库的 `ReadWrite` 模式。缺数据库或缺 schema 只产生可见状态/结构化失败，不创建数据库、不执行迁移。Phase 1C 本身不订阅实时 Event Log。
 
-### Phase 2A 实现状态（实时接入预览，开发中，未封版）
+### Phase 2A 实现状态（实时接入预览，已完成）
 
 Phase 2A 的正式定位是：**用户手动开启、当前进程内运行的 Windows Event Log 实时接入预览与会话统计。**
 
@@ -38,9 +38,19 @@ Phase 2A 的正式定位是：**用户手动开启、当前进程内运行的 Wi
 
 边界与防线：启动前先 `ValidateSchemaAsync`，`db/migrations/0003_phase_2a_live_monitoring.sql` 未应用时 fail closed，不创建 watcher、不读取任何实时事件；单条事件 XML 上限 1,048,576 个 UTF-16 code unit，超限不入队、不解析、不截断冒充完整事件（`EventRecord.ToXml()` 本身仍会先物化一次字符串，该防线约束的是队列驻留与解析内存）；每个会话最多保留前 256 条真实诊断，超出部分只增加 `suppressed_diagnostic_count`，不覆盖已保留诊断，单条消息最多 2048 字符；会话最终状态由锁内的故障标记决定，而不是异步发布的 UI 状态，因此一次真实 watcher 故障即使与用户 Stop 并发也必然落库为 `error`；通道、Provider 与 EventID 不一致时 fail closed 并固定计入 Error；每次 Start 递增一个**仅用于内存生命周期**的 session generation（它不是、也不得被当作取证意义上的 channel epoch），旧 watcher 的迟到回调无法修改新会话计数；source fault 后转入 Error 并在回调线程之外异步停止、drain、只保存一次 `final_state='error'` 的会话摘要，不自动重启。
 
-**明确不在 Phase 2A 范围、全部留待 Phase 2B**：实时原始 XML 持久化、实时删除事实持久化、ProcessContext 与删除事实关联、删除会话聚合、风险计算、哈希链及外部锚点。因此实时管线**目前只复用 `WindowsEventXmlParser` 一个 Phase 1A 组件**；`DeleteEventCorrelator`、`DeleteSessionAggregator` 和风险模型**尚未接入实时管线**。Phase 2B 将为实时证据设计独立的身份与持久化表，**不会伪造 `import_session`、输入文件 SHA-256、channel epoch 或离线哈希链锚点**来复用离线表。
+Phase 2A 的历史边界不再描述当前能力：实时原始 XML、持久化历史、按需关联/聚合/风险分析和独立规范投影均已在 Phase 2B 实现。仍然成立的边界是：实时接入必须由用户手动开始；它不会自动启动、不会安装或配置事件源，也不构成完整或生产级取证。
 
-因此 Phase 2A **不构成完整的实时删除审计**，也不得如此宣称：停止监控或关闭应用后，本次实时事件的详情无法在 Delete Events 或 Raw XML 页面回看。该限制在实时页面顶部常驻显示。
+### Phase 2B 实现状态（实时证据、历史、分析与 live-owned 投影，已完成）
+
+- **Phase 2B.1 / migration 0004**：每条成功接收的受支持事件保存 `live_evidence_id = live_session_id + received_sequence`、capture 元数据、原始 XML、原始 XML SHA-256、parser identity、分类结果和结构化错误。身份不借用离线 import、输入文件哈希、channel epoch、ingest sequence 或 entry hash。
+- **Phase 2B.2.1 有界时间刷新**：批次达到 64 条立即持久化；未满批次从第一条进入空批次起通常约 5 秒后进入持久化，同批后续记录不延长期限。异常退出仍可能丢失最多 63 条未提交记录；调度和 SQLite I/O 使五秒只是调度目标，不是严格完成保证。写入 fault、取消、Stop 和完成记录均使用单一生命周期收口，不自动重试或重启。
+- **Phase 2B.2.2 Live History**：SQLite `ReadOnly`、参数化服务端筛选、默认 50/最大 200 分页、按选择延迟读取且数据库端截断的 Raw XML 预览；ViewModel 对并发请求采用 latest-request-wins、取消和 generation stale-result rejection。打开历史页不订阅事件日志，也不轮询。
+- **Phase 2B.3 派生分析**：按用户动作只读重新解析所选 capture session，复用 Phase 1A 的 `WindowsEventXmlParser`、`DeleteEventCorrelator`、`DeleteSessionAggregator` 和风险规则，展示关联删除、删除会话和风险信号。结果不写回数据库、不提升为新证据；每次最多分析 5000 条并明确显示截断。
+- **Phase 2B.4 / migration 0005**：显式、幂等地把可投影 live evidence 写入独立的 `live_channel_epochs`、`live_projected_records` 和 `live_projection_runs`。每条记录保留来源 `live_evidence_id`、源接收序号、会话内密集 `live_ingest_sequence`、确定性 projection/epoch identity、原始 XML digest、canonical payload digest 与独立 continuity hash。投影事务只写这些 live-owned 表；不写、不冒充、也不连接 `raw_events`、`delete_events`、`delete_sessions`、`channel_epochs`、`import_sessions`、离线 ingest sequence 或离线 hash chain。
+
+`0003`、`0004`、`0005` 都只能由开发者/操作员显式应用；runtime 只用 ReadOnly 连接检查完整的 STRICT table/列/外键/UNIQUE/append-only trigger 结构，绝不自动 migration。缺少或变异 `0005` 时，只有规范投影功能 fail closed 为 unavailable，已有离线、实时预览、Live History 和派生分析仍保持各自边界。
+
+投影连续性 hash 可重算以发现顺序断裂、源证据不一致或意外修改，但没有签名或外部锚点；能写数据库的人可以重建整条链。因此它不是防篡改保证，也不能与离线链或未来外部可信检查点混称。
 
 ## 1. 威胁模型
 
@@ -101,11 +111,16 @@ Phase 2A 的正式定位是：**用户手动开启、当前进程内运行的 Wi
 │  ├─ PROJECT_PLAN.md
 │  ├─ THREAT_MODEL.md
 │  ├─ PHASE_1A_ACCEPTANCE.md
-│  └─ PHASE_1B_ACCEPTANCE.md
+│  ├─ PHASE_1B_ACCEPTANCE.md
+│  ├─ PHASE_2B_ACCEPTANCE.md
+│  └─ PHASE_2B_COMPLETION.md
 ├─ db\
 │  ├─ schema.sql
 │  └─ migrations\
-│     └─ 0002_phase_1b_offline_import.sql
+│     ├─ 0002_phase_1b_offline_import.sql
+│     ├─ 0003_phase_2a_live_monitoring.sql
+│     ├─ 0004_phase_2b_live_evidence.sql
+│     └─ 0005_phase_2b4_live_projection.sql
 ├─ config\
 │  └─ appsettings.example.json
 ├─ src\
@@ -120,7 +135,7 @@ Phase 2A 的正式定位是：**用户手动开启、当前进程内运行的 Wi
    └─ Fixtures\                 # 仅使用脱敏 XML/EVTX/USN 合成样本
 ```
 
-当前 Collector 宿主仍为空载，不订阅事件、不打开卷、不创建生产运行日志目录。Phase 1B 的配置样例与测试只把文件输出指向项目 `artifacts` 目录。
+当前 Collector 宿主仍为空载；获用户手动启动的实时接入运行在 WPF Viewer 当前进程，不注册服务、不后台自启、不打开卷。离线输出、实时数据库与全部测试数据只写仓库 `artifacts` 目录。
 
 ## 4. SQLite schema
 
@@ -142,6 +157,12 @@ Phase 1B 增量表：
 - `import_records`、`import_diagnostics`：按导入会话和物理序号保留原始 XML 可用性、逐记录结果与结构化诊断。
 - `event_correlations`：保存匹配方法、置信度、时间差、证据引用和是否富化身份。
 - `risk_assessment_subject_links`：把已有风险评估明确连接到删除会话或删除事件。
+
+Phase 2A / 2B 增量表：
+
+- `0003`：实时会话摘要、通道可用性与有界诊断。
+- `0004`：append-only `live_capture_sessions`、`live_capture_records`、`live_capture_completions`；保存 raw XML、digest、parser identity、分类与完成计数。
+- `0005`：append-only `live_channel_epochs`、`live_projected_records`、`live_projection_runs`；它们只属于 live path。确定性 projection identity 与独立 continuity chain 从不复用或延长离线身份/序号/链。
 
 所有时间采用两列：UTC 为 RFC 3339 `Z`，本地时间包含数字偏移；另存 Windows 时区 ID 与偏移分钟数。无法从证据可靠得到的必录字段写 `NULL`，并在 `missing_fields_json` 中列明原因，绝不使用伪值。
 
@@ -218,7 +239,7 @@ Phase 1B 增量表：
 
 ## 7. 测试计划
 
-所有测试使用内存对象、SQLite `:memory:`、内存流和脱敏事件夹具；不通过真实删除制造事件，不打开 D 盘，不更改审计策略。
+测试使用内存对象、SQLite `:memory:` 或仓库忽略的 `artifacts/` 内合成临时数据库、内存流和脱敏事件夹具；不通过真实删除制造事件，不打开 D 盘，不更改审计策略。
 
 ### 单元测试
 
@@ -269,14 +290,14 @@ Phase 1B 增量表：
 - 实现证据评分、PID 生命期、滚动窗口、保护目录和只追加风险历史。
 - 用合成数据完成正确性与性能门槛。
 
-### 阶段 4：只读 Windows 采集适配器
+### 阶段 4：只读 Windows 采集适配器（Phase 2A / 2B 已完成当前进程模式）
 
-- 在单独批准后，接入已经存在的 Sysmon/Security 事件通道；USN 适配器先只报告能力与检查点。
+- 用户显式启动后接入已经存在的 Sysmon/Security 事件通道；USN 适配器仍未实现。
 - 不安装 Sysmon、不启用审计策略、不注册服务；权限不足时清晰降级。
 
-### 阶段 5：WPF Viewer（离线部分已实现）
+### 阶段 5：WPF Viewer（离线与 Phase 2B 页面已实现）
 
-- Phase 1C 已实现项目内 SQLite 的只读查询、筛选、分页、会话/事件/诊断视图、手动离线导入和原始 XML。
+- Phase 1C 已实现离线导入/查询；Phase 2B 已增加实时预览、Live History、派生分析和 live-owned 规范投影页面。
 - 未来生产数据仍须经受限本机查询 IPC；覆盖健康和完整性检查点页面尚未实现。
 - 默认隐藏敏感命令行细节；按显式授权显示。
 

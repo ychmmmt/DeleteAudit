@@ -2,7 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:viewer="clr-namespace:DeleteAudit.Viewer"
-        Title="DeleteAudit — 离线查看器"
+        Title="DeleteAudit — 审计查看器"
         Height="760"
         Width="1240"
         MinHeight="620"
@@ -610,6 +610,480 @@
                                    Text="{Binding LiveMonitoring.ErrorMessage}" />
                     </StackPanel>
                 </ScrollViewer>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="实时接入历史">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <!-- Row 0 stays outside the working area: what this page is, and what
+                         it deliberately does not do, must remain visible at all times. -->
+                    <Border Grid.Row="0"
+                            Background="#EEF4FF"
+                            BorderBrush="#2F5BB7"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="10,8">
+                        <TextBlock Text="{Binding LiveHistory.Disclosure}"
+                                   TextWrapping="Wrap" />
+                    </Border>
+
+                    <WrapPanel Grid.Row="1" Margin="0,8,0,0">
+                        <TextBlock Style="{StaticResource FilterLabel}" Text="开始时间 (UTC)" />
+                        <TextBox Width="165"
+                                 AutomationProperties.Name="按开始时间筛选，UTC"
+                                 Text="{Binding LiveHistory.FromUtcText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="结束时间 (UTC)" />
+                        <TextBox Width="165"
+                                 AutomationProperties.Name="按结束时间筛选，UTC"
+                                 Text="{Binding LiveHistory.ToUtcText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        <CheckBox Margin="12,0,0,0"
+                                  VerticalAlignment="Center"
+                                  Content="只看有错误的记录"
+                                  IsChecked="{Binding LiveHistory.ErrorsOnly, Mode=TwoWay}" />
+                        <CheckBox Margin="12,0,0,0"
+                                  VerticalAlignment="Center"
+                                  Content="接收序号倒序"
+                                  IsChecked="{Binding LiveHistory.NewestFirst, Mode=TwoWay}" />
+                        <Button Command="{Binding LiveHistory.ApplyFiltersCommand}"
+                                Content="筛选会话"
+                                Margin="12,0,0,0"
+                                Padding="10,4" />
+                        <Button Command="{Binding LiveHistory.ApplyRecordFiltersCommand}"
+                                Content="筛选记录"
+                                Margin="8,0,0,0"
+                                Padding="10,4" />
+                        <Button Command="{Binding LiveHistory.RefreshCommand}"
+                                Content="刷新"
+                                Margin="8,0,0,0"
+                                Padding="10,4" />
+                        <Button Command="{Binding LiveHistory.AnalyzeCommand}"
+                                Content="分析所选会话"
+                                Margin="8,0,0,0"
+                                Padding="10,4" />
+                    </WrapPanel>
+
+                    <StackPanel Grid.Row="2">
+                        <TextBlock AutomationProperties.LiveSetting="Polite"
+                                   Text="正在读取实时接入历史…"
+                                   Visibility="{Binding LiveHistory.IsLoading, Converter={StaticResource BoolToVisibility}}" />
+                        <TextBlock Style="{StaticResource ErrorText}"
+                                   AutomationProperties.LiveSetting="Assertive"
+                                   Text="{Binding LiveHistory.UnavailableMessage}"
+                                   Visibility="{Binding LiveHistory.IsUnavailable, Converter={StaticResource BoolToVisibility}}" />
+                        <TextBlock Style="{StaticResource ErrorText}"
+                                   AutomationProperties.LiveSetting="Assertive"
+                                   Text="{Binding LiveHistory.ErrorMessage}" />
+                        <TextBlock Margin="0,4,0,0"
+                                   Text="没有符合条件的实时接入会话。"
+                                   Visibility="{Binding LiveHistory.IsSessionListEmpty, Converter={StaticResource BoolToVisibility}}" />
+                    </StackPanel>
+
+                    <Grid Grid.Row="3" Margin="0,8,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="2*" />
+                            <ColumnDefinition Width="3*" />
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Sessions -->
+                        <Grid Grid.Column="0" Margin="0,0,6,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <DataGrid Grid.Row="0"
+                                      AutomationProperties.Name="实时接入会话列表"
+                                      ItemsSource="{Binding LiveHistory.Sessions}"
+                                      SelectedItem="{Binding LiveHistory.SelectedSession, Mode=TwoWay}"
+                                      Style="{StaticResource VirtualizedDataGrid}">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Binding="{Binding StartedUtc}" Header="开始 (UTC)" />
+                                    <DataGridTextColumn Binding="{Binding FinalState, Converter={StaticResource UnknownValue}}" Header="结束状态" />
+                                    <DataGridTextColumn Binding="{Binding ReceivedCount}" Header="接收" />
+                                    <DataGridTextColumn Binding="{Binding DeleteFactCount}" Header="删除事实" />
+                                    <DataGridTextColumn Binding="{Binding StoredRecordCount}" Header="已保存" />
+                                    <DataGridTextColumn Binding="{Binding LiveSessionId}" Header="会话 ID" Width="*" />
+                                </DataGrid.Columns>
+                            </DataGrid>
+                            <DockPanel Grid.Row="1" Margin="0,6,0,0">
+                                <TextBlock VerticalAlignment="Center"
+                                           Text="{Binding LiveHistory.SessionPageStatus}" />
+                                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                    <Button Command="{Binding LiveHistory.PreviousSessionPageCommand}"
+                                            Content="上一页"
+                                            Padding="10,4" />
+                                    <Button Command="{Binding LiveHistory.NextSessionPageCommand}"
+                                            Content="下一页"
+                                            Margin="8,0,0,0"
+                                            Padding="10,4" />
+                                </StackPanel>
+                            </DockPanel>
+                        </Grid>
+
+                        <!-- Records, diagnostics and the selected record's raw XML -->
+                        <Grid Grid.Column="1" Margin="6,0,0,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <StackPanel Grid.Row="0">
+                                <TextBlock Text="{Binding LiveHistory.SelectedSessionSummary}"
+                                           TextWrapping="Wrap" />
+                                <Border Background="#FFF4E5"
+                                        BorderBrush="#B54708"
+                                        BorderThickness="1"
+                                        CornerRadius="4"
+                                        Margin="0,6,0,0"
+                                        Padding="10,8"
+                                        Visibility="{Binding LiveHistory.SelectedSessionIsIncomplete, Converter={StaticResource BoolToVisibility}}">
+                                    <TextBlock Foreground="#B54708"
+                                               Text="该会话没有完成记录，本次接入可能异常中断；上面的计数不完整。"
+                                               TextWrapping="Wrap" />
+                                </Border>
+                                <TextBlock Margin="0,4,0,0"
+                                           Text="该会话没有已保存的记录。"
+                                           Visibility="{Binding LiveHistory.IsRecordListEmpty, Converter={StaticResource BoolToVisibility}}" />
+                            </StackPanel>
+
+                            <DataGrid Grid.Row="1"
+                                      Margin="0,6,0,0"
+                                      AutomationProperties.Name="实时接入记录列表"
+                                      ItemsSource="{Binding LiveHistory.Records}"
+                                      SelectedItem="{Binding LiveHistory.SelectedRecord, Mode=TwoWay}"
+                                      Style="{StaticResource VirtualizedDataGrid}">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Binding="{Binding ReceivedSequence}" Header="序号" />
+                                    <DataGridTextColumn Binding="{Binding Outcome}" Header="分类" />
+                                    <DataGridTextColumn Binding="{Binding ObservedUtc}" Header="接收时间 (UTC)" />
+                                    <DataGridTextColumn Binding="{Binding ProviderName, Converter={StaticResource UnknownValue}}" Header="Provider" />
+                                    <DataGridTextColumn Binding="{Binding ChannelName}" Header="通道" />
+                                    <DataGridTextColumn Binding="{Binding ParsedEventId, Converter={StaticResource UnknownValue}}" Header="Event ID" />
+                                    <DataGridTextColumn Binding="{Binding EventRecordId, Converter={StaticResource UnknownValue}}" Header="Record ID" />
+                                    <DataGridTextColumn Binding="{Binding ErrorCode, Converter={StaticResource UnknownValue}}" Header="错误码" Width="*" />
+                                </DataGrid.Columns>
+                            </DataGrid>
+
+                            <DockPanel Grid.Row="2" Margin="0,6,0,0">
+                                <TextBlock VerticalAlignment="Center"
+                                           Text="{Binding LiveHistory.RecordPageStatus}" />
+                                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                    <Button Command="{Binding LiveHistory.PreviousRecordPageCommand}"
+                                            Content="上一页"
+                                            Padding="10,4" />
+                                    <Button Command="{Binding LiveHistory.NextRecordPageCommand}"
+                                            Content="下一页"
+                                            Margin="8,0,0,0"
+                                            Padding="10,4" />
+                                </StackPanel>
+                            </DockPanel>
+
+                            <StackPanel Grid.Row="3" Margin="0,8,0,0">
+                                <TextBlock Text="{Binding LiveHistory.SelectedRecordSummary}"
+                                           TextWrapping="Wrap" />
+                                <TextBlock Margin="0,4,0,0"
+                                           Text="{Binding LiveHistory.RawXmlLengthSummary}" />
+                                <Border Background="#FFF4E5"
+                                        BorderBrush="#B54708"
+                                        BorderThickness="1"
+                                        CornerRadius="4"
+                                        Margin="0,6,0,0"
+                                        Padding="10,8"
+                                        Visibility="{Binding LiveHistory.RawXmlIsTruncated, Converter={StaticResource BoolToVisibility}}">
+                                    <TextBlock Foreground="#B54708"
+                                               Text="{Binding LiveHistory.RawXmlTruncationNotice}"
+                                               TextWrapping="Wrap" />
+                                </Border>
+                            </StackPanel>
+
+                            <TextBox Grid.Row="4"
+                                     Margin="0,6,0,0"
+                                     AutomationProperties.Name="所选记录的只读原始 XML 预览"
+                                     FontFamily="Consolas"
+                                     HorizontalScrollBarVisibility="Auto"
+                                     IsReadOnly="True"
+                                     Text="{Binding LiveHistory.RawXmlPreview, Mode=OneWay}"
+                                     TextWrapping="NoWrap"
+                                     VerticalScrollBarVisibility="Auto" />
+                        </Grid>
+                    </Grid>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="实时接入分析">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0"
+                            Background="#EEF4FF"
+                            BorderBrush="#2F5BB7"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="10,8">
+                        <TextBlock TextWrapping="Wrap"
+                                   Text="本页是对「实时接入历史」中所选会话的只读派生分析：重新读取并解析该会话已保存的记录，套用与离线导入完全相同的确定性关联、删除会话归并与风险规则。分析结果不会写回数据库，也不会成为新的证据；关联表示证据之间的印证，不是攻击确认或责任判定。请先在「实时接入历史」页选择一个会话，再点击该页的“分析所选会话”。" />
+                    </Border>
+
+                    <StackPanel Grid.Row="1" Margin="0,8,0,0">
+                        <TextBlock Text="{Binding LiveHistory.AnalysisSummary}"
+                                   TextWrapping="Wrap" />
+                        <Border Background="#FFF4E5"
+                                BorderBrush="#B54708"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Margin="0,6,0,0"
+                                Padding="10,8"
+                                Visibility="{Binding LiveHistory.AnalysisWasTruncated, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B54708"
+                                       Text="{Binding LiveHistory.AnalysisTruncationNotice}"
+                                       TextWrapping="Wrap" />
+                        </Border>
+                        <TextBlock Margin="0,4,0,0"
+                                   Text="该会话没有可分析的删除事实。"
+                                   Visibility="{Binding LiveHistory.AnalysisIsEmpty, Converter={StaticResource BoolToVisibility}}" />
+                    </StackPanel>
+
+                    <DataGrid Grid.Row="2"
+                              Margin="0,8,0,0"
+                              AutomationProperties.Name="派生的删除会话列表"
+                              ItemsSource="{Binding LiveHistory.AnalysisSessions}"
+                              Style="{StaticResource VirtualizedDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Binding="{Binding Ordinal}" Header="#" />
+                            <DataGridTextColumn Binding="{Binding RiskLevel}" Header="风险信号" />
+                            <DataGridTextColumn Binding="{Binding RiskRuleCode}" Header="规则" />
+                            <DataGridTextColumn Binding="{Binding ConfirmedItemCount}" Header="删除数" />
+                            <DataGridTextColumn Binding="{Binding ProtectedItemCount}" Header="受保护路径" />
+                            <DataGridTextColumn Binding="{Binding OpenedUtc}" Header="开始 (UTC)" />
+                            <DataGridTextColumn Binding="{Binding LastEventUtc}" Header="最后事件 (UTC)" />
+                            <DataGridTextColumn Binding="{Binding ProcessIdentity}" Header="进程标识" />
+                            <DataGridTextColumn Binding="{Binding UserIdentity}" Header="用户标识" />
+                            <DataGridTextColumn Binding="{Binding MainPath}" Header="路径范围" Width="*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <DataGrid Grid.Row="3"
+                              Margin="0,8,0,0"
+                              AutomationProperties.Name="派生的关联删除事件列表"
+                              ItemsSource="{Binding LiveHistory.AnalysisDeletes}"
+                              Style="{StaticResource VirtualizedDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Binding="{Binding DeleteSessionOrdinal}" Header="会话 #" />
+                            <DataGridTextColumn Binding="{Binding OccurredUtc}" Header="发生时间 (UTC)" />
+                            <DataGridTextColumn Binding="{Binding FullPath, Converter={StaticResource UnknownValue}}" Header="路径" Width="*" />
+                            <DataGridTextColumn Binding="{Binding Method}" Header="关联方式" />
+                            <DataGridTextColumn Binding="{Binding Confidence}" Header="置信度" />
+                            <DataGridTextColumn Binding="{Binding RiskLevel}" Header="风险信号" />
+                            <DataGridTextColumn Binding="{Binding ProcessPath, Converter={StaticResource UnknownValue}}" Header="进程" />
+                            <DataGridTextColumn Binding="{Binding UserName, Converter={StaticResource UnknownValue}}" Header="用户" />
+                            <DataGridTextColumn Binding="{Binding ReceivedSequence}" Header="接收序号" />
+                            <DataGridTextColumn Binding="{Binding LiveEvidenceId}" Header="来源证据 ID" />
+                            <DataGridTextColumn Binding="{Binding MatchedProcessLiveEvidenceId, Converter={StaticResource UnknownValue}}" Header="匹配的进程证据" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="实时规范投影">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0"
+                            Background="#EEF4FF"
+                            BorderBrush="#2F5BB7"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="10,8">
+                        <TextBlock Text="{Binding LiveProjection.Disclosure}"
+                                   TextWrapping="Wrap" />
+                    </Border>
+
+                    <StackPanel Grid.Row="1" Margin="0,8,0,0">
+                        <TextBlock FontWeight="SemiBold"
+                                   Text="{Binding LiveProjection.SelectedSessionSummary}"
+                                   TextWrapping="Wrap" />
+                        <WrapPanel Margin="0,8,0,0">
+                            <Button AutomationProperties.Name="投影所选实时接入会话"
+                                    Command="{Binding LiveProjection.ProjectCommand}"
+                                    Content="投影所选会话"
+                                    Padding="12,6" />
+                            <Button AutomationProperties.Name="刷新实时规范投影"
+                                    Command="{Binding LiveProjection.RefreshCommand}"
+                                    Content="刷新投影记录"
+                                    Margin="8,0,0,0"
+                                    Padding="12,6" />
+                            <Button AutomationProperties.Name="验证实时投影连续性"
+                                    Command="{Binding LiveProjection.VerifyCommand}"
+                                    Content="验证连续性"
+                                    Margin="8,0,0,0"
+                                    Padding="12,6" />
+                             <TextBlock Margin="12,0,0,0"
+                                        AutomationProperties.LiveSetting="Polite"
+                                        VerticalAlignment="Center"
+                                        Text="正在执行…"
+                                       Visibility="{Binding LiveProjection.IsLoading, Converter={StaticResource BoolToVisibility}}" />
+                        </WrapPanel>
+
+                        <WrapPanel Margin="0,8,0,0">
+                            <TextBlock Style="{StaticResource FilterLabel}"
+                                       Text="来源" />
+                            <ComboBox Width="170"
+                                      AutomationProperties.Name="投影来源筛选"
+                                      ItemsSource="{Binding LiveProjection.SourceOptions}"
+                                      SelectedItem="{Binding LiveProjection.Source, Mode=TwoWay}" />
+                            <TextBlock Margin="12,0,6,0"
+                                       Style="{StaticResource FilterLabel}"
+                                       Text="路径包含" />
+                            <TextBox Width="220"
+                                     AutomationProperties.Name="投影路径筛选"
+                                     Text="{Binding LiveProjection.PathContains, UpdateSourceTrigger=PropertyChanged}" />
+                            <TextBlock Margin="12,0,6,0"
+                                       Style="{StaticResource FilterLabel}"
+                                       Text="进程包含" />
+                            <TextBox Width="220"
+                                     AutomationProperties.Name="投影进程筛选"
+                                     Text="{Binding LiveProjection.ProcessContains, UpdateSourceTrigger=PropertyChanged}" />
+                            <CheckBox Margin="12,0,0,0"
+                                      VerticalAlignment="Center"
+                                      Content="最新序号优先"
+                                      IsChecked="{Binding LiveProjection.Descending}" />
+                            <Button Command="{Binding LiveProjection.ApplyFiltersCommand}"
+                                    Content="应用筛选"
+                                    Margin="12,0,0,0"
+                                    Padding="10,4" />
+                        </WrapPanel>
+                    </StackPanel>
+
+                    <StackPanel Grid.Row="2" Margin="0,8,0,0">
+                        <Border Background="#FFF4E5"
+                                BorderBrush="#B54708"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Padding="10,8"
+                                AutomationProperties.LiveSetting="Assertive"
+                                Visibility="{Binding LiveProjection.SelectedSessionIsIncomplete, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B54708"
+                                       FontWeight="SemiBold"
+                                       Text="{Binding LiveProjection.IncompleteSessionNotice}"
+                                       TextWrapping="Wrap" />
+                        </Border>
+                        <TextBlock Text="{Binding LiveProjection.AvailabilityMessage}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Margin="0,4,0,0"
+                                   Text="{Binding LiveProjection.LastRunSummary}"
+                                   TextWrapping="Wrap" />
+                        <TextBlock Margin="0,4,0,0"
+                                   Text="{Binding LiveProjection.ContinuitySummary}"
+                                   TextWrapping="Wrap" />
+                        <Border Background="#FEE4E2"
+                                BorderBrush="#B42318"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Margin="0,6,0,0"
+                                Padding="10,8"
+                                Visibility="{Binding LiveProjection.IsUnavailable, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B42318"
+                                       Text="{Binding LiveProjection.AvailabilityMessage}"
+                                       TextWrapping="Wrap" />
+                        </Border>
+                        <Border Background="#FEE4E2"
+                                BorderBrush="#B42318"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Margin="0,6,0,0"
+                                Padding="10,8"
+                                Visibility="{Binding LiveProjection.LastRunFailed, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B42318"
+                                       Text="{Binding LiveProjection.LastRunSummary}"
+                                       TextWrapping="Wrap" />
+                        </Border>
+                        <Border Background="#FFF4E5"
+                                BorderBrush="#B54708"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Margin="0,6,0,0"
+                                Padding="10,8"
+                                Visibility="{Binding LiveProjection.ContinuityIsBroken, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B54708"
+                                       Text="{Binding LiveProjection.ContinuitySummary}"
+                                       TextWrapping="Wrap" />
+                        </Border>
+                        <TextBlock Style="{StaticResource ErrorText}"
+                                   Text="{Binding LiveProjection.ErrorMessage}" />
+                        <TextBlock Margin="0,4,0,0"
+                                   Text="该筛选条件下没有投影记录。"
+                                   Visibility="{Binding LiveProjection.IsEmpty, Converter={StaticResource BoolToVisibility}}" />
+                    </StackPanel>
+
+                    <DataGrid Grid.Row="3"
+                              Margin="0,8,0,0"
+                              AutomationProperties.Name="实时规范投影记录列表"
+                              ItemsSource="{Binding LiveProjection.Records}"
+                              Style="{StaticResource VirtualizedDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Binding="{Binding LiveIngestSequence}"
+                                                Header="Live 序号" />
+                            <DataGridTextColumn Binding="{Binding SourceReceivedSequence}"
+                                                Header="接收序号" />
+                            <DataGridTextColumn Binding="{Binding SourceLabel}"
+                                                Header="来源分类" />
+                            <DataGridTextColumn Binding="{Binding EventUtc, Converter={StaticResource UnknownValue}}"
+                                                Header="事件时间 (UTC)" />
+                            <DataGridTextColumn Binding="{Binding NormalizedPath, Converter={StaticResource UnknownValue}}"
+                                                Header="路径"
+                                                Width="*" />
+                            <DataGridTextColumn Binding="{Binding ProcessPath, Converter={StaticResource UnknownValue}}"
+                                                Header="进程" />
+                            <DataGridTextColumn Binding="{Binding ProcessId, Converter={StaticResource UnknownValue}}"
+                                                Header="PID" />
+                            <DataGridTextColumn Binding="{Binding UserName, Converter={StaticResource UnknownValue}}"
+                                                Header="用户" />
+                            <DataGridTextColumn Binding="{Binding LiveEvidenceId}"
+                                                Header="Live evidence ID" />
+                            <DataGridTextColumn Binding="{Binding LiveChannelEpochId}"
+                                                Header="Live epoch ID" />
+                            <DataGridTextColumn Binding="{Binding LiveProjectionId}"
+                                                Header="Projection ID" />
+                            <DataGridTextColumn Binding="{Binding EntryHash}"
+                                                Header="Entry hash" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <DockPanel Grid.Row="4" Margin="0,6,0,0">
+                        <TextBlock VerticalAlignment="Center"
+                                   Text="{Binding LiveProjection.PageStatus}" />
+                        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                            <Button Command="{Binding LiveProjection.PreviousPageCommand}"
+                                    Content="上一页"
+                                    Padding="10,4" />
+                            <Button Command="{Binding LiveProjection.NextPageCommand}"
+                                    Content="下一页"
+                                    Margin="8,0,0,0"
+                                    Padding="10,4" />
+                        </StackPanel>
+                    </DockPanel>
                 </Grid>
             </TabItem>
         </TabControl>

@@ -9,7 +9,11 @@ project, not a product.
 evidence, or compliance.** It does not provide a complete or tamper-evident
 delete audit trail, and it cannot prevent, block, or recover deletions.
 
-## What the current release does
+## What the Phase 2B source candidate does
+
+The capabilities below describe the Phase 2B source candidate. A local feature
+branch or acceptance record is not a supported release; only code integrated
+into the default branch falls under the supported-version statement below.
 
 - Offline analysis of Windows event data that the user explicitly imports
   (a single `.xml` or `.evtx` file at a time).
@@ -17,10 +21,17 @@ delete audit trail, and it cannot prevent, block, or recover deletions.
   subscribes read-only, in-process, to Windows event log channels that already
   exist on the machine (`Microsoft-Windows-Sysmon/Operational` and `Security`),
   filtered server-side to Sysmon 1/23/26 and Security 4663.
-- Live capture (Phase 2B.1) stores, in the local viewer database, the raw XML and
-  the classification of each supported event received after you start it, plus a
-  session summary. Correlation results, delete sessions and risk results are still
-  **not** produced or stored for live capture.
+- Live capture (Phase 2B) stores, in the local viewer database, the raw XML,
+  parsing and classification results, and related live evidence for each supported
+  event received after you start it, plus a session summary.
+- A read-only Live History page exposes bounded, paged queries and database-side
+  raw-XML previews. An explicit derived-analysis action reparses one selected session
+  and applies the same correlation, delete-session and risk rules as the offline
+  pipeline; those derived results are not written back.
+- An explicit canonical-projection action writes only to the live-owned tables from
+  migration `0005`. Each row retains its `live_evidence_id` and uses a separate live
+  epoch, live ingest sequence and continuity hash. It never writes to or impersonates
+  the offline tables, import identity, sequence or hash chain.
 
 ## What it deliberately does not do
 
@@ -57,13 +68,31 @@ explanation is in the README:
 
 - Live detail is written **only to the local viewer database** inside the
   repository's `artifacts` directory. Nothing is uploaded.
-- The record can have **bounded gaps**: queue overflow, an oversized event, a failed
-  write or an abrupt process termination all leave a gap, and up to 63 classified
-  records may be held in memory before a batch is written. A capture session with no
-  completion row did not finish cleanly and must be read that way.
+- A batch enters persistence immediately at 64 records. A partial batch is normally
+  scheduled for persistence about five seconds after its first record enters an empty
+  batch; later records in the same batch do not restart that deadline. This is not a
+  strict five-second guarantee: operating-system and thread scheduling, SQLite I/O, or
+  a fault can make completion later.
+- The record can still have **bounded gaps**: an abrupt process termination may lose
+  up to 63 uncommitted records, and queue overflow, an oversized event, or a failed
+  write also leaves a gap. A capture session with no completion row did not finish
+  cleanly and must be read that way.
+- A completion save is attempted once and is not retried automatically. If it fails,
+  the session is shown as `Error`; records committed successfully before that failure
+  are kept.
 - The database is **not a tamper-proof medium**. A local administrator, or any
   process with write access to the file, can modify, replace or delete it. There is
-  no signature, no external anchoring and no tamper-evident chain for live capture.
+  no signature or external anchoring. The live-owned projection continuity hash can
+  reveal an ordering break or accidental modification when recomputed from the source,
+  but a writer can rebuild the entire chain consistently. It is therefore not a
+  tamper-proof or independently trusted chain.
+- The append-only SQLite triggers constrain **this application's own write path**. They
+  are not a defence against another program that can write to the file: such a writer
+  chooses its own connection settings, and SQLite fires delete triggers for `REPLACE`
+  conflict resolution only when `recursive_triggers` is enabled. DeleteAudit never
+  issues `REPLACE` and does enable that setting on its own write connection, but neither
+  fact constrains anyone else. Read the triggers as protection against application
+  mistakes, not against an attacker who already has write access.
 - Consequently DeleteAudit must **not** be treated as a sole or authoritative source
   of evidence.
 
@@ -88,8 +117,9 @@ volunteer Alpha project there is no guaranteed response window.
 ## Scope notes
 
 Findings that describe the documented Alpha limitations above (for example
-"live event detail is not persisted" or "there is no tamper-evident chain for
-live capture") are known design boundaries, not vulnerabilities. Findings that
-show the application exceeding its documented boundaries — for example reading
-an event log channel without user action, escaping its controlled data
-directory, or writing outside the repository — are in scope and welcome.
+"the continuity hash has no signature or external anchor" or "an abrupt process
+termination can lose an uncommitted partial batch") are known design boundaries,
+not vulnerabilities. Findings that show the application exceeding its documented
+boundaries — for example reading an event log channel without user action, mixing
+live projection into offline identities, escaping its controlled data directory,
+or writing outside the repository — are in scope and welcome.

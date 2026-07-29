@@ -8,7 +8,9 @@ DeleteAudit 是面向单机 Windows 的删除审计系统。本仓库计划包�
 
 关键资产包括：删除事实及其原始证据；事件顺序与时间；执行者、进程和路径归因；会话与风险判定；JSONL/SQLite/manifest 的完整性；签名密钥；采集覆盖与缺口状态；以及原始 XML、命令行、用户名和 SID 中的敏感数据。最重要的安全结果是“证据不足时诚实降级”，而不是以猜测补齐字段。
 
-Phase 1A 已实现的控制位于离线边界内：XML 解析器禁止 DTD/外部实体并按 Data Name 取值；低置信启发式不回填身份；SQLite 仓储不创建或迁移 schema；哈希链签名仅定义接口，测试实现明确声明不具备硬件防篡改能力。真实事件日志、USN、服务和系统配置仍未接入。
+Phase 1A 已实现的控制位于离线边界内：XML 解析器禁止 DTD/外部实体并按 Data Name 取值；低置信启发式不回填身份；SQLite 仓储不创建或迁移 schema；哈希链签名仅定义接口，测试实现明确声明不具备硬件防篡改能力。
+
+Phase 2B 已增加一条由用户手动启动、当前 Viewer 进程内运行的本机实时 Event Log 接入路径。它把受支持事件作为独立 `live_evidence_id` 证据保存，提供 ReadOnly Live History、按需派生关联/会话/风险分析，并通过显式 `0005` migration 提供 live-owned canonical projection。该投影拥有独立 epoch、sequence、identity 和 continuity hash，绝不写入、伪装或连接离线 import identity、离线事件表、离线 ingest sequence 或离线 hash chain。USN、Windows Service、ProgramData、系统配置修改、签名和外部锚点仍未接入。
 
 ## Threat Model, Trust Boundaries, and Assumptions
 
@@ -16,7 +18,7 @@ Phase 1A 已实现的控制位于离线边界内：XML 解析器禁止 DTD/外�
 
 1. **Windows 内核、事件日志服务与 DeleteAudit Collector 之间**：Sysmon、Security XML、USN 记录、事件时间、PID、路径和消息字段都作为不可信输入解析。Collector 可以信任操作系统提供读取机制的权限边界，但不能假设事件一定完整、有序或一致。
 2. **高权限 Collector 与本地交互用户/Viewer 之间**：Viewer 属于低信任区，只能通过有限的只读查询契约读取数据。搜索词、筛选器、分页参数和导出目标都是攻击者可控输入，不能成为 SQL、路径或 XML 注入入口。
-3. **Collector 与 `C:\ProgramData\DeleteAudit` 之间**：数据库、WAL、JSONL、manifest、存档和状态文件跨越持久化边界。崩溃、磁盘耗尽、并发读取、离线修改和整体回滚都在威胁范围内。
+3. **采集器与本地持久化之间**：当前 Alpha 只写仓库内 `artifacts\viewer-data`；未来才计划使用 `C:\ProgramData\DeleteAudit`。数据库、WAL、JSONL、manifest、存档和状态文件跨越持久化边界。崩溃、磁盘耗尽、并发读取、离线修改和整体回滚都在威胁范围内。
 4. **本机与外部锚点之间**：在没有外部追加写检查点时，本地管理员能取得所有权、替换程序、回滚数据或清除来源日志。因此本地哈希链不能单独证明抵抗管理员篡改。
 5. **配置/部署者与运行时之间**：监控根、保护根、事件通道、证书、ACL 和保留策略是管理员控制输入。恶意或错误配置可能制造盲区、扩大敏感数据范围或造成资源耗尽。
 6. **删除事件与进程富化之间**：Sysmon 1 等进程创建证据可能缺失或迟到。PID 会复用，只有 Process GUID 或带启动时间/boot identity 的 PID 才能跨时间可靠关联。
@@ -42,6 +44,8 @@ Phase 1A 已实现的控制位于离线边界内：XML 解析器禁止 DTD/外�
 - 原始证据与风险历史只追加；同一来源事件幂等入库；跨来源证据不能重复计数。
 - 所有相关性以 UTC、稳定进程身份、规范化路径或文件引用号为依据；PID 单独不具备长期身份含义。
 - Viewer 和普通用户不能修改日志、配置、签名状态或采集控制面。
+- live projection 只能写 `0005` 的 live-owned 表，并保留来源 `live_evidence_id`；不得借用或生成离线 import、offline epoch、offline ingest sequence 或 offline hash-chain identity。
+- 缺少或变异 `0005` 时，projection 必须单独 fail closed；runtime 不得自动建表/迁移，也不得使已有离线、实时预览、历史或派生分析功能越界降级。
 - 路径规范化、显示、搜索与导出不能访问被删除目标、跟随重解析点、执行命令或拼接 SQL。
 - 风险引擎只发出告警，不调用拦截、进程控制、文件删除、清理或卷修改操作。
 - 哈希、签名和 manifest 的安全声明必须匹配真实边界；没有外部锚点时不得声称抵抗本地管理员。
@@ -73,6 +77,8 @@ Phase 1A 已实现的控制位于离线边界内：XML 解析器禁止 DTD/外�
 普通用户可能尝试修改 ProgramData 日志；管理员级对手可以清空 Windows 日志、停止 Collector、回滚整套本地数据或替换密钥。磁盘故障与崩溃也可能产生类似症状。
 
 设计缓解：服务 SID/SYSTEM 最小写 ACL；Viewer 走只读 IPC；原始表和 JSONL 只追加；逐条、跨日哈希链；CNG/TPM 不可导出签名检查点；数据库/JSONL 双写核对；检测日志 epoch、USN Journal ID 和 checkpoint 回退；将签名检查点外部锚定。外部锚定缺失时，管理员回滚仍是明确残余风险。
+
+当前 Phase 2B 的保证更窄：`0004` 与 `0005` append-only trigger、写连接的 `recursive_triggers=ON` 和 runtime 禁用 `REPLACE` 主要防止应用自身误改；ReadOnly readiness 精确验证 STRICT table、普通列、外键、UNIQUE 与 trigger 形状。live continuity hash 同时覆盖 raw XML digest 和 canonical payload digest，并从第一条显式零锚点开始重算。它能暴露缺节点、乱序、字段/digest 不一致和意外修改，却没有签名或外部锚点；有数据库写权限的对手可以替换文件或重建整链，因此不能称为防篡改。
 
 ### 路径与查看器注入
 
@@ -135,5 +141,4 @@ Collector 未来可能高权限运行，恶意 NuGet 包、构建脚本或未签
 - 需要本地管理员权限、仅造成管理员已经能够造成的本地可用性影响，且不违背外部完整性承诺。
 - 测试/文档工具中的问题在无生产凭据、无发布路径、无系统权限的真实使用方式下通常为 Low 或不适用。
 
-Repository: local-workspace:sha256:715aca6315bad872305865c67fd196924d36a44ce3f0a4b45757146d41d5060f
-Version: codex-security-snapshot/v1:sha256:4021a4b59a5e1b749aae36dc92bda73d915b540cf9c60a5deecb5acc0d6f2a61
+本威胁模型已按 Phase 2B live evidence、历史、派生分析和 live-owned projection 边界更新；它不构成对某个构建产物或部署环境的签名证明。

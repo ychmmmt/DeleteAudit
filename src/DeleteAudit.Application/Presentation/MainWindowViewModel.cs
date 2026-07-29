@@ -1,5 +1,7 @@
+using DeleteAudit.Application.Analysis;
 using DeleteAudit.Application.Importing;
 using DeleteAudit.Application.LiveMonitoring;
+using DeleteAudit.Application.Projection;
 using DeleteAudit.Application.Viewing;
 
 namespace DeleteAudit.Application.Presentation;
@@ -8,10 +10,12 @@ public sealed class MainWindowViewModel : ViewModelBase
 {
     /// <summary>
     /// Always visible at the top of the window. It must describe what the application
-    /// actually does right now — including that live event detail is not retained.
+    /// actually does right now, including the locally persisted live evidence boundary.
     /// </summary>
     public const string CapabilityBanner =
-        "当前支持离线日志分析，以及用户手动开启的实时事件接入预览；实时事件详情暂不持久保存。";
+        "当前支持离线日志分析、用户手动开启的实时事件接入、已保存的实时历史、派生分析和"
+        + "独立 live-owned 规范投影。实时原始 XML、解析/分类结果与相关证据保存在本机查看器"
+        + "数据库；实时接入仍须由用户手动开始，本应用不是完整或防篡改的取证系统。";
 
     private readonly IViewerQueryService _queryService;
     private readonly string _bannerMessage = CapabilityBanner;
@@ -25,6 +29,9 @@ public sealed class MainWindowViewModel : ViewModelBase
         IOfflineFilePicker filePicker,
         IRawXmlPreviewClipboard rawXmlPreviewClipboard,
         ILiveMonitoringService liveMonitoringService,
+        ILiveHistoryQueryService liveHistoryQueryService,
+        ILiveAnalysisService liveAnalysisService,
+        ILiveProjectionService liveProjectionService,
         IUiDispatcher uiDispatcher,
         INetworkPathImportConfirmation? networkPathConfirmation = null)
     {
@@ -34,10 +41,20 @@ public sealed class MainWindowViewModel : ViewModelBase
         ArgumentNullException.ThrowIfNull(filePicker);
         ArgumentNullException.ThrowIfNull(rawXmlPreviewClipboard);
         ArgumentNullException.ThrowIfNull(liveMonitoringService);
+        ArgumentNullException.ThrowIfNull(liveHistoryQueryService);
+        ArgumentNullException.ThrowIfNull(liveAnalysisService);
+        ArgumentNullException.ThrowIfNull(liveProjectionService);
         ArgumentNullException.ThrowIfNull(uiDispatcher);
 
         RawXml = new RawXmlViewModel(queryService, rawXmlPreviewClipboard);
         LiveMonitoring = new LiveMonitoringViewModel(liveMonitoringService, uiDispatcher);
+        LiveProjection = new LiveProjectionViewModel(liveProjectionService);
+        LiveHistory = new LiveHistoryViewModel(
+            liveHistoryQueryService,
+            liveAnalysisService,
+            session => LiveProjection.SetSession(
+                session?.LiveSessionId,
+                session?.IsComplete ?? false));
         ImportHistory = new ImportHistoryViewModel(queryService);
         DeleteSessions = new DeleteSessionsViewModel(queryService);
         DeleteEvents = new DeleteEventsViewModel(queryService, OpenRawXmlAsync);
@@ -83,6 +100,20 @@ public sealed class MainWindowViewModel : ViewModelBase
     public RawXmlViewModel RawXml { get; }
 
     public LiveMonitoringViewModel LiveMonitoring { get; }
+
+    /// <summary>
+    /// Read-only history of past live captures. It is not loaded by
+    /// <see cref="InitializeAsync"/>: reading it is an explicit user action, and the live
+    /// evidence tables may legitimately be absent on an older database.
+    /// </summary>
+    public LiveHistoryViewModel LiveHistory { get; }
+
+    /// <summary>
+    /// Explicit live-owned projection over the capture selected in
+    /// <see cref="LiveHistory"/>. It is not loaded or run by
+    /// <see cref="InitializeAsync"/>.
+    /// </summary>
+    public LiveProjectionViewModel LiveProjection { get; }
 
     public Task InitializeAsync() =>
         RunSafelyAsync(async () =>

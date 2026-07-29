@@ -295,7 +295,13 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
     private readonly List<LiveCaptureRecord> _records = [];
     private readonly List<int> _batchSizes = [];
     private readonly List<IReadOnlyList<LiveMonitoringDiagnostic>> _diagnostics = [];
+    private readonly List<int> _appendThreadIds = [];
+    private readonly List<int> _completionThreadIds = [];
     private readonly object _sync = new();
+    private readonly TaskCompletionSource _firstAppendEntered =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _firstCompletionEntered =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public Exception? SaveException { get; init; }
 
@@ -307,6 +313,8 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
 
     /// <summary>Held open to park a save mid-flight and interleave a concurrent Stop.</summary>
     public ManualResetEventSlim? SaveGate { get; init; }
+
+    public bool ObserveCompletionCancellationAfterGate { get; init; }
 
     /// <summary>Held open to park an append mid-flight.</summary>
     public ManualResetEventSlim? AppendGate { get; init; }
@@ -326,6 +334,10 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
     public int StartCount { get; private set; }
 
     public int AppendCount { get; private set; }
+
+    public Task FirstAppendEntered => _firstAppendEntered.Task;
+
+    public Task FirstCompletionEntered => _firstCompletionEntered.Task;
 
     public IReadOnlyList<LiveMonitoringSession> Sessions
     {
@@ -378,6 +390,28 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
             lock (_sync)
             {
                 return [.. _batchSizes];
+            }
+        }
+    }
+
+    public IReadOnlyList<int> AppendThreadIds
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return [.. _appendThreadIds];
+            }
+        }
+    }
+
+    public IReadOnlyList<int> CompletionThreadIds
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return [.. _completionThreadIds];
             }
         }
     }
@@ -441,6 +475,8 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
         {
             AppendCount++;
             _batchSizes.Add(records.Count);
+            _appendThreadIds.Add(Environment.CurrentManagedThreadId);
+            _firstAppendEntered.TrySetResult();
             if (AppendException is not null)
             {
                 return Task.FromException(AppendException);
@@ -464,6 +500,8 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
         lock (_sync)
         {
             SaveCount++;
+            _completionThreadIds.Add(Environment.CurrentManagedThreadId);
+            _firstCompletionEntered.TrySetResult();
             if (SaveException is not null)
             {
                 return Task.FromException(SaveException);
@@ -476,6 +514,11 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
 
         // Waits on a real signal; the timeout only guards against a hung test.
         SaveGate?.Wait(SaveGatePatience, CancellationToken.None);
+        if (ObserveCompletionCancellationAfterGate)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
         return Task.CompletedTask;
     }
 }

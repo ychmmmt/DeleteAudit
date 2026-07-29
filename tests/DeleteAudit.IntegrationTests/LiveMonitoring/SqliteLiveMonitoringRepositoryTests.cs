@@ -54,6 +54,287 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         Assert.Equal(3, await CountLiveTablesAsync(location));
     }
 
+    [Theory]
+    [InlineData(EvidenceSchemaMutation.MissingColumn, "provider_name")]
+    [InlineData(EvidenceSchemaMutation.WrongType, "raw_xml_sha256")]
+    [InlineData(EvidenceSchemaMutation.MissingNotNull, "channel_name")]
+    [InlineData(EvidenceSchemaMutation.WrongPrimaryKey, "live_evidence_id")]
+    [InlineData(EvidenceSchemaMutation.MissingUnique, "live_session_id, received_sequence")]
+    [InlineData(EvidenceSchemaMutation.MissingForeignKey, "live_session_id")]
+    [InlineData(
+        EvidenceSchemaMutation.MissingUpdateTrigger,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.MissingDeleteTrigger,
+        "live_capture_records_no_delete")]
+    [InlineData(
+        EvidenceSchemaMutation.WrongTriggerBinding,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.TriggerWithoutRaise,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.ConditionalTrigger,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.ZeroRowRaiseWhere,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.ZeroRowRaiseLimit,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.ZeroRowRaiseFrom,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.CaseConditionalRaise,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.MultiStatementBody,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.RaiseIgnore,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.WrongTiming,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.WrongEvent,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.UpdateOfColumns,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.QuotedIdentifierHeaderDecoy,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.StringLiteralHeaderDecoy,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.CommentHeaderDecoy,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.WrongTriggerName,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.TriggerNameTakenByView,
+        "live_capture_records_no_update")]
+    [InlineData(EvidenceSchemaMutation.ExtraForeignKey, "channel_name")]
+    [InlineData(EvidenceSchemaMutation.CascadingForeignKey, "CASCADE")]
+    [InlineData(
+        EvidenceSchemaMutation.VirtualGeneratedColumn,
+        "shadow_outcome")]
+    [InlineData(
+        EvidenceSchemaMutation.StoredGeneratedColumn,
+        "shadow_channel")]
+    [InlineData(EvidenceSchemaMutation.MissingStrict, "live_capture_sessions")]
+    public async Task MalformedEvidenceSchemaFailsClosedWithSpecificObjectAndMigration(
+        EvidenceSchemaMutation mutation,
+        string expectedObject)
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(
+            location,
+            applyLiveMigration: true,
+            evidenceMigrationTransform: sql => MutateEvidenceMigration(sql, mutation));
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var before = await FileDigestAsync(location.DatabasePath);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => repository.ValidateSchemaAsync());
+
+        // A rejected schema is reported, never repaired.
+        Assert.Equal(before, await FileDigestAsync(location.DatabasePath));
+        Assert.Contains(expectedObject, exception.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            "db/migrations/0004_phase_2b_live_evidence.sql",
+            exception.Message,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "runtime structural readiness check",
+            exception.Message,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(
+            "does not prove database integrity, tamper resistance, or migration authenticity",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Naming the object is not enough: an operator has to be told which part of the
+    /// definition is wrong. A regression that rejected every trigger for the same reason
+    /// would still satisfy the object-name assertion, so the reason itself is pinned.
+    /// </summary>
+    [Theory]
+    [InlineData(EvidenceSchemaMutation.WrongTiming, "timing is not BEFORE")]
+    [InlineData(EvidenceSchemaMutation.WrongEvent, "event is not UPDATE")]
+    [InlineData(EvidenceSchemaMutation.UpdateOfColumns, "is not followed by ON")]
+    [InlineData(EvidenceSchemaMutation.ConditionalTrigger, "is not followed by BEGIN")]
+    [InlineData(EvidenceSchemaMutation.ZeroRowRaiseWhere, "is not closed by ');'")]
+    [InlineData(EvidenceSchemaMutation.ZeroRowRaiseLimit, "is not closed by ');'")]
+    [InlineData(EvidenceSchemaMutation.ZeroRowRaiseFrom, "is not closed by ');'")]
+    [InlineData(
+        EvidenceSchemaMutation.MultiStatementBody,
+        "does not begin with SELECT RAISE(ABORT")]
+    [InlineData(
+        EvidenceSchemaMutation.RaiseIgnore,
+        "does not begin with SELECT RAISE(ABORT")]
+    [InlineData(
+        EvidenceSchemaMutation.CaseConditionalRaise,
+        "does not begin with SELECT RAISE(ABORT")]
+    [InlineData(EvidenceSchemaMutation.WrongTriggerBinding, "it is bound to")]
+    [InlineData(EvidenceSchemaMutation.TriggerNameTakenByView, "is not a trigger")]
+    [InlineData(EvidenceSchemaMutation.QuotedIdentifierHeaderDecoy, "timing is not BEFORE")]
+    [InlineData(EvidenceSchemaMutation.WrongTriggerName, "required trigger is missing")]
+    public async Task MalformedTriggerNamesItsSpecificReason(
+        EvidenceSchemaMutation mutation,
+        string expectedReason)
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(
+            location,
+            applyLiveMigration: true,
+            evidenceMigrationTransform: sql => MutateEvidenceMigration(sql, mutation));
+        var repository = new SqliteLiveMonitoringRepository(location);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => repository.ValidateSchemaAsync());
+
+        Assert.Contains(expectedReason, exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The canonical check must reject rewritten guards without rejecting a guard that is
+    /// merely spelled differently. Case, whitespace, identifier quoting and the two inert
+    /// optional clauses are all semantics-preserving and must stay ready.
+    /// </summary>
+    [Theory]
+    [InlineData(
+        """
+        create trigger live_capture_records_no_update
+        before update on live_capture_records begin
+            select raise( ABORT , 'live_capture_records is append-only' ) ;
+        end;
+        """)]
+    [InlineData(
+        """
+        CREATE TRIGGER "live_capture_records_no_update"
+        BEFORE UPDATE ON [live_capture_records] BEGIN
+            SELECT RAISE(ABORT, 'live_capture_records is append-only');
+        END;
+        """)]
+    [InlineData(
+        """
+        CREATE TRIGGER live_capture_records_no_update
+        BEFORE UPDATE ON live_capture_records
+        FOR EACH ROW BEGIN
+            SELECT RAISE(ABORT, 'live_capture_records is append-only');
+        END;
+        """)]
+    [InlineData(
+        """
+        CREATE TRIGGER IF NOT EXISTS live_capture_records_no_update
+        BEFORE UPDATE ON live_capture_records BEGIN
+            SELECT RAISE(ABORT, 'it can say anything at all');
+        END;
+        """)]
+    public async Task SemanticallyIdenticalTriggerSpellingsStayReady(string trigger)
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(
+            location,
+            applyLiveMigration: true,
+            evidenceMigrationTransform: sql =>
+                ReplaceCanonicalRecordUpdate(sql, trigger));
+        var repository = new SqliteLiveMonitoringRepository(location);
+
+        await repository.ValidateSchemaAsync();
+
+        Assert.Equal(3, await CountLiveTablesAsync(location));
+    }
+
+    [Fact]
+    public async Task MalformedSummarySchemaNamesThe0003ObjectAndMigration()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(
+            location,
+            applyLiveMigration: true,
+            liveMigrationTransform: sql => ReplaceRequiredOnce(
+                sql,
+                "started_utc             TEXT NOT NULL,",
+                "started_utc             BLOB NOT NULL,"));
+        var repository = new SqliteLiveMonitoringRepository(location);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => repository.ValidateSchemaAsync());
+
+        Assert.Contains(
+            "live_monitoring_sessions",
+            exception.Message,
+            StringComparison.Ordinal);
+        Assert.Contains("started_utc", exception.Message, StringComparison.Ordinal);
+        Assert.Contains(
+            "db/migrations/0003_phase_2a_live_monitoring.sql",
+            exception.Message,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "0004_phase_2b_live_evidence.sql",
+            exception.Message,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadinessUsesReadOnlyConnectionAndContainsNoWritePath()
+    {
+        var source = await File.ReadAllTextAsync(Path.Combine(
+            RepositoryRoot.Value,
+            "src",
+            "DeleteAudit.Infrastructure",
+            "LiveMonitoring",
+            "SqliteLiveMonitoringRepository.cs"));
+        var start = source.IndexOf(
+            "public async Task ValidateSchemaAsync",
+            StringComparison.Ordinal);
+        var end = source.IndexOf(
+            "public async Task StartCaptureSessionAsync",
+            start,
+            StringComparison.Ordinal);
+
+        Assert.True(start >= 0);
+        Assert.True(end > start);
+        var readinessPath = source[start..end];
+        Assert.Contains(
+            "_location.CreateReadOnlyConnection()",
+            readinessPath,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "OpenWritableAsync",
+            readinessPath,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "ExecuteNonQuery",
+            readinessPath,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ReadinessLeavesSchemaAndBusinessDataUnchanged()
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        await repository.StartCaptureSessionAsync(new LiveCaptureSessionStart(
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            StartedUtc,
+            2048,
+            "readiness-snapshot"));
+        var before = await ReadReadinessSnapshotAsync(location);
+
+        await repository.ValidateSchemaAsync();
+
+        Assert.Equal(before, await ReadReadinessSnapshotAsync(location));
+    }
+
     [Fact]
     public async Task SessionChannelsAndDiagnosticsArePersistedExactly()
     {
@@ -600,6 +881,103 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         Assert.Equal(8, exception.SqliteErrorCode);
     }
 
+    /// <summary>
+    /// REPLACE conflict resolution deletes the conflicting row. With recursive_triggers
+    /// off that delete does not fire the append-only trigger, so no production path may
+    /// use it — checked across the whole of src, not just this repository.
+    /// </summary>
+    [Fact]
+    public async Task NoProductionSqlUsesReplaceConflictResolution()
+    {
+        var sourceRoot = Path.Combine(RepositoryRoot.Value, "src");
+        var offenders = new List<string>();
+        foreach (var file in Directory.EnumerateFiles(
+                     sourceRoot,
+                     "*.cs",
+                     SearchOption.AllDirectories))
+        {
+            var text = await File.ReadAllTextAsync(file);
+            foreach (var forbidden in new[]
+                     {
+                         "INSERT OR REPLACE", "REPLACE INTO", "INSERT OR IGNORE"
+                     })
+            {
+                if (text.Contains(forbidden, StringComparison.OrdinalIgnoreCase))
+                {
+                    offenders.Add($"{Path.GetFileName(file)}: {forbidden}");
+                }
+            }
+        }
+
+        Assert.Empty(offenders);
+    }
+
+    /// <summary>
+    /// Proves the guard is real rather than declarative: with the connection the
+    /// repository actually opens, a REPLACE that would silently drop committed evidence
+    /// is aborted by the append-only delete trigger.
+    /// </summary>
+    [Fact]
+    public async Task ReplaceOnCommittedEvidenceIsAbortedByTheAppendOnlyGuard()
+    {
+        const string OriginalXml = "<Event original=\"true\" />";
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var sessionId = await StartCaptureAsync(repository);
+        await repository.AppendRecordsAsync(
+            [CaptureRecord(sessionId, 1, OriginalXml)]);
+
+        await using var connection = CreateWritableConnection(location.DatabasePath);
+        await connection.OpenAsync();
+        using (var pragma = connection.CreateCommand())
+        {
+            // The same settings the repository's own write connection uses.
+            pragma.CommandText = """
+                PRAGMA foreign_keys = ON;
+                PRAGMA recursive_triggers = ON;
+                """;
+            await pragma.ExecuteNonQueryAsync();
+        }
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT OR REPLACE INTO live_capture_records (
+                live_evidence_id, live_session_id, received_sequence, channel_name,
+                observed_utc, raw_xml, raw_xml_sha256, outcome)
+            VALUES ($id, $session, 1, 'Microsoft-Windows-Sysmon/Operational',
+                    '2026-07-25T09:00:00.0000000+00:00', '<Event />', $digest, 'ignored');
+            """;
+        command.Parameters.AddWithValue("$id", LiveEvidenceIdentity.Create(sessionId, 1));
+        command.Parameters.AddWithValue("$session", sessionId);
+        command.Parameters.Add("$digest", SqliteType.Blob).Value =
+            SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("<Event />"));
+
+        var exception = await Assert.ThrowsAsync<SqliteException>(
+            () => command.ExecuteNonQueryAsync());
+
+        Assert.Contains("append-only", exception.Message, StringComparison.OrdinalIgnoreCase);
+        // The committed evidence is untouched.
+        var stored = await ReadSingleRawXmlAsync(
+            location,
+            LiveEvidenceIdentity.Create(sessionId, 1));
+        Assert.Equal(OriginalXml, stored);
+    }
+
+    private static async Task<string?> ReadSingleRawXmlAsync(
+        ViewerDataLocation location,
+        string liveEvidenceId)
+    {
+        await using var connection = location.CreateReadOnlyConnection();
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT raw_xml FROM live_capture_records WHERE live_evidence_id = $id;
+            """;
+        command.Parameters.AddWithValue("$id", liveEvidenceId);
+        return await command.ExecuteScalarAsync() as string;
+    }
+
     [Fact]
     public async Task MigrationFileDoesNotTouchExistingSchemaObjects()
     {
@@ -684,7 +1062,9 @@ public sealed class SqliteLiveMonitoringRepositoryTests
     private static async Task CreateDatabaseAsync(
         ViewerDataLocation location,
         bool applyLiveMigration,
-        bool? applyEvidenceMigration = null)
+        bool? applyEvidenceMigration = null,
+        Func<string, string>? liveMigrationTransform = null,
+        Func<string, string>? evidenceMigrationTransform = null)
     {
         await using var connection = CreateWritableConnection(location.DatabasePath);
         await connection.OpenAsync();
@@ -697,20 +1077,278 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         };
         if (applyLiveMigration)
         {
-            scripts.Add(await File.ReadAllTextAsync(
-                Path.Combine(fixtures, "0003_phase_2a_live_monitoring.sql")));
+            var migration = (await File.ReadAllTextAsync(
+                    Path.Combine(fixtures, "0003_phase_2a_live_monitoring.sql")))
+                .ReplaceLineEndings("\n");
+            scripts.Add(liveMigrationTransform?.Invoke(migration) ?? migration);
         }
 
         if (applyEvidenceMigration ?? applyLiveMigration)
         {
-            scripts.Add(await File.ReadAllTextAsync(
-                Path.Combine(fixtures, "0004_phase_2b_live_evidence.sql")));
+            var migration = (await File.ReadAllTextAsync(
+                    Path.Combine(fixtures, "0004_phase_2b_live_evidence.sql")))
+                .ReplaceLineEndings("\n");
+            scripts.Add(evidenceMigrationTransform?.Invoke(migration) ?? migration);
         }
 
         using var command = connection.CreateCommand();
         command.CommandText = string.Join(Environment.NewLine, scripts);
         await command.ExecuteNonQueryAsync();
     }
+
+    private static string MutateEvidenceMigration(
+        string migration,
+        EvidenceSchemaMutation mutation) =>
+        mutation switch
+        {
+            EvidenceSchemaMutation.MissingColumn => ReplaceRequiredOnce(
+                migration,
+                "    provider_name           TEXT,\n",
+                string.Empty),
+            EvidenceSchemaMutation.WrongType => ReplaceRequiredOnce(
+                migration,
+                "    raw_xml_sha256          BLOB NOT NULL",
+                "    raw_xml_sha256          TEXT NOT NULL"),
+            EvidenceSchemaMutation.MissingNotNull => ReplaceRequiredOnce(
+                migration,
+                "    channel_name            TEXT NOT NULL",
+                "    channel_name            TEXT"),
+            EvidenceSchemaMutation.WrongPrimaryKey => ReplaceRequiredOnce(
+                migration,
+                "    live_evidence_id        TEXT PRIMARY KEY,",
+                "    live_evidence_id        TEXT NOT NULL,"),
+            EvidenceSchemaMutation.MissingUnique => ReplaceRequiredOnce(
+                migration,
+                ",\n    UNIQUE (live_session_id, received_sequence)",
+                string.Empty),
+            EvidenceSchemaMutation.MissingForeignKey => ReplaceRequiredOnce(
+                migration,
+                """
+                CREATE TABLE live_capture_records (
+                    live_evidence_id        TEXT PRIMARY KEY,
+                    live_session_id         TEXT NOT NULL
+                                                REFERENCES live_capture_sessions(live_session_id),
+                """,
+                """
+                CREATE TABLE live_capture_records (
+                    live_evidence_id        TEXT PRIMARY KEY,
+                    live_session_id         TEXT NOT NULL,
+                """),
+            EvidenceSchemaMutation.MissingUpdateTrigger => ReplaceRequiredOnce(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                BEFORE UPDATE ON live_capture_records BEGIN
+                    SELECT RAISE(ABORT, 'live_capture_records is append-only');
+                END;
+                """,
+                string.Empty),
+            EvidenceSchemaMutation.MissingDeleteTrigger => ReplaceRequiredOnce(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_delete
+                BEFORE DELETE ON live_capture_records BEGIN
+                    SELECT RAISE(ABORT, 'live_capture_records is append-only');
+                END;
+                """,
+                string.Empty),
+            EvidenceSchemaMutation.WrongTriggerBinding => ReplaceRequiredOnce(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                BEFORE UPDATE ON live_capture_records
+                """,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                BEFORE UPDATE ON live_capture_sessions
+                """),
+            EvidenceSchemaMutation.TriggerWithoutRaise => ReplaceRequiredOnce(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                BEFORE UPDATE ON live_capture_records BEGIN
+                    SELECT RAISE(ABORT, 'live_capture_records is append-only');
+                END;
+                """,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                BEFORE UPDATE ON live_capture_records BEGIN
+                    SELECT 1;
+                END;
+                """),
+            EvidenceSchemaMutation.ConditionalTrigger => ReplaceRequiredOnce(
+                migration,
+                "BEFORE UPDATE ON live_capture_records BEGIN",
+                "BEFORE UPDATE ON live_capture_records WHEN 1 = 1 BEGIN"),
+            // A RAISE that can never be reached is decoration, not a guard. Each of the
+            // following creates cleanly and leaves UPDATE working.
+            EvidenceSchemaMutation.ZeroRowRaiseWhere => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT RAISE(ABORT, 'live_capture_records is append-only') WHERE 0;"),
+            EvidenceSchemaMutation.ZeroRowRaiseLimit => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT RAISE(ABORT, 'live_capture_records is append-only') LIMIT 0;"),
+            EvidenceSchemaMutation.ZeroRowRaiseFrom => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT RAISE(ABORT, 'live_capture_records is append-only')\n"
+                + "        FROM (SELECT 1) WHERE 0;"),
+            EvidenceSchemaMutation.CaseConditionalRaise => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT CASE WHEN 0 THEN RAISE(ABORT, 'live_capture_records is append-only')\n"
+                + "        END;"),
+            EvidenceSchemaMutation.MultiStatementBody => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT 1;\n"
+                + "    SELECT RAISE(ABORT, 'live_capture_records is append-only');"),
+            EvidenceSchemaMutation.RaiseIgnore => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT RAISE(IGNORE);"),
+            EvidenceSchemaMutation.WrongTiming => ReplaceRequiredOnce(
+                migration,
+                "BEFORE UPDATE ON live_capture_records BEGIN",
+                "AFTER UPDATE ON live_capture_records BEGIN"),
+            EvidenceSchemaMutation.WrongEvent => ReplaceRequiredOnce(
+                migration,
+                "BEFORE UPDATE ON live_capture_records BEGIN",
+                "BEFORE INSERT ON live_capture_records BEGIN"),
+            // A column-scoped UPDATE trigger leaves every other column unguarded.
+            EvidenceSchemaMutation.UpdateOfColumns => ReplaceRequiredOnce(
+                migration,
+                "BEFORE UPDATE ON live_capture_records BEGIN",
+                "BEFORE UPDATE OF raw_xml ON live_capture_records BEGIN"),
+            // Header tokens hidden inside a quoted identifier, a string literal and a
+            // comment. None of them makes the trigger guard UPDATE.
+            EvidenceSchemaMutation.QuotedIdentifierHeaderDecoy => ReplaceCanonicalRecordUpdate(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                AFTER DELETE ON live_capture_records BEGIN
+                    SELECT RAISE(ABORT, 'decoy')
+                        FROM (SELECT 1 AS "BEFORE UPDATE ON live_capture_records");
+                END;
+                """),
+            EvidenceSchemaMutation.StringLiteralHeaderDecoy => ReplaceCanonicalRecordUpdate(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                AFTER DELETE ON live_capture_records BEGIN
+                    SELECT RAISE(ABORT, 'BEFORE UPDATE ON live_capture_records');
+                END;
+                """),
+            EvidenceSchemaMutation.CommentHeaderDecoy => ReplaceCanonicalRecordUpdate(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                AFTER DELETE ON live_capture_records BEGIN
+                    -- BEFORE UPDATE ON live_capture_records
+                    SELECT RAISE(ABORT, 'decoy');
+                END;
+                """),
+            EvidenceSchemaMutation.WrongTriggerName => ReplaceRequiredOnce(
+                migration,
+                "CREATE TRIGGER live_capture_records_no_update",
+                "CREATE TRIGGER live_capture_records_no_update_v2"),
+            // The name exists, but it belongs to a view rather than a trigger.
+            EvidenceSchemaMutation.TriggerNameTakenByView => ReplaceCanonicalRecordUpdate(
+                migration,
+                "CREATE VIEW live_capture_records_no_update AS SELECT 1 AS ok;"),
+            // An extra key the canonical shape does not declare.
+            EvidenceSchemaMutation.ExtraForeignKey => ReplaceRequiredOnce(
+                migration,
+                "    UNIQUE (live_session_id, received_sequence)",
+                "    FOREIGN KEY (channel_name)\n"
+                + "        REFERENCES live_capture_sessions(live_session_id),\n"
+                + "    UNIQUE (live_session_id, received_sequence)"),
+            // The required key, but with a referential action that silently repairs data.
+            EvidenceSchemaMutation.CascadingForeignKey => ReplaceRequiredOnce(
+                migration,
+                "                                REFERENCES live_capture_sessions(live_session_id),\n"
+                + "    -- Assigned on the delivery thread",
+                "                                REFERENCES live_capture_sessions(live_session_id)\n"
+                + "                                ON DELETE CASCADE,\n"
+                + "    -- Assigned on the delivery thread"),
+            // pragma_table_info hides these; only pragma_table_xinfo reports them.
+            EvidenceSchemaMutation.VirtualGeneratedColumn => ReplaceRequiredOnce(
+                migration,
+                "    UNIQUE (live_session_id, received_sequence)",
+                "    shadow_outcome          TEXT GENERATED ALWAYS AS (outcome) VIRTUAL,\n"
+                + "    UNIQUE (live_session_id, received_sequence)"),
+            EvidenceSchemaMutation.StoredGeneratedColumn => ReplaceRequiredOnce(
+                migration,
+                "    UNIQUE (live_session_id, received_sequence)",
+                "    shadow_channel          TEXT GENERATED ALWAYS AS (channel_name) STORED,\n"
+                + "    UNIQUE (live_session_id, received_sequence)"),
+            EvidenceSchemaMutation.MissingStrict => ReplaceRequiredOnce(
+                migration,
+                """
+                    application_version     TEXT NOT NULL CHECK (length(application_version) > 0)
+                ) STRICT;
+                """,
+                """
+                    application_version     TEXT NOT NULL CHECK (length(application_version) > 0)
+                );
+                """),
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(mutation),
+                mutation,
+                null)
+        };
+
+    private static string ReplaceRequiredOnce(
+        string source,
+        string oldValue,
+        string newValue)
+    {
+        var index = source.IndexOf(oldValue, StringComparison.Ordinal);
+        Assert.True(
+            index >= 0,
+            $"The fixture text to mutate was not found: {oldValue}");
+        Assert.Equal(
+            -1,
+            source.IndexOf(
+                oldValue,
+                index + oldValue.Length,
+                StringComparison.Ordinal));
+        return string.Concat(
+            source.AsSpan(0, index),
+            newValue,
+            source.AsSpan(index + oldValue.Length));
+    }
+
+    private static async Task<string> FileDigestAsync(string path)
+    {
+        var bytes = await File.ReadAllBytesAsync(path);
+        return Convert.ToHexString(SHA256.HashData(bytes));
+    }
+
+    /// <summary>
+    /// The canonical append-only UPDATE trigger for live_capture_records, exactly as
+    /// 0004 declares it. Mutations are expressed as replacements of this text so a
+    /// fixture can never drift away from the real migration unnoticed.
+    /// </summary>
+    private const string CanonicalRecordUpdateTrigger =
+        """
+        CREATE TRIGGER live_capture_records_no_update
+        BEFORE UPDATE ON live_capture_records BEGIN
+            SELECT RAISE(ABORT, 'live_capture_records is append-only');
+        END;
+        """;
+
+    private static string ReplaceCanonicalRecordUpdate(
+        string migration,
+        string replacement) =>
+        ReplaceRequiredOnce(migration, CanonicalRecordUpdateTrigger, replacement);
+
+    /// <summary>Keeps the canonical header and swaps only the trigger body.</summary>
+    private static string ReplaceCanonicalRecordUpdateBody(
+        string migration,
+        string body) =>
+        ReplaceCanonicalRecordUpdate(
+            migration,
+            "CREATE TRIGGER live_capture_records_no_update\n"
+            + "BEFORE UPDATE ON live_capture_records BEGIN\n"
+            + $"    {body}\n"
+            + "END;");
 
     private static SqliteConnection CreateWritableConnection(string databasePath) =>
         new(new SqliteConnectionStringBuilder
@@ -950,6 +1588,94 @@ public sealed class SqliteLiveMonitoringRepositoryTests
 
         return Convert.ToHexString(
             SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(builder.ToString())));
+    }
+
+    private static async Task<string> ReadReadinessSnapshotAsync(
+        ViewerDataLocation location)
+    {
+        await using var connection = location.CreateReadOnlyConnection();
+        await connection.OpenAsync();
+        var builder = new System.Text.StringBuilder();
+        using (var schema = connection.CreateCommand())
+        {
+            schema.CommandText = """
+                SELECT type, name, tbl_name, COALESCE(sql, '')
+                FROM sqlite_master
+                WHERE name LIKE 'live_%'
+                ORDER BY type, name;
+                """;
+            await using var reader = await schema.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                for (var ordinal = 0; ordinal < reader.FieldCount; ordinal++)
+                {
+                    builder
+                        .Append(reader.GetString(ordinal))
+                        .Append('\u001f');
+                }
+
+                builder.Append('\u001e');
+            }
+        }
+
+        using (var data = connection.CreateCommand())
+        {
+            data.CommandText = """
+                SELECT live_session_id, started_utc, queue_capacity, application_version
+                FROM live_capture_sessions
+                ORDER BY live_session_id;
+                """;
+            await using var reader = await data.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                builder
+                    .Append(reader.GetString(0))
+                    .Append('\u001f')
+                    .Append(reader.GetString(1))
+                    .Append('\u001f')
+                    .Append(reader.GetInt64(2))
+                    .Append('\u001f')
+                    .Append(reader.GetString(3))
+                    .Append('\u001e');
+            }
+        }
+
+        return Convert.ToHexString(
+            SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(builder.ToString())));
+    }
+
+    public enum EvidenceSchemaMutation
+    {
+        MissingColumn,
+        WrongType,
+        MissingNotNull,
+        WrongPrimaryKey,
+        MissingUnique,
+        MissingForeignKey,
+        MissingUpdateTrigger,
+        MissingDeleteTrigger,
+        WrongTriggerBinding,
+        TriggerWithoutRaise,
+        ConditionalTrigger,
+        ZeroRowRaiseWhere,
+        ZeroRowRaiseLimit,
+        ZeroRowRaiseFrom,
+        CaseConditionalRaise,
+        MultiStatementBody,
+        RaiseIgnore,
+        WrongTiming,
+        WrongEvent,
+        UpdateOfColumns,
+        QuotedIdentifierHeaderDecoy,
+        StringLiteralHeaderDecoy,
+        CommentHeaderDecoy,
+        WrongTriggerName,
+        TriggerNameTakenByView,
+        ExtraForeignKey,
+        CascadingForeignKey,
+        VirtualGeneratedColumn,
+        StoredGeneratedColumn,
+        MissingStrict
     }
 
     private sealed record StoredSession(

@@ -13,6 +13,355 @@ public sealed class LiveMonitoringServiceTests
 {
     private static readonly TimeSpan Patience = TimeSpan.FromSeconds(10);
 
+    // ---------- deterministic timer support ----------
+
+    [Fact]
+    public void CaptureFlushIntervalIsFixedAndPositive()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(5), LiveMonitoringLimits.CaptureFlushInterval);
+        Assert.True(LiveMonitoringLimits.CaptureFlushInterval > TimeSpan.Zero);
+    }
+
+    [Fact]
+    public async Task ManualTimerDoesNotFireBeforeItsDueTimeAndFiresAtTheDeadline()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        var callbackCount = 0;
+        using var timer = time.CreateTimer(
+            _ => Interlocked.Increment(ref callbackCount),
+            null,
+            TimeSpan.FromSeconds(5),
+            Timeout.InfiniteTimeSpan);
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(4));
+        Assert.Equal(0, callbackCount);
+        Assert.Equal(1, time.ActiveTimerCount);
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(1, callbackCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task DisposedManualTimerNeverFires()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        var callbackCount = 0;
+        var timer = time.CreateTimer(
+            _ => Interlocked.Increment(ref callbackCount),
+            null,
+            TimeSpan.FromSeconds(5),
+            Timeout.InfiniteTimeSpan);
+
+        timer.Dispose();
+        await time.AdvanceAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(0, callbackCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task ConcurrentDisposeWaitsForACommittedCallbackBeforeReturning()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        using var callbackCommitted = new ManualResetEventSlim(false);
+        using var releaseCallback = new ManualResetEventSlim(false);
+        using var disposeWaiting = new ManualResetEventSlim(false);
+        var callbackCount = 0;
+        var callbackWaitTimedOut = 0;
+        time.BeforeTimerCallback = () =>
+        {
+            callbackCommitted.Set();
+            if (!releaseCallback.Wait(Patience))
+            {
+                Interlocked.Exchange(ref callbackWaitTimedOut, 1);
+            }
+        };
+        time.BeforeTimerDisposeWait = disposeWaiting.Set;
+        var timer = time.CreateTimer(
+            _ => Interlocked.Increment(ref callbackCount),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var advancing = time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        Assert.True(callbackCommitted.Wait(Patience));
+        var disposing = Task.Run(() =>
+        {
+            timer.Dispose();
+        });
+        Assert.True(disposeWaiting.Wait(Patience));
+        Assert.False(disposing.IsCompleted);
+
+        releaseCallback.Set();
+        await Task.WhenAll(advancing, disposing);
+        await time.AdvanceAsync(TimeSpan.FromDays(1));
+
+        Assert.Equal(1, callbackCount);
+        Assert.Equal(0, callbackWaitTimedOut);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task CancellingProviderBackedDelayRemovesItsTimer()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        using var cancellation = new CancellationTokenSource();
+        var delay = Task.Delay(
+            TimeSpan.FromSeconds(5),
+            time,
+            cancellation.Token);
+
+        await cancellation.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => delay);
+        await time.AdvanceAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(delay.IsCanceled);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task ManualTimersFireInDueTimeThenRegistrationOrder()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        var order = new List<string>();
+        using var laterFirst = time.CreateTimer(
+            _ => order.Add("five-first"),
+            null,
+            TimeSpan.FromSeconds(5),
+            Timeout.InfiniteTimeSpan);
+        using var earlier = time.CreateTimer(
+            _ => order.Add("three"),
+            null,
+            TimeSpan.FromSeconds(3),
+            Timeout.InfiniteTimeSpan);
+        using var laterSecond = time.CreateTimer(
+            _ => order.Add("five-second"),
+            null,
+            TimeSpan.FromSeconds(5),
+            Timeout.InfiniteTimeSpan);
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(["three", "five-first", "five-second"], order);
+    }
+
+    [Fact]
+    public async Task ManualTimerCallbackDoesNotReenterTheAdvancingThread()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        var advancingThread = Environment.CurrentManagedThreadId;
+        var callbackThread = 0;
+        using var timer = time.CreateTimer(
+            _ => callbackThread = Environment.CurrentManagedThreadId,
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+
+        Assert.NotEqual(0, callbackThread);
+        Assert.NotEqual(advancingThread, callbackThread);
+    }
+
+    [Fact]
+    public async Task ManualOneShotTimerFiresOnlyOnce()
+    {
+        var time = new ManualTimerTimeProvider(
+            new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
+        var callbackCount = 0;
+        using var timer = time.CreateTimer(
+            _ => Interlocked.Increment(ref callbackCount),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await time.AdvanceAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(1, callbackCount);
+    }
+
+    // ---------- manual clock failure handling ----------
+
+    [Fact]
+    public async Task ThrowingTimerCallbackFaultsItsOwnAdvance()
+    {
+        var time = CaptureTime();
+        var failure = new InvalidOperationException("fixture callback failure");
+        using var timer = time.CreateTimer(
+            _ => throw failure,
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var advancing = time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => advancing.WaitAsync(Patience));
+
+        // Faulted, not hung, and carrying the original failure.
+        Assert.Same(failure, thrown);
+        Assert.True(advancing.IsFaulted);
+    }
+
+    [Fact]
+    public async Task ThrowingBeforeTimerCallbackHookIsObservable()
+    {
+        var time = CaptureTime();
+        var failure = new InvalidOperationException("fixture hook failure");
+        time.BeforeTimerCallback = () => throw failure;
+        var fired = 0;
+        using var timer = time.CreateTimer(
+            _ => Interlocked.Increment(ref fired),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience));
+
+        Assert.Same(failure, thrown);
+        // The hook threw before the callback body, so the timer never ran.
+        Assert.Equal(0, fired);
+    }
+
+    [Fact]
+    public async Task DispatcherRecoversAndLaterAdvancesAreUnaffected()
+    {
+        var time = CaptureTime();
+        using (var failing = time.CreateTimer(
+            _ => throw new InvalidOperationException("fixture callback failure"),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan))
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience));
+        }
+
+        // An advance with nothing due must still complete, proving the dispatcher was
+        // released rather than latched on by the earlier failure.
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience);
+
+        var fired = 0;
+        using var healthy = time.CreateTimer(
+            _ => Interlocked.Increment(ref fired),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        // A brand new timer still fires, and its advance does not inherit the old failure.
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience);
+
+        Assert.Equal(1, fired);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task EveryDueCallbackRunsAndAllFailuresReachTheSameAdvance()
+    {
+        var time = CaptureTime();
+        var firstFailure = new InvalidOperationException("fixture failure one");
+        var secondFailure = new InvalidOperationException("fixture failure two");
+        var survivorRan = 0;
+        using var failingFirst = time.CreateTimer(
+            _ => throw firstFailure,
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+        using var survivor = time.CreateTimer(
+            _ => Interlocked.Increment(ref survivorRan),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+        using var failingLast = time.CreateTimer(
+            _ => throw secondFailure,
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var thrown = await Assert.ThrowsAsync<AggregateException>(
+            () => time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience));
+
+        // One failure never cancels the rest of the advancement.
+        Assert.Equal(1, survivorRan);
+        Assert.Equal([firstFailure, secondFailure], thrown.InnerExceptions);
+    }
+
+    [Fact]
+    public async Task QueuedAdvancesStillCompleteAfterAnEarlierCallbackFails()
+    {
+        var time = CaptureTime();
+        var reachedCallback = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim(false);
+        using var failing = time.CreateTimer(
+            _ =>
+            {
+                reachedCallback.TrySetResult();
+                release.Wait(Patience);
+                throw new InvalidOperationException("fixture callback failure");
+            },
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var failingAdvance = time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await reachedCallback.Task.WaitAsync(Patience);
+
+        // Queued behind the failing callback while the dispatcher is still busy.
+        var queuedAdvance = time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        release.Set();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => failingAdvance.WaitAsync(Patience));
+        // The later marker is neither lost nor poisoned by the earlier failure.
+        await queuedAdvance.WaitAsync(Patience);
+
+        Assert.True(queuedAdvance.IsCompletedSuccessfully);
+    }
+
+    [Fact]
+    public async Task DisposeRacingAThrowingCallbackNeitherDeadlocksNorLosesTheMarker()
+    {
+        var time = CaptureTime();
+        var reachedCallback = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var disposeWaiting = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim(false);
+        time.BeforeTimerDisposeWait = () => disposeWaiting.TrySetResult();
+        var timer = time.CreateTimer(
+            _ =>
+            {
+                reachedCallback.TrySetResult();
+                release.Wait(Patience);
+                throw new InvalidOperationException("fixture callback failure");
+            },
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var advancing = time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await reachedCallback.Task.WaitAsync(Patience);
+        var disposing = Task.Run(timer.Dispose);
+        await disposeWaiting.Task.WaitAsync(Patience);
+        release.Set();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => advancing.WaitAsync(Patience));
+        await disposing.WaitAsync(Patience);
+
+        Assert.Equal(0, time.ActiveTimerCount);
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience);
+    }
+
     // ---------- channel detection ----------
 
     [Fact]
@@ -1063,6 +1412,435 @@ public sealed class LiveMonitoringServiceTests
     }
 
     [Fact]
+    public async Task SingleRecordFlushesWhenItsDeadlineExpiresWithoutStop()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        Assert.Equal(0, repository.AppendCount);
+        Assert.Equal(1, time.CreatedTimerCount);
+        await time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        Assert.Equal([1], repository.BatchSizes);
+        Assert.Single(repository.Records);
+        Assert.Equal(LiveMonitoringState.Running, service.Snapshot.State);
+        Assert.Equal(0, time.ActiveTimerCount);
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task SixtyThreeRecordsFlushTogetherAtTheDeadlineWithoutStop()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        for (var index = 1;
+             index < LiveMonitoringLimits.MaxCaptureBatchRecords;
+             index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        observer.WaitForCount(
+            LiveMonitoringLimits.MaxCaptureBatchRecords - 1,
+            Patience);
+        Assert.Equal(0, repository.AppendCount);
+        Assert.Equal(1, time.CreatedTimerCount);
+
+        await time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        Assert.Equal([LiveMonitoringLimits.MaxCaptureBatchRecords - 1], repository.BatchSizes);
+        Assert.Equal(
+            LiveMonitoringLimits.MaxCaptureBatchRecords - 1,
+            repository.Records.Count);
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task FullBatchFlushesImmediatelyWithoutAdvancingTime()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        for (var index = 1;
+             index <= LiveMonitoringLimits.MaxCaptureBatchRecords;
+             index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        observer.WaitForCount(LiveMonitoringLimits.MaxCaptureBatchRecords, Patience);
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        Assert.Equal([LiveMonitoringLimits.MaxCaptureBatchRecords], repository.BatchSizes);
+        Assert.Equal(1, time.CreatedTimerCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task LaterRecordsDoNotResetTheFirstRecordDeadline()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        for (var second = 1; second <= 4; second++)
+        {
+            await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(second + 1)));
+            observer.WaitForCount(second + 1, Patience);
+            Assert.Equal(1, time.CreatedTimerCount);
+            Assert.Equal(0, repository.AppendCount);
+        }
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        Assert.Equal([5], repository.BatchSizes);
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task FullBatchAndDeadlineRaceNeverDuplicatesEvidence()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        for (var index = 1;
+             index < LiveMonitoringLimits.MaxCaptureBatchRecords;
+             index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        observer.WaitForCount(
+            LiveMonitoringLimits.MaxCaptureBatchRecords - 1,
+            Patience);
+        var advancing = time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(
+                LiveMonitoringLimits.MaxCaptureBatchRecords)));
+        observer.WaitForCount(LiveMonitoringLimits.MaxCaptureBatchRecords, Patience);
+        await advancing;
+        await service.StopAsync();
+
+        Assert.Equal(
+            LiveMonitoringLimits.MaxCaptureBatchRecords,
+            repository.Records.Count);
+        Assert.Equal(
+            LiveMonitoringLimits.MaxCaptureBatchRecords,
+            repository.Records.Select(record => record.ReceivedSequence).Distinct().Count());
+        Assert.Equal(
+            LiveMonitoringLimits.MaxCaptureBatchRecords,
+            repository.BatchSizes.Sum());
+        Assert.Single(repository.Completions);
+    }
+
+    [Fact]
+    public async Task AdvancingTimeWithAnEmptyBatchNeverCallsAppend()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out _,
+            out var repository,
+            timeProvider: time);
+        await service.StartAsync();
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(0, time.CreatedTimerCount);
+        Assert.Equal(0, repository.AppendCount);
+        await service.StopAsync();
+        Assert.Equal(0, repository.AppendCount);
+    }
+
+    [Fact]
+    public async Task StopAndDeadlineRaceFlushAndCompleteExactlyOnce()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        var watcher = source.Watcher(0);
+        watcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        var advancing = time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        var stopping = service.StopAsync();
+        await Task.WhenAll(advancing, stopping);
+
+        Assert.Single(repository.Records);
+        Assert.Equal(1, repository.AppendCount);
+        Assert.Single(repository.Completions);
+        Assert.Single(repository.Sessions);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task SourceFaultBeforeDeadlineFlushesWithoutAdvancingTime()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        source.Fault("live_watcher_failed", "fixture fault before deadline");
+        await service.StopAsync();
+
+        Assert.Single(repository.Records);
+        Assert.Single(repository.Completions);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Equal(1, time.CreatedTimerCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task SourceFaultAndDeadlineRaceEndsInErrorWithoutDuplicateEvidence()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        var watcher = source.Watcher(0);
+        watcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        var advancing = time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        source.Fault("live_watcher_failed", "fixture deadline race");
+        await advancing;
+        await service.StopAsync();
+
+        Assert.Single(repository.Records);
+        Assert.Single(repository.Completions);
+        Assert.Equal(
+            LiveMonitoringState.Error,
+            Assert.Single(repository.Sessions).FinalState);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task PersistenceFaultAtDeadlineCreatesNoFurtherAppendOrDeadline()
+    {
+        var time = CaptureTime();
+        var source = new FakeLiveEventSource();
+        var repository = new FakeRepository
+        {
+            AppendException = new InvalidOperationException(
+                "fixture timed append failure")
+        };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        var watcher = source.Watcher(0);
+        watcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        await time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        await WaitForAsync(() => repository.AppendCount == 1);
+        await service.StopAsync();
+        var timersAfterFault = time.CreatedTimerCount;
+        watcher.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(2)));
+
+        Assert.Equal(1, repository.AppendCount);
+        Assert.Equal(timersAfterFault, time.CreatedTimerCount);
+        Assert.Empty(repository.Records);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task DisposeAndDeadlineRaceLeavesNoWatcherConsumerOrTimer()
+    {
+        var time = CaptureTime();
+        var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        var advancing = time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        var disposing = service.DisposeAsync().AsTask();
+        await Task.WhenAll(advancing, disposing);
+
+        Assert.Single(repository.Records);
+        Assert.Single(repository.Completions);
+        Assert.Equal(0, source.LiveWatcherCount);
+        Assert.Equal(1, source.DisposeCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+        Assert.True(service.LifecycleCompleted);
+    }
+
+    [Fact]
+    public async Task ChannelCompletionBeforeDeadlineFlushesImmediately()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        await service.StopAsync();
+
+        Assert.Single(repository.Records);
+        Assert.Equal([1], repository.BatchSizes);
+        Assert.Equal(1, time.CreatedTimerCount);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task NextPartialBatchGetsANewDeadlineFromItsFirstRecord()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        await time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(2)));
+        observer.WaitForCount(2, Patience);
+        Assert.Equal(2, time.CreatedTimerCount);
+        await time.AdvanceAsync(LiveMonitoringLimits.CaptureFlushInterval);
+        await WaitForAsync(() => repository.AppendCount == 2);
+
+        Assert.Equal([1, 1], repository.BatchSizes);
+        await service.StopAsync();
+    }
+
+    [Fact]
+    public async Task StableLowTrafficProducesTwoFixedDeadlineCycles()
+    {
+        var time = CaptureTime();
+        await using var service = CreateService(
+            FakeProbe.AllAvailable(),
+            out var source,
+            out var repository,
+            timeProvider: time);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+        for (var second = 1; second <= 4; second++)
+        {
+            await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(second + 1)));
+            observer.WaitForCount(second + 1, Patience);
+        }
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await WaitForAsync(() => repository.AppendCount == 1);
+
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(6)));
+        observer.WaitForCount(6, Patience);
+        for (var second = 6; second <= 9; second++)
+        {
+            await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(second + 1)));
+            observer.WaitForCount(second + 1, Patience);
+        }
+
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await WaitForAsync(() => repository.AppendCount == 2);
+
+        Assert.Equal([5, 5], repository.BatchSizes);
+        Assert.Equal(2, time.CreatedTimerCount);
+        Assert.Equal(10, repository.Records.Count);
+        await service.StopAsync();
+    }
+
+    [Fact]
     public async Task EachRecordIsParsedOnceAndCarriesItsParserIdentity()
     {
         await using var service = CreateService(
@@ -1300,6 +2078,275 @@ public sealed class LiveMonitoringServiceTests
         Assert.Single(repository.Starts);
     }
 
+    [Fact]
+    public async Task AppendFaultRemainsLastErrorWhenCompletionAlsoFails()
+    {
+        const string AppendFailure = "specific append failure A";
+        const string CompletionFailure = "generic completion failure B";
+        var repository = new FakeRepository
+        {
+            AppendException = new InvalidOperationException(AppendFailure),
+            SaveException = new InvalidOperationException(CompletionFailure)
+        };
+        var source = new FakeLiveEventSource();
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        using var observer = new ClassificationObserver(service);
+        await service.StartAsync();
+        source.Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(1)));
+        observer.WaitForCount(1, Patience);
+
+        await service.StopAsync();
+
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Contains(AppendFailure, service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            CompletionFailure,
+            service.Snapshot.LastError,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_evidence_persist_failed"
+                && item.Message.Contains(AppendFailure, StringComparison.Ordinal));
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_session_persist_failed"
+                && item.Message.Contains(CompletionFailure, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task CompletionFaultIsLastErrorWhenThereIsNoEarlierCause()
+    {
+        const string CompletionFailure = "completion-only failure B";
+        var repository = new FakeRepository
+        {
+            SaveException = new InvalidOperationException(CompletionFailure)
+        };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            new FakeLiveEventSource(),
+            repository);
+        await service.StartAsync();
+
+        await service.StopAsync();
+
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Contains(
+            CompletionFailure,
+            service.Snapshot.LastError,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_session_persist_failed"
+                && item.Message.Contains(CompletionFailure, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task SourceFaultRemainsLastErrorWhenCompletionAlsoFails()
+    {
+        const string SourceFailure = "specific source failure A";
+        const string CompletionFailure = "generic completion failure B";
+        var repository = new FakeRepository
+        {
+            SaveException = new InvalidOperationException(CompletionFailure)
+        };
+        var source = new FakeLiveEventSource();
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        await service.StartAsync();
+
+        source.Fault("live_watcher_failed", SourceFailure);
+        await service.StopAsync();
+
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Contains(SourceFailure, service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            CompletionFailure,
+            service.Snapshot.LastError,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_watcher_failed"
+                && item.Message.Contains(SourceFailure, StringComparison.Ordinal));
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_session_persist_failed"
+                && item.Message.Contains(CompletionFailure, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Queue overflow is a condition, not a fault. It may claim the user-visible error
+    /// while nothing else has, but the first real fault replaces it and is then never
+    /// displaced again — including by traffic that keeps arriving afterwards.
+    /// </summary>
+    [Fact]
+    public async Task QueueOverflowNoticeYieldsToTheFirstRealFaultAndNeverReturns()
+    {
+        const string SourceFailure = "specific source failure A";
+        var source = new FakeLiveEventSource();
+        // Capacity 1 plus a parked consumer makes the overflow deterministic.
+        using var appendGate = new ManualResetEventSlim(false);
+        var repository = new FakeRepository { AppendGate = appendGate };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository,
+            new LiveMonitoringOptions(QueueCapacity: 1));
+        await service.StartAsync();
+
+        for (var index = 1; index <= 200; index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        // The overflow notice is shown while nothing more causal exists.
+        Assert.Contains(
+            "队列已满",
+            service.Snapshot.LastError ?? string.Empty,
+            StringComparison.Ordinal);
+
+        // OnSourceFault records the root cause synchronously before it returns.
+        source.Fault("live_watcher_failed", SourceFailure);
+
+        Assert.Contains(SourceFailure, service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "队列已满",
+            service.Snapshot.LastError ?? string.Empty,
+            StringComparison.Ordinal);
+
+        appendGate.Set();
+        await service.StopAsync();
+
+        // Late traffic after the fault must not restore the overflow notice.
+        source.Watchers[0].Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(999)));
+
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Contains(SourceFailure, service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "队列已满",
+            service.Snapshot.LastError ?? string.Empty,
+            StringComparison.Ordinal);
+        // Both remain separately diagnosable.
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_queue_overflow");
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_watcher_failed"
+                && item.Message.Contains(SourceFailure, StringComparison.Ordinal));
+        var completion = Assert.Single(repository.Completions);
+        Assert.Equal(LiveMonitoringState.Error, completion.FinalState);
+        Assert.True(completion.Counters.Dropped > 0);
+        Assert.True(completion.Counters.IsBalanced);
+    }
+
+    /// <summary>
+    /// The precedence rules above only hold if no branch writes the user-visible error
+    /// directly. The one window where a fault is recorded while the session still accepts
+    /// events — a cancelled start, between marking the fault and stopping acceptance — is
+    /// a synchronous gap that cannot be entered deterministically from outside, so the
+    /// invariant is pinned at its source instead: exactly three assignments exist, and
+    /// the queue-overflow branch goes through the shared condition entry point.
+    /// </summary>
+    [Fact]
+    public void LastErrorIsOnlyAssignedThroughTheSharedEntryPoints()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            RepositoryRoot(),
+            "src",
+            "DeleteAudit.Infrastructure",
+            "LiveMonitoring",
+            "LiveMonitoringService.cs"));
+
+        // BeginSession resets it, MarkFaultedCore records a fault, ReportConditionCore
+        // records a non-fault condition. Any fourth assignment is a bypass.
+        Assert.Equal(3, CountOccurrences(source, "_lastError ="));
+
+        var overflowBranch = source.IndexOf(
+            "live_queue_overflow",
+            StringComparison.Ordinal);
+        Assert.True(overflowBranch > 0);
+        var precedingText = source[..overflowBranch];
+        var lastConditionCall = precedingText.LastIndexOf(
+            "ReportConditionCore(",
+            StringComparison.Ordinal);
+        var lastDirectAssignment = precedingText.LastIndexOf(
+            "_lastError =",
+            StringComparison.Ordinal);
+        Assert.True(
+            lastConditionCall > lastDirectAssignment,
+            "the queue overflow branch must report through ReportConditionCore");
+    }
+
+    private static int CountOccurrences(string text, string value)
+    {
+        var count = 0;
+        var index = text.IndexOf(value, StringComparison.Ordinal);
+        while (index >= 0)
+        {
+            count++;
+            index = text.IndexOf(value, index + value.Length, StringComparison.Ordinal);
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// A cancelled start records its root cause while the session is still accepting
+    /// events. Whatever arrives afterwards must not overwrite it.
+    /// </summary>
+    [Fact]
+    public async Task CancelledStartRootCauseSurvivesLaterTraffic()
+    {
+        using var startGate = new TestGate();
+        var source = new FakeLiveEventSource { StartGate = startGate };
+        var repository = new FakeRepository();
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository,
+            new LiveMonitoringOptions(QueueCapacity: 1));
+        using var cancellation = new CancellationTokenSource();
+
+        var starting = Task.Run(() => service.StartAsync(cancellation.Token));
+        await startGate.Entered.WaitAsync(Patience);
+        await cancellation.CancelAsync();
+        startGate.Release();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+
+        var rootCause = service.Snapshot.LastError;
+        Assert.Contains("取消", rootCause ?? string.Empty, StringComparison.Ordinal);
+
+        // Records arriving after the aborted start are late; none of them may claim the
+        // user-visible error, and a full queue must not produce an overflow notice here.
+        for (var index = 1; index <= 200; index++)
+        {
+            source.Watchers[0].Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        Assert.Equal(rootCause, service.Snapshot.LastError);
+        Assert.DoesNotContain(
+            "队列已满",
+            service.Snapshot.LastError ?? string.Empty,
+            StringComparison.Ordinal);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Equal(200, service.Snapshot.Counters.LateDiscarded);
+        Assert.Equal(0, service.Snapshot.Counters.Dropped);
+        var completion = Assert.Single(repository.Completions);
+        Assert.Equal(LiveMonitoringState.Error, completion.FinalState);
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_start_cancelled");
+    }
+
     // ---------- Phase 2B.1 start cancellation lifecycle ----------
 
     [Fact]
@@ -1331,6 +2378,19 @@ public sealed class LiveMonitoringServiceTests
         Assert.Equal(0, source.LiveWatcherCount);
         Assert.Equal(0, probe.ProbeCount);
         // A user cancellation is not a database failure and not a faulted capture.
+        Assert.Equal(LiveMonitoringState.Stopped, service.Snapshot.State);
+        // Adjacent facts: nothing was blamed on anything, no counter moved, and the
+        // lifecycle really did finish rather than merely look finished.
+        Assert.Null(service.Snapshot.LastError);
+        Assert.Empty(service.SessionDiagnostics);
+        Assert.Equal(LiveMonitoringCounters.Empty, service.Snapshot.Counters);
+        Assert.True(service.CompletionStarted);
+        Assert.True(service.LifecycleCompleted);
+        Assert.False(service.SessionPersisted);
+        // Repeated shutdown stays a no-op: still nothing recorded, still Stopped.
+        await service.StopAsync();
+        Assert.Empty(repository.Starts);
+        Assert.Equal(0, repository.SaveCount);
         Assert.Equal(LiveMonitoringState.Stopped, service.Snapshot.State);
     }
 
@@ -1368,6 +2428,16 @@ public sealed class LiveMonitoringServiceTests
         Assert.Contains(
             repository.LastDiagnostics,
             item => item.Code == "live_start_cancelled");
+        // Adjacent facts: the cancellation is the recorded root cause, the summary was
+        // persisted exactly once, and a later Stop neither retries nor duplicates it.
+        Assert.Contains("取消", service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.True(service.SessionPersisted);
+        Assert.Equal(1, repository.SaveCount);
+        await service.StopAsync();
+        await service.StopAsync();
+        Assert.Equal(1, repository.SaveCount);
+        Assert.Single(repository.Completions);
+        Assert.Single(repository.Sessions);
     }
 
     [Fact]
@@ -1444,6 +2514,21 @@ public sealed class LiveMonitoringServiceTests
         // Exactly one attempt; a later Stop does not retry it.
         await service.StopAsync();
         Assert.Equal(1, repository.SaveCount);
+        // Adjacent facts: the completion failure never reached the database, so the
+        // cancellation root cause survives only in memory — and it must still be there,
+        // alongside the persistence failure, rather than one having replaced the other.
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_start_cancelled");
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_session_persist_failed");
+        Assert.Contains("取消", service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "fixture completion failure",
+            service.Snapshot.LastError,
+            StringComparison.Ordinal);
+        Assert.True(service.LifecycleCompleted);
     }
 
     [Fact]
@@ -1495,6 +2580,17 @@ public sealed class LiveMonitoringServiceTests
         Assert.All(
             repository.Records,
             record => Assert.NotEqual(cancelledSessionId, record.LiveSessionId));
+        // Adjacent facts: B inherits none of A's explanation. Neither the cancellation
+        // diagnostic nor A's error text may appear anywhere in B's session.
+        Assert.DoesNotContain(
+            serviceB.SessionDiagnostics,
+            item => item.Code == "live_start_cancelled");
+        Assert.Null(serviceB.Snapshot.LastError);
+        Assert.DoesNotContain(
+            repository.LastDiagnostics,
+            item => item.Code == "live_start_cancelled");
+        Assert.Equal(LiveMonitoringState.Stopped, serviceB.Snapshot.State);
+        Assert.True(serviceB.SessionPersisted);
     }
 
     // ---------- Phase 2B.1 callback identity ----------
@@ -1586,6 +2682,93 @@ public sealed class LiveMonitoringServiceTests
         Assert.True(options.SingleReader);
         Assert.False(options.SingleWriter);
         Assert.Equal(2048, options.Capacity);
+    }
+
+    [Fact]
+    public async Task WatcherPublishThreadNeverRunsAppendOrCompletion()
+    {
+        using var appendGate = new ManualResetEventSlim(false);
+        using var completionGate = new ManualResetEventSlim(false);
+        using var keepPublisherAlive = new ManualResetEventSlim(false);
+        var repository = new FakeRepository
+        {
+            AppendGate = appendGate,
+            SaveGate = completionGate
+        };
+        var source = new FakeLiveEventSource();
+        var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        var publishReturned = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var publisherThreadId = 0;
+        var publisher = new Thread(() =>
+        {
+            try
+            {
+                publisherThreadId = Environment.CurrentManagedThreadId;
+                for (var index = 1;
+                     index <= LiveMonitoringLimits.MaxCaptureBatchRecords;
+                     index++)
+                {
+                    source.Publish(LiveEventFixtures.SysmonRecord(
+                        LiveEventFixtures.SysmonDelete(index)));
+                }
+
+                publishReturned.TrySetResult();
+                keepPublisherAlive.Wait(Patience);
+            }
+            catch (Exception exception)
+            {
+                publishReturned.TrySetException(exception);
+            }
+        })
+        {
+            IsBackground = false,
+            Name = "DeleteAudit fixture watcher publisher"
+        };
+
+        try
+        {
+            await service.StartAsync();
+            publisher.Start();
+
+            await publishReturned.Task.WaitAsync(Patience);
+            await repository.FirstAppendEntered.WaitAsync(Patience);
+
+            Assert.True(publishReturned.Task.IsCompletedSuccessfully);
+            Assert.NotEqual(0, publisherThreadId);
+            Assert.DoesNotContain(publisherThreadId, repository.AppendThreadIds);
+
+            var stopping = service.StopAsync();
+            Assert.False(stopping.IsCompleted);
+            appendGate.Set();
+            await repository.FirstCompletionEntered.WaitAsync(Patience);
+
+            Assert.DoesNotContain(
+                publisherThreadId,
+                repository.CompletionThreadIds);
+            completionGate.Set();
+            await stopping;
+
+            Assert.Equal(1, repository.AppendCount);
+            Assert.Equal(1, repository.SaveCount);
+            Assert.Single(repository.Completions);
+            Assert.Equal(0, source.LiveWatcherCount);
+        }
+        finally
+        {
+            appendGate.Set();
+            completionGate.Set();
+            keepPublisherAlive.Set();
+            if (publisher.IsAlive)
+            {
+                Assert.True(publisher.Join(Patience));
+            }
+
+            await service.DisposeAsync();
+        }
     }
 
     // ---------- XAML structure ----------
@@ -1756,6 +2939,59 @@ public sealed class LiveMonitoringServiceTests
     }
 
     [Fact]
+    public async Task CancellationAfterStopBeginsCannotAbandonCompletion()
+    {
+        using var saveGate = new ManualResetEventSlim(false);
+        var repository = new FakeRepository
+        {
+            SaveGate = saveGate,
+            ObserveCompletionCancellationAfterGate = true
+        };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            new FakeLiveEventSource(),
+            repository);
+        await service.StartAsync();
+        using var cancellation = new CancellationTokenSource();
+
+        var stopping = service.StopAsync(cancellation.Token);
+        await repository.FirstCompletionEntered.WaitAsync(Patience);
+        cancellation.Cancel();
+        saveGate.Set();
+        await stopping;
+
+        Assert.True(service.CompletionStarted);
+        Assert.True(service.LifecycleCompleted);
+        Assert.True(service.SessionPersisted);
+        Assert.Equal(LiveMonitoringState.Stopped, service.Snapshot.State);
+        Assert.Single(repository.Completions);
+    }
+
+    [Fact]
+    public async Task SourceFaultAfterCleanStopCannotReviseFinalState()
+    {
+        var source = new FakeLiveEventSource();
+        var repository = new FakeRepository();
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        await service.StartAsync();
+        var watcher = source.Watcher(0);
+        await service.StopAsync();
+
+        watcher.Fault("late_fixture_fault", "late fault after stop");
+
+        Assert.Equal(LiveMonitoringState.Stopped, service.Snapshot.State);
+        Assert.Equal(
+            LiveMonitoringState.Stopped,
+            Assert.Single(repository.Sessions).FinalState);
+        Assert.DoesNotContain(
+            service.SessionDiagnostics,
+            item => item.Code == "late_fixture_fault");
+    }
+
+    [Fact]
     public async Task CompletionStartedLifecycleAndPersistedAreDistinctFacts()
     {
         var repository = new FakeRepository
@@ -1875,7 +3111,8 @@ public sealed class LiveMonitoringServiceTests
                      ("README.en.md", "only a session summary is saved"),
                      ("README.en.md", "Live event detail is **not retained** today"),
                      ("README.fil.md", "hindi itinatago ang detalye ng mga live event"),
-                     ("SECURITY.md", "Only a **session summary** is stored for live monitoring")
+                     ("SECURITY.md", "Only a **session summary** is stored for live monitoring"),
+                     ("SECURITY.md", "live event detail is not persisted")
                  })
         {
             Assert.DoesNotContain(
@@ -1890,9 +3127,9 @@ public sealed class LiveMonitoringServiceTests
                      ("README.md", "会写入本机的 SQLite 数据库"),
                      ("README.md", "63 条"),
                      ("README.en.md", "written to a local SQLite database"),
-                     ("README.en.md", "63 classified records"),
+                     ("README.en.md", "63 uncommitted records"),
                      ("README.fil.md", "isinusulat sa lokal na SQLite database"),
-                     ("README.fil.md", "63 na naklasipikang record"),
+                     ("README.fil.md", "63 na hindi pa na-commit na record"),
                      ("SECURITY.md", "not a tamper-proof medium"),
                      ("CONTRIBUTING.md", "0004_phase_2b_live_evidence.sql")
                  })
@@ -1902,6 +3139,94 @@ public sealed class LiveMonitoringServiceTests
                 File.ReadAllText(Path.Combine(root, file)),
                 StringComparison.Ordinal);
         }
+    }
+
+    [Theory]
+    [InlineData(
+        "README.md",
+        "达到 64 条时会立即进入持久化",
+        "第一条进入空批次起，通常约 5 秒",
+        "同批后续记录不会重新开始期限",
+        "仍可能丢失最多 63 条尚未提交的记录",
+        "只尝试保存一次",
+        "不会自动重试",
+        "此前已经成功提交的记录仍会保留",
+        "显示 `Error`",
+        "不是严格时限保证")]
+    [InlineData(
+        "README.en.md",
+        "enters persistence immediately at 64 records",
+        "about five seconds after its first record enters an empty batch",
+        "later records in that batch do not restart the deadline",
+        "still lose up to 63 uncommitted records",
+        "completion record is attempted once",
+        "no automatic retry",
+        "records committed successfully beforehand are kept",
+        "session shows `Error`",
+        "not a strict timing guarantee")]
+    [InlineData(
+        "README.fil.md",
+        "Agad na pumapasok sa persistence ang batch kapag umabot sa 64 record",
+        "mga limang segundo matapos pumasok ang unang record sa bakanteng batch",
+        "hindi inuulit ng mga kasunod na record ang deadline",
+        "maaari pa ring mawala ang hanggang 63 na hindi pa na-commit na record",
+        "Isang beses lang sinusubukang i-save ang completion record",
+        "walang awtomatikong retry",
+        "nananatili ang mga record na matagumpay nang na-commit",
+        "`Error` ang ipinapakita",
+        "hindi ito mahigpit na garantiya sa oras")]
+    [InlineData(
+        "SECURITY.md",
+        "enters persistence immediately at 64 records",
+        "about five seconds after its first record enters an empty batch",
+        "later records in the same batch do not restart that deadline",
+        "may lose up to 63 uncommitted records",
+        "completion save is attempted once",
+        "not retried automatically",
+        "records committed successfully before that failure are kept",
+        "shown as `Error`",
+        "not a strict five-second guarantee")]
+    public void PublicDocsDescribeBoundedLatencyWithoutErasingResidualRisk(
+        string file,
+        string immediateBatch,
+        string partialBatch,
+        string fixedDeadline,
+        string residualLoss,
+        string completionAttempt,
+        string noRetry,
+        string committedRecords,
+        string errorState,
+        string nonGuarantee)
+    {
+        var document = string.Join(
+            " ",
+            File.ReadAllText(Path.Combine(RepositoryRoot(), file))
+                .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        foreach (var required in new[]
+                 {
+                     immediateBatch,
+                     partialBatch,
+                     fixedDeadline,
+                     residualLoss,
+                     completionAttempt,
+                     noRetry,
+                     committedRecords,
+                     errorState,
+                     nonGuarantee
+                 })
+        {
+            Assert.Contains(required, document, StringComparison.Ordinal);
+        }
+
+        Assert.DoesNotContain(
+            "guaranteed within five seconds",
+            document,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(
+            "63-record crash-loss window has been eliminated",
+            document,
+            StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -2062,13 +3387,20 @@ public sealed class LiveMonitoringServiceTests
     // ---------- disclosure ----------
 
     [Fact]
-    public void BannerNoLongerClaimsThereIsNoLiveMonitoring()
+    public void BannerDescribesTheCompletedPhase2BLiveSurface()
     {
         var banner = MainWindowViewModel.CapabilityBanner;
 
         Assert.DoesNotContain("当前尚未实时监控", banner, StringComparison.Ordinal);
-        Assert.Contains("实时事件接入预览", banner, StringComparison.Ordinal);
-        Assert.Contains("实时事件详情暂不持久保存", banner, StringComparison.Ordinal);
+        Assert.Contains("用户手动开启的实时事件接入", banner, StringComparison.Ordinal);
+        Assert.DoesNotContain("实时事件详情暂不持久保存", banner, StringComparison.Ordinal);
+        Assert.Contains("原始 XML", banner, StringComparison.Ordinal);
+        Assert.Contains("解析/分类结果", banner, StringComparison.Ordinal);
+        Assert.Contains("本机查看器", banner, StringComparison.Ordinal);
+        Assert.Contains("实时历史", banner, StringComparison.Ordinal);
+        Assert.Contains("派生分析", banner, StringComparison.Ordinal);
+        Assert.Contains("live-owned", banner, StringComparison.Ordinal);
+        Assert.DoesNotContain("尚无实时历史", banner, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -2082,13 +3414,27 @@ public sealed class LiveMonitoringServiceTests
         Assert.Contains("分类结果", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("会写入本机查看器数据库", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("会保留", viewModel.Disclosure, StringComparison.Ordinal);
-        // What it still does not do.
-        Assert.Contains("尚未接入", viewModel.Disclosure, StringComparison.Ordinal);
-        Assert.Contains("风险评估", viewModel.Disclosure, StringComparison.Ordinal);
+        // What the later Phase 2B pages now do, without blurring their boundaries.
+        Assert.Contains("实时历史", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("风险分析", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("live-owned", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("用户主动", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("不会自动写入或伪装成离线", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("离线身份", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("缺口", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("异常中断", viewModel.Disclosure, StringComparison.Ordinal);
         Assert.Contains("不上传", viewModel.Disclosure, StringComparison.Ordinal);
-        Assert.Contains("尚未投影", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("达到 64 条时立即", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("第一条进入空批次起通常约 5 秒", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("后续记录不会重新开始期限", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("实际完成时间稍晚", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("不是严格的五秒保证", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("最多 63 条尚未提交记录", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("只尝试保存一次且不自动重试", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("显示 Error", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("已经成功提交的记录仍会保留", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("不是防篡改介质", viewModel.Disclosure, StringComparison.Ordinal);
+        Assert.Contains("不是完整或生产级取证系统", viewModel.Disclosure, StringComparison.Ordinal);
         // The retired Phase 2A claim must not come back: live detail is no longer lost
         // on stop, so the page may not keep saying that it is.
         Assert.DoesNotContain(
@@ -2120,21 +3466,27 @@ public sealed class LiveMonitoringServiceTests
         // written locally, not that only a summary survives.
         Assert.Contains("会写入本机的 SQLite 数据库", readme, StringComparison.Ordinal);
         Assert.Contains("会话摘要", readme, StringComparison.Ordinal);
-        Assert.Contains("尚未接入", readme, StringComparison.Ordinal);
+        Assert.Contains("实时历史与派生分析", readme, StringComparison.Ordinal);
+        Assert.Contains("独立实时规范投影", readme, StringComparison.Ordinal);
+        Assert.Contains("不会把实时数据伪装成离线导入", readme, StringComparison.Ordinal);
+        Assert.DoesNotContain("目前没有实时历史", readme, StringComparison.Ordinal);
         Assert.Contains("Phase 2B", readme, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void ProjectPlanRecordsPhase2AScopeAndPhase2BDeferrals()
+    public void ProjectPlanRecordsCompletedPhase2BScopeAndSeparation()
     {
         var plan = File.ReadAllText(
             Path.Combine(RepositoryRoot(), "docs", "PROJECT_PLAN.md"));
 
         Assert.Contains("Phase 2A 实现状态", plan, StringComparison.Ordinal);
-        Assert.Contains("只复用 `WindowsEventXmlParser`", plan, StringComparison.Ordinal);
-        Assert.Contains("尚未接入实时管线", plan, StringComparison.Ordinal);
-        Assert.Contains("不会伪造", plan, StringComparison.Ordinal);
-        Assert.Contains("不构成完整的实时删除审计", plan, StringComparison.Ordinal);
+        Assert.Contains("Phase 2B 实现状态", plan, StringComparison.Ordinal);
+        Assert.Contains("WindowsEventXmlParser", plan, StringComparison.Ordinal);
+        Assert.Contains("DeleteEventCorrelator", plan, StringComparison.Ordinal);
+        Assert.Contains("live-owned", plan, StringComparison.Ordinal);
+        Assert.Contains("0005", plan, StringComparison.Ordinal);
+        Assert.Contains("不写、不冒充、也不连接", plan, StringComparison.Ordinal);
+        Assert.Contains("不是防篡改保证", plan, StringComparison.Ordinal);
     }
 
     // ---------- view model ----------
@@ -2204,12 +3556,21 @@ public sealed class LiveMonitoringServiceTests
         ILiveEventChannelProbe probe,
         out FakeLiveEventSource source,
         out FakeRepository repository,
-        LiveMonitoringOptions? options = null)
+        LiveMonitoringOptions? options = null,
+        TimeProvider? timeProvider = null)
     {
         source = new FakeLiveEventSource();
         repository = new FakeRepository();
-        return new LiveMonitoringService(probe, source, repository, options);
+        return new LiveMonitoringService(
+            probe,
+            source,
+            repository,
+            options,
+            timeProvider);
     }
+
+    private static ManualTimerTimeProvider CaptureTime() =>
+        new(new DateTimeOffset(2026, 7, 28, 9, 0, 0, TimeSpan.Zero));
 
     private static LiveMonitoringViewModel CreateViewModel(ILiveMonitoringService service) =>
         new(service, new InlineDispatcher());
