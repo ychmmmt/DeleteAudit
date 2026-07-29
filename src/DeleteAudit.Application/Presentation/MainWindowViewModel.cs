@@ -1,3 +1,4 @@
+using DeleteAudit.Application.Analysis;
 using DeleteAudit.Application.Importing;
 using DeleteAudit.Application.LiveMonitoring;
 using DeleteAudit.Application.Viewing;
@@ -27,6 +28,7 @@ public sealed class MainWindowViewModel : ViewModelBase
         IRawXmlPreviewClipboard rawXmlPreviewClipboard,
         ILiveMonitoringService liveMonitoringService,
         ILiveHistoryQueryService liveHistoryQueryService,
+        ILiveAnalysisService liveAnalysisService,
         IUiDispatcher uiDispatcher,
         INetworkPathImportConfirmation? networkPathConfirmation = null)
     {
@@ -37,11 +39,14 @@ public sealed class MainWindowViewModel : ViewModelBase
         ArgumentNullException.ThrowIfNull(rawXmlPreviewClipboard);
         ArgumentNullException.ThrowIfNull(liveMonitoringService);
         ArgumentNullException.ThrowIfNull(liveHistoryQueryService);
+        ArgumentNullException.ThrowIfNull(liveAnalysisService);
         ArgumentNullException.ThrowIfNull(uiDispatcher);
 
         RawXml = new RawXmlViewModel(queryService, rawXmlPreviewClipboard);
         LiveMonitoring = new LiveMonitoringViewModel(liveMonitoringService, uiDispatcher);
-        LiveHistory = new LiveHistoryViewModel(liveHistoryQueryService);
+        LiveHistory = new LiveHistoryViewModel(
+            liveHistoryQueryService,
+            liveAnalysisService);
         ImportHistory = new ImportHistoryViewModel(queryService);
         DeleteSessions = new DeleteSessionsViewModel(queryService);
         DeleteEvents = new DeleteEventsViewModel(queryService, OpenRawXmlAsync);

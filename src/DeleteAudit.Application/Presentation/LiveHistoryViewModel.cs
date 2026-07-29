@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Globalization;
+using DeleteAudit.Application.Analysis;
 using DeleteAudit.Application.Viewing;
 using DeleteAudit.Domain;
 
@@ -33,13 +34,18 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     private const int PageSize = 50;
 
     private readonly ILiveHistoryQueryService _queryService;
+    private readonly ILiveAnalysisService _analysisService;
     private readonly ObservableCollection<LiveCaptureSessionRow> _sessions = [];
     private readonly ObservableCollection<LiveCaptureRecordRow> _records = [];
     private readonly ObservableCollection<LiveCaptureDiagnosticRow> _diagnostics = [];
+    private readonly ObservableCollection<LiveDeleteSessionRow> _analysisSessions = [];
+    private readonly ObservableCollection<LiveCorrelatedDeleteRow> _analysisDeletes = [];
 
     private readonly RequestSlot _sessionRequests = new();
     private readonly RequestSlot _recordRequests = new();
     private readonly RequestSlot _rawXmlRequests = new();
+    private readonly RequestSlot _analysisRequests = new();
+    private LiveSessionAnalysis? _analysis;
     private int _inFlight;
     private bool _disposed;
 
@@ -62,9 +68,13 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     private bool _errorsOnly;
     private bool _newestFirst;
 
-    public LiveHistoryViewModel(ILiveHistoryQueryService queryService)
+    public LiveHistoryViewModel(
+        ILiveHistoryQueryService queryService,
+        ILiveAnalysisService analysisService)
     {
         _queryService = queryService ?? throw new ArgumentNullException(nameof(queryService));
+        _analysisService = analysisService
+            ?? throw new ArgumentNullException(nameof(analysisService));
 
         // None of these gate on a load being in flight: a newer request replaces an
         // older one rather than being refused, so the user is never locked out of
@@ -98,9 +108,20 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
             () => SelectedSession is not null,
             ShowUnexpectedError);
 
+        // Analysis is never automatic: deriving correlation re-reads and re-parses the
+        // session's evidence, so the user asks for it explicitly.
+        AnalyzeCommand = new AsyncCommand(
+            AnalyzeAsync,
+            () => SelectedSession is not null,
+            ShowUnexpectedError);
+
         Sessions = new ReadOnlyObservableCollection<LiveCaptureSessionRow>(_sessions);
         Records = new ReadOnlyObservableCollection<LiveCaptureRecordRow>(_records);
         Diagnostics = new ReadOnlyObservableCollection<LiveCaptureDiagnosticRow>(_diagnostics);
+        AnalysisSessions =
+            new ReadOnlyObservableCollection<LiveDeleteSessionRow>(_analysisSessions);
+        AnalysisDeletes =
+            new ReadOnlyObservableCollection<LiveCorrelatedDeleteRow>(_analysisDeletes);
     }
 
     public string Disclosure { get; } = HistoryDisclosure;
@@ -110,6 +131,14 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     public ReadOnlyObservableCollection<LiveCaptureRecordRow> Records { get; }
 
     public ReadOnlyObservableCollection<LiveCaptureDiagnosticRow> Diagnostics { get; }
+
+    /// <summary>Delete sessions derived from the selected capture, never stored.</summary>
+    public ReadOnlyObservableCollection<LiveDeleteSessionRow> AnalysisSessions { get; }
+
+    /// <summary>Correlated deletes derived from the selected capture, never stored.</summary>
+    public ReadOnlyObservableCollection<LiveCorrelatedDeleteRow> AnalysisDeletes { get; }
+
+    public AsyncCommand AnalyzeCommand { get; }
 
     public AsyncCommand RefreshCommand { get; }
 
@@ -147,6 +176,40 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
 
     public bool HasDiagnostics => _diagnostics.Count > 0;
 
+    public bool HasAnalysis => _analysis is not null;
+
+    public bool AnalysisIsEmpty => _analysis is not null && !_analysis.HasDeletes;
+
+    public bool AnalysisWasTruncated => _analysis?.WasTruncated ?? false;
+
+    public string AnalysisTruncationNotice =>
+        AnalysisWasTruncated
+            ? string.Format(
+                CultureInfo.InvariantCulture,
+                "该会话的记录超过分析上限 {0:N0} 条，下面只分析了最早的一部分；其余记录仍完整保存在数据库中。",
+                LiveAnalysisLimits.MaxAnalyzedRecords)
+            : string.Empty;
+
+    /// <summary>
+    /// States plainly what the derived numbers are and are not. Correlation is
+    /// corroboration, not proof of intent.
+    /// </summary>
+    public string AnalysisSummary =>
+        _analysis is null
+            ? "尚未分析。分析只读取该会话已保存的记录，重新解析并套用与离线导入相同的确定性规则，不会写入任何数据。"
+            : string.Format(
+                CultureInfo.InvariantCulture,
+                "已分析记录 {0:N0}；删除事实 {1:N0}；进程上下文 {2:N0}；安全补强 {3:N0}；"
+                + "无法解析 {4:N0}；未能关联的删除 {5:N0}；归纳出删除会话 {6:N0} 个。"
+                + "关联结果是证据之间的印证，不代表已确认的攻击或责任判定。",
+                _analysis.AnalyzedRecordCount,
+                _analysis.DeleteFactCount,
+                _analysis.ProcessContextCount,
+                _analysis.SecurityEvidenceCount,
+                _analysis.UnparsableRecordCount,
+                _analysis.UncorrelatedDeleteCount,
+                _analysis.DeleteSessions.Count);
+
     public string SessionPageStatus => DescribePage(_sessionOffset, _sessions.Count, _sessionTotalCount);
 
     public string RecordPageStatus => DescribePage(_recordOffset, _records.Count, _recordTotalCount);
@@ -168,6 +231,10 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
             {
                 OnPropertyChanged(nameof(SelectedSessionSummary));
                 OnPropertyChanged(nameof(SelectedSessionIsIncomplete));
+                // An analysis belongs to the session it was derived from. Switching
+                // sessions retires it immediately rather than leaving another session's
+                // conclusions on screen while the new records load.
+                SetAnalysis(null);
                 NotifyCommands();
                 // Selecting a session loads its records; the previous load is cancelled.
                 _ = LoadRecordsAsync(resetPage: true);
@@ -461,6 +528,61 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         });
 
     /// <summary>
+    /// Derives correlation, delete sessions and risk for the selected capture session.
+    /// Reads and re-parses stored evidence; writes nothing.
+    /// </summary>
+    public Task AnalyzeAsync() =>
+        RunLatestAsync(_analysisRequests, async ticket =>
+        {
+            var session = SelectedSession;
+            if (session is null)
+            {
+                if (ticket.IsCurrent)
+                {
+                    SetAnalysis(null);
+                }
+
+                return;
+            }
+
+            var analysis = await _analysisService
+                .AnalyzeAsync(session.LiveSessionId, ticket.Token)
+                .ConfigureAwait(true);
+
+            if (!ticket.IsCurrent)
+            {
+                return;
+            }
+
+            SetAnalysis(analysis);
+        });
+
+    private void SetAnalysis(LiveSessionAnalysis? analysis)
+    {
+        _analysis = analysis;
+        _analysisSessions.Clear();
+        _analysisDeletes.Clear();
+        if (analysis is not null)
+        {
+            foreach (var row in analysis.DeleteSessions)
+            {
+                _analysisSessions.Add(row);
+            }
+
+            foreach (var row in analysis.Deletes)
+            {
+                _analysisDeletes.Add(row);
+            }
+        }
+
+        OnPropertyChanged(nameof(HasAnalysis));
+        OnPropertyChanged(nameof(AnalysisIsEmpty));
+        OnPropertyChanged(nameof(AnalysisWasTruncated));
+        OnPropertyChanged(nameof(AnalysisTruncationNotice));
+        OnPropertyChanged(nameof(AnalysisSummary));
+    }
+
+    /// <summary>
     /// Runs one request under a latest-request-wins policy: starting a new one cancels
     /// the request it supersedes, and only the newest may touch the view model.
     /// </summary>
@@ -552,6 +674,7 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         _sessionRequests.Dispose();
         _recordRequests.Dispose();
         _rawXmlRequests.Dispose();
+        _analysisRequests.Dispose();
     }
 
     private Task MoveSessionPageAsync(int delta)
@@ -605,6 +728,9 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         _recordTotalCount = 0;
         _recordOffset = 0;
         SetRawXml(null);
+        // Analysis belongs to one capture session; changing session retires it rather
+        // than leaving another session's conclusions on screen.
+        SetAnalysis(null);
         NotifyRecordListChanged();
     }
 
@@ -631,6 +757,7 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
 
     private void NotifyCommands()
     {
+        AnalyzeCommand.NotifyCanExecuteChanged();
         RefreshCommand.NotifyCanExecuteChanged();
         ApplyFiltersCommand.NotifyCanExecuteChanged();
         ApplyRecordFiltersCommand.NotifyCanExecuteChanged();

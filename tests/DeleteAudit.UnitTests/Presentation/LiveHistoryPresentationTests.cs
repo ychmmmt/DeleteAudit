@@ -1,3 +1,4 @@
+using DeleteAudit.Application.Analysis;
 using DeleteAudit.Application.Presentation;
 using DeleteAudit.Application.Viewing;
 using DeleteAudit.Domain;
@@ -18,13 +19,82 @@ public sealed class LiveHistoryPresentationTests
     {
         var service = new FakeLiveHistoryQueryService();
 
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
 
         Assert.Equal(0, service.AvailabilityCalls);
         Assert.Equal(0, service.SessionCalls);
         Assert.Equal(0, service.RecordCalls);
+        Assert.Equal(0, service.AnalyzeCalls);
         Assert.Empty(viewModel.Sessions);
         Assert.False(viewModel.IsUnavailable);
+    }
+
+    /// <summary>
+    /// Analysis is derived work over stored evidence. It must never run on its own —
+    /// only when the user asks for it, and only for a selected session.
+    /// </summary>
+    [Fact]
+    public async Task AnalysisRunsOnlyWhenExplicitlyRequested()
+    {
+        var service = new FakeLiveHistoryQueryService();
+        service.SetSessions([Session(1)]);
+        service.SetRecords([Record(1)]);
+        service.Analysis = new LiveSessionAnalysis(
+            "session-1",
+            3,
+            1,
+            1,
+            0,
+            0,
+            0,
+            LiveAnalysisTruncation.None,
+            [
+                new LiveDeleteSessionRow(
+                    1,
+                    "guid:P",
+                    "name:U",
+                    @"C:\Work",
+                    StartedUtc,
+                    StartedUtc,
+                    1,
+                    0,
+                    AuditRiskLevel.Informational,
+                    "single_delete")
+            ],
+            []);
+        using var viewModel = new LiveHistoryViewModel(service, service);
+        await viewModel.LoadSessionsAsync();
+
+        // Selecting a session loads its records but must not analyse anything.
+        viewModel.SelectedSession = viewModel.Sessions[0];
+        Assert.Equal(0, service.AnalyzeCalls);
+        Assert.False(viewModel.HasAnalysis);
+
+        await viewModel.AnalyzeAsync();
+
+        Assert.Equal(1, service.AnalyzeCalls);
+        Assert.True(viewModel.HasAnalysis);
+        Assert.Single(viewModel.AnalysisSessions);
+        Assert.Contains("不代表已确认的攻击", viewModel.AnalysisSummary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ChangingSessionRetiresThePreviousAnalysis()
+    {
+        var service = new FakeLiveHistoryQueryService();
+        service.SetSessions([Session(1), Session(2)]);
+        using var viewModel = new LiveHistoryViewModel(service, service);
+        await viewModel.LoadSessionsAsync();
+        viewModel.SelectedSession = viewModel.Sessions[0];
+        await viewModel.AnalyzeAsync();
+        Assert.True(viewModel.HasAnalysis);
+
+        viewModel.SelectedSession = viewModel.Sessions[1];
+
+        // Another session's conclusions must not stay on screen.
+        Assert.False(viewModel.HasAnalysis);
+        Assert.Empty(viewModel.AnalysisSessions);
+        Assert.Empty(viewModel.AnalysisDeletes);
     }
 
     [Fact]
@@ -37,7 +107,7 @@ public sealed class LiveHistoryPresentationTests
                 "缺少 live_capture_records。",
                 ["live_capture_records"])
         };
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
 
         await viewModel.LoadSessionsAsync();
 
@@ -54,7 +124,7 @@ public sealed class LiveHistoryPresentationTests
     {
         var service = new FakeLiveHistoryQueryService();
         service.SetSessions(Enumerable.Range(1, 120).Select(Session).ToArray());
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
 
         await viewModel.LoadSessionsAsync();
 
@@ -73,7 +143,7 @@ public sealed class LiveHistoryPresentationTests
     public async Task AnEmptyResultIsAnEmptyStateNotAnError()
     {
         var service = new FakeLiveHistoryQueryService();
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
 
         await viewModel.LoadSessionsAsync();
 
@@ -89,7 +159,7 @@ public sealed class LiveHistoryPresentationTests
         service.SetSessions([Session(1)]);
         service.SetRecords([Record(1), Record(2)]);
         service.SetDiagnostics([Diagnostic("live_queue_overflow")]);
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
         await viewModel.LoadSessionsAsync();
 
         // Selecting the session is what loads its records; no explicit call is needed.
@@ -106,7 +176,7 @@ public sealed class LiveHistoryPresentationTests
         var service = new FakeLiveHistoryQueryService();
         service.SetSessions([Session(1)]);
         service.SetRecords([Record(1)]);
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
         await viewModel.LoadSessionsAsync();
         viewModel.SelectedSession = viewModel.Sessions[0];
 
@@ -133,7 +203,7 @@ public sealed class LiveHistoryPresentationTests
         };
         service.SetSessions([Session(1)]);
         service.SetRecords([Record(1)]);
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
         await viewModel.LoadSessionsAsync();
         viewModel.SelectedSession = viewModel.Sessions[0];
         await viewModel.LoadRecordsAsync();
@@ -157,7 +227,7 @@ public sealed class LiveHistoryPresentationTests
         service.SetSessions([Session(1)]);
         using var gate = new ManualResetEventSlim(false);
         service.SessionGate = gate;
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
 
         var slow = viewModel.LoadSessionsAsync();
         await service.SessionEntered.WaitAsync(TimeSpan.FromSeconds(10));
@@ -185,7 +255,7 @@ public sealed class LiveHistoryPresentationTests
         service.SetSessions([Session(1)]);
         using var slow = new ManualResetEventSlim(false);
         service.GateCall(1, slow);
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
 
         var first = viewModel.LoadSessionsAsync();
         await service.CallEntered(1).WaitAsync(TimeSpan.FromSeconds(10));
@@ -218,7 +288,7 @@ public sealed class LiveHistoryPresentationTests
         service.SetSessions([Session(1)]);
         using var slow = new ManualResetEventSlim(false);
         service.GateCall(1, slow);
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
 
         var first = viewModel.LoadSessionsAsync();
         await service.CallEntered(1).WaitAsync(TimeSpan.FromSeconds(10));
@@ -237,7 +307,7 @@ public sealed class LiveHistoryPresentationTests
     public async Task TheNewestQueryFailureIsReported()
     {
         var service = new FakeLiveHistoryQueryService { FailingCall = 1 };
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
 
         await viewModel.LoadSessionsAsync();
 
@@ -253,7 +323,7 @@ public sealed class LiveHistoryPresentationTests
         service.SetSessions([Session(1)]);
         using var slow = new ManualResetEventSlim(false);
         service.GateCall(1, slow);
-        var viewModel = new LiveHistoryViewModel(service);
+        var viewModel = new LiveHistoryViewModel(service, service);
 
         var loading = viewModel.LoadSessionsAsync();
         await service.CallEntered(1).WaitAsync(TimeSpan.FromSeconds(10));
@@ -281,7 +351,7 @@ public sealed class LiveHistoryPresentationTests
         var service = new FakeLiveHistoryQueryService();
         service.SetSessions([Session(1)]);
         service.SetRecords([Record(1), Record(2)]);
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
         await viewModel.LoadSessionsAsync();
         viewModel.SelectedSession = viewModel.Sessions[0];
 
@@ -310,7 +380,7 @@ public sealed class LiveHistoryPresentationTests
         service.SetSessions([Session(1)]);
         using var gate = new ManualResetEventSlim(false);
         service.SessionGate = gate;
-        var viewModel = new LiveHistoryViewModel(service);
+        var viewModel = new LiveHistoryViewModel(service, service);
 
         var loading = viewModel.LoadSessionsAsync();
         await service.SessionEntered.WaitAsync(TimeSpan.FromSeconds(10));
@@ -328,7 +398,7 @@ public sealed class LiveHistoryPresentationTests
     {
         var service = new FakeLiveHistoryQueryService { OverridePageSize = 51 };
         service.SetSessions(Enumerable.Range(1, 60).Select(Session).ToArray());
-        using var viewModel = new LiveHistoryViewModel(service);
+        using var viewModel = new LiveHistoryViewModel(service, service);
 
         await viewModel.LoadSessionsAsync();
 
@@ -355,17 +425,27 @@ public sealed class LiveHistoryPresentationTests
     [Fact]
     public void TheViewModelExposesNoMutatingOperation()
     {
-        var names = typeof(LiveHistoryViewModel)
+        // Property accessors are excluded on purpose: AnalysisDeletes is a list of
+        // observed deletions, not an operation that deletes anything.
+        var operations = typeof(LiveHistoryViewModel)
             .GetMethods()
+            .Where(method => !method.IsSpecialName)
             .Select(method => method.Name)
             .ToArray();
 
-        Assert.DoesNotContain(names, name =>
-            name.Contains("Delete", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("Clear", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("Repair", StringComparison.OrdinalIgnoreCase)
-            || name.Contains("Purge", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(operations, name =>
+            name.StartsWith("Delete", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Clear", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Remove", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Repair", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Purge", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Save", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("Write", StringComparison.OrdinalIgnoreCase));
         Assert.Null(typeof(ILiveHistoryQueryService).GetMethod("DeleteAsync"));
+        // The analysis contract is a single read; it cannot persist anything either.
+        Assert.Equal(
+            ["AnalyzeAsync"],
+            typeof(ILiveAnalysisService).GetMethods().Select(method => method.Name));
     }
 
     private static LiveCaptureSessionRow Session(int index) =>
@@ -417,8 +497,22 @@ public sealed class LiveHistoryPresentationTests
             "fixture diagnostic",
             StartedUtc);
 
-    private sealed class FakeLiveHistoryQueryService : ILiveHistoryQueryService
+    private sealed class FakeLiveHistoryQueryService
+        : ILiveHistoryQueryService, ILiveAnalysisService
     {
+        public int AnalyzeCalls { get; private set; }
+
+        public LiveSessionAnalysis? Analysis { get; set; }
+
+        public Task<LiveSessionAnalysis> AnalyzeAsync(
+            string liveSessionId,
+            CancellationToken cancellationToken = default)
+        {
+            AnalyzeCalls++;
+            return Task.FromResult(
+                Analysis ?? LiveSessionAnalysis.Empty(liveSessionId));
+        }
+
         private readonly TaskCompletionSource _sessionEntered =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
         private LiveCaptureSessionRow[] _sessions = [];

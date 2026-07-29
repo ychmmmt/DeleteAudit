@@ -1,5 +1,6 @@
 using System.Windows;
 using DeleteAudit.Application.LiveMonitoring;
+using DeleteAudit.Infrastructure.Analysis;
 using DeleteAudit.Application.Presentation;
 using DeleteAudit.Infrastructure.LiveMonitoring;
 using DeleteAudit.Infrastructure.Viewing;
@@ -27,6 +28,7 @@ public partial class MainWindow : Window
             new WpfRawXmlPreviewClipboard(),
             liveMonitoring,
             new SqliteLiveHistoryQueryService(location),
+            new SqliteLiveAnalysisService(location),
             new WpfUiDispatcher(),
             new WpfNetworkPathImportConfirmation(this));
         DataContext = _viewModel;

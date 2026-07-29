@@ -665,6 +665,10 @@
                                 Content="刷新"
                                 Margin="8,0,0,0"
                                 Padding="10,4" />
+                        <Button Command="{Binding LiveHistory.AnalyzeCommand}"
+                                Content="分析所选会话"
+                                Margin="8,0,0,0"
+                                Padding="10,4" />
                     </WrapPanel>
 
                     <StackPanel Grid.Row="2">
@@ -809,6 +813,85 @@
                                      VerticalScrollBarVisibility="Auto" />
                         </Grid>
                     </Grid>
+                </Grid>
+            </TabItem>
+
+            <TabItem Header="实时接入分析">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0"
+                            Background="#EEF4FF"
+                            BorderBrush="#2F5BB7"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="10,8">
+                        <TextBlock TextWrapping="Wrap"
+                                   Text="本页是对「实时接入历史」中所选会话的只读派生分析：重新读取并解析该会话已保存的记录，套用与离线导入完全相同的确定性关联、删除会话归并与风险规则。分析结果不会写回数据库，也不会成为新的证据；关联表示证据之间的印证，不是攻击确认或责任判定。请先在「实时接入历史」页选择一个会话，再点击该页的“分析所选会话”。" />
+                    </Border>
+
+                    <StackPanel Grid.Row="1" Margin="0,8,0,0">
+                        <TextBlock Text="{Binding LiveHistory.AnalysisSummary}"
+                                   TextWrapping="Wrap" />
+                        <Border Background="#FFF4E5"
+                                BorderBrush="#B54708"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Margin="0,6,0,0"
+                                Padding="10,8"
+                                Visibility="{Binding LiveHistory.AnalysisWasTruncated, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B54708"
+                                       Text="{Binding LiveHistory.AnalysisTruncationNotice}"
+                                       TextWrapping="Wrap" />
+                        </Border>
+                        <TextBlock Margin="0,4,0,0"
+                                   Text="该会话没有可分析的删除事实。"
+                                   Visibility="{Binding LiveHistory.AnalysisIsEmpty, Converter={StaticResource BoolToVisibility}}" />
+                    </StackPanel>
+
+                    <DataGrid Grid.Row="2"
+                              Margin="0,8,0,0"
+                              AutomationProperties.Name="派生的删除会话列表"
+                              ItemsSource="{Binding LiveHistory.AnalysisSessions}"
+                              Style="{StaticResource VirtualizedDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Binding="{Binding Ordinal}" Header="#" />
+                            <DataGridTextColumn Binding="{Binding RiskLevel}" Header="风险信号" />
+                            <DataGridTextColumn Binding="{Binding RiskRuleCode}" Header="规则" />
+                            <DataGridTextColumn Binding="{Binding ConfirmedItemCount}" Header="删除数" />
+                            <DataGridTextColumn Binding="{Binding ProtectedItemCount}" Header="受保护路径" />
+                            <DataGridTextColumn Binding="{Binding OpenedUtc}" Header="开始 (UTC)" />
+                            <DataGridTextColumn Binding="{Binding LastEventUtc}" Header="最后事件 (UTC)" />
+                            <DataGridTextColumn Binding="{Binding ProcessIdentity}" Header="进程标识" />
+                            <DataGridTextColumn Binding="{Binding UserIdentity}" Header="用户标识" />
+                            <DataGridTextColumn Binding="{Binding MainPath}" Header="路径范围" Width="*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <DataGrid Grid.Row="3"
+                              Margin="0,8,0,0"
+                              AutomationProperties.Name="派生的关联删除事件列表"
+                              ItemsSource="{Binding LiveHistory.AnalysisDeletes}"
+                              Style="{StaticResource VirtualizedDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Binding="{Binding DeleteSessionOrdinal}" Header="会话 #" />
+                            <DataGridTextColumn Binding="{Binding OccurredUtc}" Header="发生时间 (UTC)" />
+                            <DataGridTextColumn Binding="{Binding FullPath, Converter={StaticResource UnknownValue}}" Header="路径" Width="*" />
+                            <DataGridTextColumn Binding="{Binding Method}" Header="关联方式" />
+                            <DataGridTextColumn Binding="{Binding Confidence}" Header="置信度" />
+                            <DataGridTextColumn Binding="{Binding RiskLevel}" Header="风险信号" />
+                            <DataGridTextColumn Binding="{Binding ProcessPath, Converter={StaticResource UnknownValue}}" Header="进程" />
+                            <DataGridTextColumn Binding="{Binding UserName, Converter={StaticResource UnknownValue}}" Header="用户" />
+                            <DataGridTextColumn Binding="{Binding ReceivedSequence}" Header="接收序号" />
+                            <DataGridTextColumn Binding="{Binding LiveEvidenceId}" Header="来源证据 ID" />
+                            <DataGridTextColumn Binding="{Binding MatchedProcessLiveEvidenceId, Converter={StaticResource UnknownValue}}" Header="匹配的进程证据" />
+                        </DataGrid.Columns>
+                    </DataGrid>
                 </Grid>
             </TabItem>
         </TabControl>
