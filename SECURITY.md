@@ -73,6 +73,13 @@ explanation is in the README:
 - The database is **not a tamper-proof medium**. A local administrator, or any
   process with write access to the file, can modify, replace or delete it. There is
   no signature, no external anchoring and no tamper-evident chain for live capture.
+- The append-only SQLite triggers constrain **this application's own write path**. They
+  are not a defence against another program that can write to the file: such a writer
+  chooses its own connection settings, and SQLite fires delete triggers for `REPLACE`
+  conflict resolution only when `recursive_triggers` is enabled. DeleteAudit never
+  issues `REPLACE` and does enable that setting on its own write connection, but neither
+  fact constrains anyone else. Read the triggers as protection against application
+  mistakes, not against an attacker who already has write access.
 - Consequently DeleteAudit must **not** be treated as a sole or authoritative source
   of evidence.
 

@@ -160,6 +160,49 @@ public sealed class SqliteLiveMonitoringRepositoryTests
     }
 
     /// <summary>
+    /// Naming the object is not enough: an operator has to be told which part of the
+    /// definition is wrong. A regression that rejected every trigger for the same reason
+    /// would still satisfy the object-name assertion, so the reason itself is pinned.
+    /// </summary>
+    [Theory]
+    [InlineData(EvidenceSchemaMutation.WrongTiming, "timing is not BEFORE")]
+    [InlineData(EvidenceSchemaMutation.WrongEvent, "event is not UPDATE")]
+    [InlineData(EvidenceSchemaMutation.UpdateOfColumns, "is not followed by ON")]
+    [InlineData(EvidenceSchemaMutation.ConditionalTrigger, "is not followed by BEGIN")]
+    [InlineData(EvidenceSchemaMutation.ZeroRowRaiseWhere, "is not closed by ');'")]
+    [InlineData(EvidenceSchemaMutation.ZeroRowRaiseLimit, "is not closed by ');'")]
+    [InlineData(EvidenceSchemaMutation.ZeroRowRaiseFrom, "is not closed by ');'")]
+    [InlineData(
+        EvidenceSchemaMutation.MultiStatementBody,
+        "does not begin with SELECT RAISE(ABORT")]
+    [InlineData(
+        EvidenceSchemaMutation.RaiseIgnore,
+        "does not begin with SELECT RAISE(ABORT")]
+    [InlineData(
+        EvidenceSchemaMutation.CaseConditionalRaise,
+        "does not begin with SELECT RAISE(ABORT")]
+    [InlineData(EvidenceSchemaMutation.WrongTriggerBinding, "it is bound to")]
+    [InlineData(EvidenceSchemaMutation.TriggerNameTakenByView, "is not a trigger")]
+    [InlineData(EvidenceSchemaMutation.QuotedIdentifierHeaderDecoy, "timing is not BEFORE")]
+    [InlineData(EvidenceSchemaMutation.WrongTriggerName, "required trigger is missing")]
+    public async Task MalformedTriggerNamesItsSpecificReason(
+        EvidenceSchemaMutation mutation,
+        string expectedReason)
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(
+            location,
+            applyLiveMigration: true,
+            evidenceMigrationTransform: sql => MutateEvidenceMigration(sql, mutation));
+        var repository = new SqliteLiveMonitoringRepository(location);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => repository.ValidateSchemaAsync());
+
+        Assert.Contains(expectedReason, exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// The canonical check must reject rewritten guards without rejecting a guard that is
     /// merely spelled differently. Case, whitespace, identifier quoting and the two inert
     /// optional clauses are all semantics-preserving and must stay ready.
@@ -836,6 +879,103 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         var exception = await Assert.ThrowsAsync<SqliteException>(
             () => command.ExecuteNonQueryAsync());
         Assert.Equal(8, exception.SqliteErrorCode);
+    }
+
+    /// <summary>
+    /// REPLACE conflict resolution deletes the conflicting row. With recursive_triggers
+    /// off that delete does not fire the append-only trigger, so no production path may
+    /// use it — checked across the whole of src, not just this repository.
+    /// </summary>
+    [Fact]
+    public async Task NoProductionSqlUsesReplaceConflictResolution()
+    {
+        var sourceRoot = Path.Combine(RepositoryRoot.Value, "src");
+        var offenders = new List<string>();
+        foreach (var file in Directory.EnumerateFiles(
+                     sourceRoot,
+                     "*.cs",
+                     SearchOption.AllDirectories))
+        {
+            var text = await File.ReadAllTextAsync(file);
+            foreach (var forbidden in new[]
+                     {
+                         "INSERT OR REPLACE", "REPLACE INTO", "INSERT OR IGNORE"
+                     })
+            {
+                if (text.Contains(forbidden, StringComparison.OrdinalIgnoreCase))
+                {
+                    offenders.Add($"{Path.GetFileName(file)}: {forbidden}");
+                }
+            }
+        }
+
+        Assert.Empty(offenders);
+    }
+
+    /// <summary>
+    /// Proves the guard is real rather than declarative: with the connection the
+    /// repository actually opens, a REPLACE that would silently drop committed evidence
+    /// is aborted by the append-only delete trigger.
+    /// </summary>
+    [Fact]
+    public async Task ReplaceOnCommittedEvidenceIsAbortedByTheAppendOnlyGuard()
+    {
+        const string OriginalXml = "<Event original=\"true\" />";
+        var location = CreateLocation();
+        await CreateDatabaseAsync(location, applyLiveMigration: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var sessionId = await StartCaptureAsync(repository);
+        await repository.AppendRecordsAsync(
+            [CaptureRecord(sessionId, 1, OriginalXml)]);
+
+        await using var connection = CreateWritableConnection(location.DatabasePath);
+        await connection.OpenAsync();
+        using (var pragma = connection.CreateCommand())
+        {
+            // The same settings the repository's own write connection uses.
+            pragma.CommandText = """
+                PRAGMA foreign_keys = ON;
+                PRAGMA recursive_triggers = ON;
+                """;
+            await pragma.ExecuteNonQueryAsync();
+        }
+
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT OR REPLACE INTO live_capture_records (
+                live_evidence_id, live_session_id, received_sequence, channel_name,
+                observed_utc, raw_xml, raw_xml_sha256, outcome)
+            VALUES ($id, $session, 1, 'Microsoft-Windows-Sysmon/Operational',
+                    '2026-07-25T09:00:00.0000000+00:00', '<Event />', $digest, 'ignored');
+            """;
+        command.Parameters.AddWithValue("$id", LiveEvidenceIdentity.Create(sessionId, 1));
+        command.Parameters.AddWithValue("$session", sessionId);
+        command.Parameters.Add("$digest", SqliteType.Blob).Value =
+            SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("<Event />"));
+
+        var exception = await Assert.ThrowsAsync<SqliteException>(
+            () => command.ExecuteNonQueryAsync());
+
+        Assert.Contains("append-only", exception.Message, StringComparison.OrdinalIgnoreCase);
+        // The committed evidence is untouched.
+        var stored = await ReadSingleRawXmlAsync(
+            location,
+            LiveEvidenceIdentity.Create(sessionId, 1));
+        Assert.Equal(OriginalXml, stored);
+    }
+
+    private static async Task<string?> ReadSingleRawXmlAsync(
+        ViewerDataLocation location,
+        string liveEvidenceId)
+    {
+        await using var connection = location.CreateReadOnlyConnection();
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT raw_xml FROM live_capture_records WHERE live_evidence_id = $id;
+            """;
+        command.Parameters.AddWithValue("$id", liveEvidenceId);
+        return await command.ExecuteScalarAsync() as string;
     }
 
     [Fact]

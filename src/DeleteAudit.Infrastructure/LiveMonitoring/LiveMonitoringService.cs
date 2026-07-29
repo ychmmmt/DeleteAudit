@@ -563,6 +563,10 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                 }
                 catch (OperationCanceledException)
                 {
+                    // The consumer observes its own cancellation token; a cancelled drain
+                    // is the expected shutdown outcome, not a pipeline failure, so it is
+                    // deliberately not reported as one. Any other exception falls through
+                    // to the handler below and is recorded as live_consumer_failed.
                 }
                 catch (Exception exception)
                 {
@@ -735,6 +739,10 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            // Only our own cancellation is swallowed, and only to leave the loop: the
+            // finally below still retires the deadline and writes whatever the batch
+            // still holds. A cancellation that did not come from this token does not
+            // match the filter and propagates to ReleasePipelineAsync.
         }
         finally
         {
@@ -1227,9 +1235,16 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
         }
         catch (OperationCanceledException)
         {
+            // This await exists only to observe the shutdown task so its exception is
+            // never unhandled. The fault it is tearing down was already recorded as the
+            // session's root cause and diagnostic before the task was started, so there
+            // is nothing further to report here.
         }
         catch (Exception exception) when (IsExpectedFailure(exception))
         {
+            // Same reason, for the storage and lifecycle failures the shutdown path can
+            // surface. The filter is deliberate: an unexpected exception type is not
+            // swallowed and still propagates to the caller.
         }
     }
 

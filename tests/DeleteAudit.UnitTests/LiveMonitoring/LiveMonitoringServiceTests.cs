@@ -2179,6 +2179,174 @@ public sealed class LiveMonitoringServiceTests
                 && item.Message.Contains(CompletionFailure, StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// Queue overflow is a condition, not a fault. It may claim the user-visible error
+    /// while nothing else has, but the first real fault replaces it and is then never
+    /// displaced again — including by traffic that keeps arriving afterwards.
+    /// </summary>
+    [Fact]
+    public async Task QueueOverflowNoticeYieldsToTheFirstRealFaultAndNeverReturns()
+    {
+        const string SourceFailure = "specific source failure A";
+        var source = new FakeLiveEventSource();
+        // Capacity 1 plus a parked consumer makes the overflow deterministic.
+        using var appendGate = new ManualResetEventSlim(false);
+        var repository = new FakeRepository { AppendGate = appendGate };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository,
+            new LiveMonitoringOptions(QueueCapacity: 1));
+        await service.StartAsync();
+
+        for (var index = 1; index <= 200; index++)
+        {
+            source.Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        // The overflow notice is shown while nothing more causal exists.
+        Assert.Contains(
+            "队列已满",
+            service.Snapshot.LastError ?? string.Empty,
+            StringComparison.Ordinal);
+
+        // OnSourceFault records the root cause synchronously before it returns.
+        source.Fault("live_watcher_failed", SourceFailure);
+
+        Assert.Contains(SourceFailure, service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "队列已满",
+            service.Snapshot.LastError ?? string.Empty,
+            StringComparison.Ordinal);
+
+        appendGate.Set();
+        await service.StopAsync();
+
+        // Late traffic after the fault must not restore the overflow notice.
+        source.Watchers[0].Publish(LiveEventFixtures.SysmonRecord(
+            LiveEventFixtures.SysmonDelete(999)));
+
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Contains(SourceFailure, service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "队列已满",
+            service.Snapshot.LastError ?? string.Empty,
+            StringComparison.Ordinal);
+        // Both remain separately diagnosable.
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_queue_overflow");
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_watcher_failed"
+                && item.Message.Contains(SourceFailure, StringComparison.Ordinal));
+        var completion = Assert.Single(repository.Completions);
+        Assert.Equal(LiveMonitoringState.Error, completion.FinalState);
+        Assert.True(completion.Counters.Dropped > 0);
+        Assert.True(completion.Counters.IsBalanced);
+    }
+
+    /// <summary>
+    /// The precedence rules above only hold if no branch writes the user-visible error
+    /// directly. The one window where a fault is recorded while the session still accepts
+    /// events — a cancelled start, between marking the fault and stopping acceptance — is
+    /// a synchronous gap that cannot be entered deterministically from outside, so the
+    /// invariant is pinned at its source instead: exactly three assignments exist, and
+    /// the queue-overflow branch goes through the shared condition entry point.
+    /// </summary>
+    [Fact]
+    public void LastErrorIsOnlyAssignedThroughTheSharedEntryPoints()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            RepositoryRoot(),
+            "src",
+            "DeleteAudit.Infrastructure",
+            "LiveMonitoring",
+            "LiveMonitoringService.cs"));
+
+        // BeginSession resets it, MarkFaultedCore records a fault, ReportConditionCore
+        // records a non-fault condition. Any fourth assignment is a bypass.
+        Assert.Equal(3, CountOccurrences(source, "_lastError ="));
+
+        var overflowBranch = source.IndexOf(
+            "live_queue_overflow",
+            StringComparison.Ordinal);
+        Assert.True(overflowBranch > 0);
+        var precedingText = source[..overflowBranch];
+        var lastConditionCall = precedingText.LastIndexOf(
+            "ReportConditionCore(",
+            StringComparison.Ordinal);
+        var lastDirectAssignment = precedingText.LastIndexOf(
+            "_lastError =",
+            StringComparison.Ordinal);
+        Assert.True(
+            lastConditionCall > lastDirectAssignment,
+            "the queue overflow branch must report through ReportConditionCore");
+    }
+
+    private static int CountOccurrences(string text, string value)
+    {
+        var count = 0;
+        var index = text.IndexOf(value, StringComparison.Ordinal);
+        while (index >= 0)
+        {
+            count++;
+            index = text.IndexOf(value, index + value.Length, StringComparison.Ordinal);
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// A cancelled start records its root cause while the session is still accepting
+    /// events. Whatever arrives afterwards must not overwrite it.
+    /// </summary>
+    [Fact]
+    public async Task CancelledStartRootCauseSurvivesLaterTraffic()
+    {
+        using var startGate = new TestGate();
+        var source = new FakeLiveEventSource { StartGate = startGate };
+        var repository = new FakeRepository();
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository,
+            new LiveMonitoringOptions(QueueCapacity: 1));
+        using var cancellation = new CancellationTokenSource();
+
+        var starting = Task.Run(() => service.StartAsync(cancellation.Token));
+        await startGate.Entered.WaitAsync(Patience);
+        await cancellation.CancelAsync();
+        startGate.Release();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => starting);
+
+        var rootCause = service.Snapshot.LastError;
+        Assert.Contains("取消", rootCause ?? string.Empty, StringComparison.Ordinal);
+
+        // Records arriving after the aborted start are late; none of them may claim the
+        // user-visible error, and a full queue must not produce an overflow notice here.
+        for (var index = 1; index <= 200; index++)
+        {
+            source.Watchers[0].Publish(LiveEventFixtures.SysmonRecord(
+                LiveEventFixtures.SysmonDelete(index)));
+        }
+
+        Assert.Equal(rootCause, service.Snapshot.LastError);
+        Assert.DoesNotContain(
+            "队列已满",
+            service.Snapshot.LastError ?? string.Empty,
+            StringComparison.Ordinal);
+        Assert.Equal(LiveMonitoringState.Error, service.Snapshot.State);
+        Assert.Equal(200, service.Snapshot.Counters.LateDiscarded);
+        Assert.Equal(0, service.Snapshot.Counters.Dropped);
+        var completion = Assert.Single(repository.Completions);
+        Assert.Equal(LiveMonitoringState.Error, completion.FinalState);
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_start_cancelled");
+    }
+
     // ---------- Phase 2B.1 start cancellation lifecycle ----------
 
     [Fact]

@@ -593,15 +593,17 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         // unreachable — WHERE, LIMIT, FROM, CASE — is not that shape, so it is rejected
         // without having to enumerate the ways of writing one.
         var tokens = TokenizeSql(reader.GetString(2));
-        if (tokens is null || !MatchesCanonicalTrigger(tokens, requirement))
+        if (tokens is null)
         {
             throw TriggerNotReady(
                 requirement,
-                "definition must be exactly CREATE TRIGGER "
-                + $"{requirement.Name} BEFORE {requirement.EventName} ON "
-                + $"{requirement.TableName} BEGIN SELECT RAISE(ABORT, '<message>'); END; "
-                + "no other timing, event, column list, WHEN clause, additional "
-                + "statement or trailing clause is accepted");
+                "its definition could not be tokenised; an unterminated string, quoted "
+                + "identifier or block comment is present");
+        }
+
+        if (!TryMatchCanonicalTrigger(tokens, requirement, out var mismatch))
+        {
+            throw TriggerNotReady(requirement, mismatch);
         }
     }
 
@@ -616,14 +618,16 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
     /// (<c>FOR EACH ROW</c> is the sole supported granularity) and neither can make the
     /// RAISE conditional or unreachable.
     /// </summary>
-    private static bool MatchesCanonicalTrigger(
+    private static bool TryMatchCanonicalTrigger(
         IReadOnlyList<SqlToken> tokens,
-        TriggerRequirement requirement)
+        TriggerRequirement requirement,
+        out string mismatch)
     {
         var position = 0;
         if (!TakeWord(tokens, ref position, "CREATE")
             || !TakeWord(tokens, ref position, "TRIGGER"))
         {
+            mismatch = "its definition does not start with CREATE TRIGGER";
             return false;
         }
 
@@ -632,15 +636,41 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 || !TakeWord(tokens, ref position, "NOT")
                 || !TakeWord(tokens, ref position, "EXISTS")))
         {
+            mismatch = "the clause after CREATE TRIGGER is not IF NOT EXISTS";
             return false;
         }
 
-        if (!TakeName(tokens, ref position, requirement.Name)
-            || !TakeWord(tokens, ref position, "BEFORE")
-            || !TakeWord(tokens, ref position, requirement.EventName)
-            || !TakeWord(tokens, ref position, "ON")
-            || !TakeName(tokens, ref position, requirement.TableName))
+        if (!TakeName(tokens, ref position, requirement.Name))
         {
+            mismatch =
+                $"the declared trigger name is not '{requirement.Name}'; a "
+                + "schema-qualified name is not part of the canonical definition";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, "BEFORE"))
+        {
+            mismatch = "the trigger timing is not BEFORE";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, requirement.EventName))
+        {
+            mismatch = $"the trigger event is not {requirement.EventName}";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, "ON"))
+        {
+            mismatch =
+                $"the {requirement.EventName} event is not followed by ON; a column "
+                + "list such as UPDATE OF <columns> leaves other columns unguarded";
+            return false;
+        }
+
+        if (!TakeName(tokens, ref position, requirement.TableName))
+        {
+            mismatch = $"the declared table is not '{requirement.TableName}'";
             return false;
         }
 
@@ -649,20 +679,50 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 || !TakeWord(tokens, ref position, "EACH")
                 || !TakeWord(tokens, ref position, "ROW")))
         {
+            mismatch = "the clause before BEGIN is not FOR EACH ROW";
             return false;
         }
 
-        if (!TakeWord(tokens, ref position, "BEGIN")
-            || !TakeWord(tokens, ref position, "SELECT")
+        if (!TakeWord(tokens, ref position, "BEGIN"))
+        {
+            mismatch =
+                "the header is not followed by BEGIN; a WHEN clause makes the guard "
+                + "conditional and is not accepted";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, "SELECT")
             || !TakeWord(tokens, ref position, "RAISE")
             || !TakePunctuator(tokens, ref position, "(")
             || !TakeWord(tokens, ref position, "ABORT")
-            || !TakePunctuator(tokens, ref position, ",")
-            || !TakeKind(tokens, ref position, SqlTokenKind.StringLiteral)
-            || !TakePunctuator(tokens, ref position, ")")
-            || !TakePunctuator(tokens, ref position, ";")
-            || !TakeWord(tokens, ref position, "END"))
+            || !TakePunctuator(tokens, ref position, ","))
         {
+            mismatch =
+                "the body does not begin with SELECT RAISE(ABORT, ...); only an "
+                + "unconditional ABORT is accepted";
+            return false;
+        }
+
+        if (!TakeKind(tokens, ref position, SqlTokenKind.StringLiteral))
+        {
+            mismatch =
+                "the RAISE message is not a single-quoted string literal; a "
+                + "double-quoted message is not part of the canonical definition";
+            return false;
+        }
+
+        if (!TakePunctuator(tokens, ref position, ")")
+            || !TakePunctuator(tokens, ref position, ";"))
+        {
+            mismatch = "the RAISE call is not closed by ');'";
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, "END"))
+        {
+            mismatch =
+                "the body holds more than the single RAISE statement, or a clause "
+                + "such as WHERE, LIMIT, FROM or CASE can stop it from being reached";
             return false;
         }
 
@@ -672,7 +732,14 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
             position++;
         }
 
-        return position == tokens.Count;
+        if (position != tokens.Count)
+        {
+            mismatch = "the definition carries extra tokens after END";
+            return false;
+        }
+
+        mismatch = string.Empty;
+        return true;
     }
 
     private static bool PeekWord(
@@ -1570,7 +1637,15 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         {
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
             using var pragma = connection.CreateCommand();
-            pragma.CommandText = "PRAGMA foreign_keys = ON;";
+            // recursive_triggers is defence in depth for this connection only: without it
+            // a REPLACE conflict resolution would delete a row without firing the
+            // append-only delete trigger. This repository never issues REPLACE, and the
+            // setting is per-connection, so it constrains this application's own writes —
+            // it is not, and must not be presented as, protection against another writer.
+            pragma.CommandText = """
+                PRAGMA foreign_keys = ON;
+                PRAGMA recursive_triggers = ON;
+                """;
             await pragma.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             return connection;
         }
