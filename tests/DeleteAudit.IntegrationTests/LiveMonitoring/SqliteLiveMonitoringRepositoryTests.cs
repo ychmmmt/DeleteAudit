@@ -76,6 +76,54 @@ public sealed class SqliteLiveMonitoringRepositoryTests
     [InlineData(
         EvidenceSchemaMutation.ConditionalTrigger,
         "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.ZeroRowRaiseWhere,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.ZeroRowRaiseLimit,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.ZeroRowRaiseFrom,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.CaseConditionalRaise,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.MultiStatementBody,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.RaiseIgnore,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.WrongTiming,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.WrongEvent,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.UpdateOfColumns,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.QuotedIdentifierHeaderDecoy,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.StringLiteralHeaderDecoy,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.CommentHeaderDecoy,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.WrongTriggerName,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.TriggerNameTakenByView,
+        "live_capture_records_no_update")]
+    [InlineData(
+        EvidenceSchemaMutation.VirtualGeneratedColumn,
+        "shadow_outcome")]
+    [InlineData(
+        EvidenceSchemaMutation.StoredGeneratedColumn,
+        "shadow_channel")]
     [InlineData(EvidenceSchemaMutation.MissingStrict, "live_capture_sessions")]
     public async Task MalformedEvidenceSchemaFailsClosedWithSpecificObjectAndMigration(
         EvidenceSchemaMutation mutation,
@@ -87,10 +135,13 @@ public sealed class SqliteLiveMonitoringRepositoryTests
             applyLiveMigration: true,
             evidenceMigrationTransform: sql => MutateEvidenceMigration(sql, mutation));
         var repository = new SqliteLiveMonitoringRepository(location);
+        var before = await FileDigestAsync(location.DatabasePath);
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
             () => repository.ValidateSchemaAsync());
 
+        // A rejected schema is reported, never repaired.
+        Assert.Equal(before, await FileDigestAsync(location.DatabasePath));
         Assert.Contains(expectedObject, exception.Message, StringComparison.Ordinal);
         Assert.Contains(
             "db/migrations/0004_phase_2b_live_evidence.sql",
@@ -104,6 +155,56 @@ public sealed class SqliteLiveMonitoringRepositoryTests
             "does not prove database integrity, tamper resistance, or migration authenticity",
             exception.Message,
             StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The canonical check must reject rewritten guards without rejecting a guard that is
+    /// merely spelled differently. Case, whitespace, identifier quoting and the two inert
+    /// optional clauses are all semantics-preserving and must stay ready.
+    /// </summary>
+    [Theory]
+    [InlineData(
+        """
+        create trigger live_capture_records_no_update
+        before update on live_capture_records begin
+            select raise( ABORT , 'live_capture_records is append-only' ) ;
+        end;
+        """)]
+    [InlineData(
+        """
+        CREATE TRIGGER "live_capture_records_no_update"
+        BEFORE UPDATE ON [live_capture_records] BEGIN
+            SELECT RAISE(ABORT, 'live_capture_records is append-only');
+        END;
+        """)]
+    [InlineData(
+        """
+        CREATE TRIGGER live_capture_records_no_update
+        BEFORE UPDATE ON live_capture_records
+        FOR EACH ROW BEGIN
+            SELECT RAISE(ABORT, 'live_capture_records is append-only');
+        END;
+        """)]
+    [InlineData(
+        """
+        CREATE TRIGGER IF NOT EXISTS live_capture_records_no_update
+        BEFORE UPDATE ON live_capture_records BEGIN
+            SELECT RAISE(ABORT, 'it can say anything at all');
+        END;
+        """)]
+    public async Task SemanticallyIdenticalTriggerSpellingsStayReady(string trigger)
+    {
+        var location = CreateLocation();
+        await CreateDatabaseAsync(
+            location,
+            applyLiveMigration: true,
+            evidenceMigrationTransform: sql =>
+                ReplaceCanonicalRecordUpdate(sql, trigger));
+        var repository = new SqliteLiveMonitoringRepository(location);
+
+        await repository.ValidateSchemaAsync();
+
+        Assert.Equal(3, await CountLiveTablesAsync(location));
     }
 
     [Fact]
@@ -937,6 +1038,89 @@ public sealed class SqliteLiveMonitoringRepositoryTests
                 migration,
                 "BEFORE UPDATE ON live_capture_records BEGIN",
                 "BEFORE UPDATE ON live_capture_records WHEN 1 = 1 BEGIN"),
+            // A RAISE that can never be reached is decoration, not a guard. Each of the
+            // following creates cleanly and leaves UPDATE working.
+            EvidenceSchemaMutation.ZeroRowRaiseWhere => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT RAISE(ABORT, 'live_capture_records is append-only') WHERE 0;"),
+            EvidenceSchemaMutation.ZeroRowRaiseLimit => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT RAISE(ABORT, 'live_capture_records is append-only') LIMIT 0;"),
+            EvidenceSchemaMutation.ZeroRowRaiseFrom => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT RAISE(ABORT, 'live_capture_records is append-only')\n"
+                + "        FROM (SELECT 1) WHERE 0;"),
+            EvidenceSchemaMutation.CaseConditionalRaise => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT CASE WHEN 0 THEN RAISE(ABORT, 'live_capture_records is append-only')\n"
+                + "        END;"),
+            EvidenceSchemaMutation.MultiStatementBody => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT 1;\n"
+                + "    SELECT RAISE(ABORT, 'live_capture_records is append-only');"),
+            EvidenceSchemaMutation.RaiseIgnore => ReplaceCanonicalRecordUpdateBody(
+                migration,
+                "SELECT RAISE(IGNORE);"),
+            EvidenceSchemaMutation.WrongTiming => ReplaceRequiredOnce(
+                migration,
+                "BEFORE UPDATE ON live_capture_records BEGIN",
+                "AFTER UPDATE ON live_capture_records BEGIN"),
+            EvidenceSchemaMutation.WrongEvent => ReplaceRequiredOnce(
+                migration,
+                "BEFORE UPDATE ON live_capture_records BEGIN",
+                "BEFORE INSERT ON live_capture_records BEGIN"),
+            // A column-scoped UPDATE trigger leaves every other column unguarded.
+            EvidenceSchemaMutation.UpdateOfColumns => ReplaceRequiredOnce(
+                migration,
+                "BEFORE UPDATE ON live_capture_records BEGIN",
+                "BEFORE UPDATE OF raw_xml ON live_capture_records BEGIN"),
+            // Header tokens hidden inside a quoted identifier, a string literal and a
+            // comment. None of them makes the trigger guard UPDATE.
+            EvidenceSchemaMutation.QuotedIdentifierHeaderDecoy => ReplaceCanonicalRecordUpdate(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                AFTER DELETE ON live_capture_records BEGIN
+                    SELECT RAISE(ABORT, 'decoy')
+                        FROM (SELECT 1 AS "BEFORE UPDATE ON live_capture_records");
+                END;
+                """),
+            EvidenceSchemaMutation.StringLiteralHeaderDecoy => ReplaceCanonicalRecordUpdate(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                AFTER DELETE ON live_capture_records BEGIN
+                    SELECT RAISE(ABORT, 'BEFORE UPDATE ON live_capture_records');
+                END;
+                """),
+            EvidenceSchemaMutation.CommentHeaderDecoy => ReplaceCanonicalRecordUpdate(
+                migration,
+                """
+                CREATE TRIGGER live_capture_records_no_update
+                AFTER DELETE ON live_capture_records BEGIN
+                    -- BEFORE UPDATE ON live_capture_records
+                    SELECT RAISE(ABORT, 'decoy');
+                END;
+                """),
+            EvidenceSchemaMutation.WrongTriggerName => ReplaceRequiredOnce(
+                migration,
+                "CREATE TRIGGER live_capture_records_no_update",
+                "CREATE TRIGGER live_capture_records_no_update_v2"),
+            // The name exists, but it belongs to a view rather than a trigger.
+            EvidenceSchemaMutation.TriggerNameTakenByView => ReplaceCanonicalRecordUpdate(
+                migration,
+                "CREATE VIEW live_capture_records_no_update AS SELECT 1 AS ok;"),
+            // pragma_table_info hides these; only pragma_table_xinfo reports them.
+            EvidenceSchemaMutation.VirtualGeneratedColumn => ReplaceRequiredOnce(
+                migration,
+                "    UNIQUE (live_session_id, received_sequence)",
+                "    shadow_outcome          TEXT GENERATED ALWAYS AS (outcome) VIRTUAL,\n"
+                + "    UNIQUE (live_session_id, received_sequence)"),
+            EvidenceSchemaMutation.StoredGeneratedColumn => ReplaceRequiredOnce(
+                migration,
+                "    UNIQUE (live_session_id, received_sequence)",
+                "    shadow_channel          TEXT GENERATED ALWAYS AS (channel_name) STORED,\n"
+                + "    UNIQUE (live_session_id, received_sequence)"),
             EvidenceSchemaMutation.MissingStrict => ReplaceRequiredOnce(
                 migration,
                 """
@@ -973,6 +1157,41 @@ public sealed class SqliteLiveMonitoringRepositoryTests
             newValue,
             source.AsSpan(index + oldValue.Length));
     }
+
+    private static async Task<string> FileDigestAsync(string path)
+    {
+        var bytes = await File.ReadAllBytesAsync(path);
+        return Convert.ToHexString(SHA256.HashData(bytes));
+    }
+
+    /// <summary>
+    /// The canonical append-only UPDATE trigger for live_capture_records, exactly as
+    /// 0004 declares it. Mutations are expressed as replacements of this text so a
+    /// fixture can never drift away from the real migration unnoticed.
+    /// </summary>
+    private const string CanonicalRecordUpdateTrigger =
+        """
+        CREATE TRIGGER live_capture_records_no_update
+        BEFORE UPDATE ON live_capture_records BEGIN
+            SELECT RAISE(ABORT, 'live_capture_records is append-only');
+        END;
+        """;
+
+    private static string ReplaceCanonicalRecordUpdate(
+        string migration,
+        string replacement) =>
+        ReplaceRequiredOnce(migration, CanonicalRecordUpdateTrigger, replacement);
+
+    /// <summary>Keeps the canonical header and swaps only the trigger body.</summary>
+    private static string ReplaceCanonicalRecordUpdateBody(
+        string migration,
+        string body) =>
+        ReplaceCanonicalRecordUpdate(
+            migration,
+            "CREATE TRIGGER live_capture_records_no_update\n"
+            + "BEFORE UPDATE ON live_capture_records BEGIN\n"
+            + $"    {body}\n"
+            + "END;");
 
     private static SqliteConnection CreateWritableConnection(string databasePath) =>
         new(new SqliteConnectionStringBuilder
@@ -1281,6 +1500,22 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         WrongTriggerBinding,
         TriggerWithoutRaise,
         ConditionalTrigger,
+        ZeroRowRaiseWhere,
+        ZeroRowRaiseLimit,
+        ZeroRowRaiseFrom,
+        CaseConditionalRaise,
+        MultiStatementBody,
+        RaiseIgnore,
+        WrongTiming,
+        WrongEvent,
+        UpdateOfColumns,
+        QuotedIdentifierHeaderDecoy,
+        StringLiteralHeaderDecoy,
+        CommentHeaderDecoy,
+        WrongTriggerName,
+        TriggerNameTakenByView,
+        VirtualGeneratedColumn,
+        StoredGeneratedColumn,
         MissingStrict
     }
 

@@ -284,6 +284,22 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 requirement.Name,
                 cancellationToken)
             .ConfigureAwait(false);
+
+        // The canonical schema declares only plain stored columns. A generated or hidden
+        // column is rejected by name rather than quietly excluded from the count.
+        var generated = columns
+            .Where(column => column.Value.Hidden != 0)
+            .Select(column => column.Key)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+        if (generated.Length != 0)
+        {
+            throw SchemaNotReady(
+                requirement,
+                "generated or hidden column(s) are declared: "
+                + string.Join(", ", generated));
+        }
+
         foreach (var expected in requirement.Columns)
         {
             if (!columns.TryGetValue(expected.Name, out var actual))
@@ -377,9 +393,12 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         CancellationToken cancellationToken)
     {
         using var command = connection.CreateCommand();
+        // table_xinfo, not table_info: only the extended pragma reports generated and
+        // hidden columns. Reading the narrow pragma let a table carry an extra generated
+        // column and still satisfy an exact column-set comparison.
         command.CommandText = """
-            SELECT name, type, "notnull", pk
-            FROM pragma_table_info($table, $schema)
+            SELECT name, type, "notnull", pk, hidden
+            FROM pragma_table_xinfo($table, $schema)
             ORDER BY cid;
             """;
         command.Parameters.Add("$table", SqliteType.Text).Value = tableName;
@@ -397,7 +416,8 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 new ColumnMetadata(
                     reader.GetString(1).Trim(),
                     reader.GetInt64(2) != 0,
-                    reader.GetInt32(3)));
+                    reader.GetInt32(3),
+                    reader.GetInt64(4)));
         }
 
         return columns;
@@ -540,120 +560,328 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 + $"'{requirement.TableName}'");
         }
 
-        var tokens = TokenizeTriggerSql(reader.GetString(2));
-        if (!ContainsTokenSequence(
-                tokens,
-                ["BEFORE", requirement.EventName, "ON", requirement.TableName])
-            || tokens.Contains("WHEN", StringComparer.OrdinalIgnoreCase)
-            || !ContainsTokenSequence(tokens, ["SELECT", "RAISE", "ABORT"]))
+        // Whitelist, not blacklist: the stored definition is tokenised into typed tokens
+        // and matched against the one canonical shape. A RAISE that some clause can make
+        // unreachable — WHERE, LIMIT, FROM, CASE — is not that shape, so it is rejected
+        // without having to enumerate the ways of writing one.
+        var tokens = TokenizeSql(reader.GetString(2));
+        if (tokens is null || !MatchesCanonicalTrigger(tokens, requirement))
         {
             throw TriggerNotReady(
                 requirement,
-                $"definition must be unconditional {requirement.EventName} "
-                + "and fail closed with SELECT RAISE(ABORT, ...)");
+                "definition must be exactly CREATE TRIGGER "
+                + $"{requirement.Name} BEFORE {requirement.EventName} ON "
+                + $"{requirement.TableName} BEGIN SELECT RAISE(ABORT, '<message>'); END; "
+                + "no other timing, event, column list, WHEN clause, additional "
+                + "statement or trailing clause is accepted");
         }
     }
 
-    private static string[] TokenizeTriggerSql(string sql)
+    /// <summary>
+    /// Matches the tokenised trigger against the single accepted definition:
+    /// <code>
+    /// CREATE TRIGGER [IF NOT EXISTS] name BEFORE (UPDATE|DELETE) ON table
+    /// [FOR EACH ROW] BEGIN SELECT RAISE(ABORT, 'literal'); END [;]
+    /// </code>
+    /// Every token must be consumed, so nothing can be appended to the body. The two
+    /// optional clauses are the only ones accepted: both are semantically inert in SQLite
+    /// (<c>FOR EACH ROW</c> is the sole supported granularity) and neither can make the
+    /// RAISE conditional or unreachable.
+    /// </summary>
+    private static bool MatchesCanonicalTrigger(
+        IReadOnlyList<SqlToken> tokens,
+        TriggerRequirement requirement)
     {
-        var normalized = new StringBuilder(sql.Length);
-        for (var index = 0; index < sql.Length; index++)
+        var position = 0;
+        if (!TakeWord(tokens, ref position, "CREATE")
+            || !TakeWord(tokens, ref position, "TRIGGER"))
+        {
+            return false;
+        }
+
+        if (PeekWord(tokens, position, "IF")
+            && (!TakeWord(tokens, ref position, "IF")
+                || !TakeWord(tokens, ref position, "NOT")
+                || !TakeWord(tokens, ref position, "EXISTS")))
+        {
+            return false;
+        }
+
+        if (!TakeName(tokens, ref position, requirement.Name)
+            || !TakeWord(tokens, ref position, "BEFORE")
+            || !TakeWord(tokens, ref position, requirement.EventName)
+            || !TakeWord(tokens, ref position, "ON")
+            || !TakeName(tokens, ref position, requirement.TableName))
+        {
+            return false;
+        }
+
+        if (PeekWord(tokens, position, "FOR")
+            && (!TakeWord(tokens, ref position, "FOR")
+                || !TakeWord(tokens, ref position, "EACH")
+                || !TakeWord(tokens, ref position, "ROW")))
+        {
+            return false;
+        }
+
+        if (!TakeWord(tokens, ref position, "BEGIN")
+            || !TakeWord(tokens, ref position, "SELECT")
+            || !TakeWord(tokens, ref position, "RAISE")
+            || !TakePunctuator(tokens, ref position, "(")
+            || !TakeWord(tokens, ref position, "ABORT")
+            || !TakePunctuator(tokens, ref position, ",")
+            || !TakeKind(tokens, ref position, SqlTokenKind.StringLiteral)
+            || !TakePunctuator(tokens, ref position, ")")
+            || !TakePunctuator(tokens, ref position, ";")
+            || !TakeWord(tokens, ref position, "END"))
+        {
+            return false;
+        }
+
+        // SQLite stores the definition without its terminating semicolon, but accept one.
+        if (position < tokens.Count && IsPunctuator(tokens[position], ";"))
+        {
+            position++;
+        }
+
+        return position == tokens.Count;
+    }
+
+    private static bool PeekWord(
+        IReadOnlyList<SqlToken> tokens,
+        int position,
+        string expected) =>
+        position < tokens.Count
+        && tokens[position].Kind == SqlTokenKind.Word
+        && string.Equals(tokens[position].Text, expected, StringComparison.OrdinalIgnoreCase);
+
+    private static bool TakeWord(
+        IReadOnlyList<SqlToken> tokens,
+        ref int position,
+        string expected)
+    {
+        if (!PeekWord(tokens, position, expected))
+        {
+            return false;
+        }
+
+        position++;
+        return true;
+    }
+
+    /// <summary>
+    /// Consumes an object name. A bare word and a quoted identifier are both accepted,
+    /// because quoting is the only formatting freedom SQLite has here; the text itself
+    /// must still equal the expected name.
+    /// </summary>
+    private static bool TakeName(
+        IReadOnlyList<SqlToken> tokens,
+        ref int position,
+        string expected)
+    {
+        if (position >= tokens.Count)
+        {
+            return false;
+        }
+
+        var token = tokens[position];
+        if (token.Kind is not (SqlTokenKind.Word or SqlTokenKind.QuotedName)
+            || !string.Equals(token.Text, expected, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        position++;
+        return true;
+    }
+
+    private static bool TakeKind(
+        IReadOnlyList<SqlToken> tokens,
+        ref int position,
+        SqlTokenKind kind)
+    {
+        if (position >= tokens.Count || tokens[position].Kind != kind)
+        {
+            return false;
+        }
+
+        position++;
+        return true;
+    }
+
+    private static bool TakePunctuator(
+        IReadOnlyList<SqlToken> tokens,
+        ref int position,
+        string expected)
+    {
+        if (position >= tokens.Count || !IsPunctuator(tokens[position], expected))
+        {
+            return false;
+        }
+
+        position++;
+        return true;
+    }
+
+    private static bool IsPunctuator(SqlToken token, string expected) =>
+        token.Kind == SqlTokenKind.Punctuator
+        && string.Equals(token.Text, expected, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Splits SQL into typed tokens. String literals, quoted identifiers and comments are
+    /// classified rather than flattened, so keywords hidden inside them can never be read
+    /// as part of the surrounding statement. Returns null when the text does not tokenise
+    /// — an unterminated literal, identifier or comment is treated as not ready.
+    /// </summary>
+    private static List<SqlToken>? TokenizeSql(string sql)
+    {
+        var tokens = new List<SqlToken>();
+        var index = 0;
+        while (index < sql.Length)
         {
             var character = sql[index];
-            if (character == '\'')
+            if (char.IsWhiteSpace(character))
             {
-                normalized.Append(' ');
-                while (++index < sql.Length)
+                index++;
+                continue;
+            }
+
+            if (character == '-' && index + 1 < sql.Length && sql[index + 1] == '-')
+            {
+                index += 2;
+                while (index < sql.Length && sql[index] is not '\n')
                 {
-                    if (sql[index] != '\'')
+                    index++;
+                }
+
+                continue;
+            }
+
+            if (character == '/' && index + 1 < sql.Length && sql[index + 1] == '*')
+            {
+                index += 2;
+                var closed = false;
+                while (index + 1 < sql.Length)
+                {
+                    if (sql[index] == '*' && sql[index + 1] == '/')
                     {
-                        continue;
+                        index += 2;
+                        closed = true;
+                        break;
                     }
 
-                    if (index + 1 < sql.Length && sql[index + 1] == '\'')
-                    {
-                        index++;
-                        continue;
-                    }
+                    index++;
+                }
 
-                    break;
+                if (!closed)
+                {
+                    return null;
                 }
 
                 continue;
             }
 
-            if (character == '-'
-                && index + 1 < sql.Length
-                && sql[index + 1] == '-')
+            if (character is '\'' or '"' or '`' or '[')
             {
-                normalized.Append(' ');
-                index += 2;
-                while (index < sql.Length && sql[index] is not '\r' and not '\n')
+                var closing = character == '[' ? ']' : character;
+                // Only same-character delimiters use doubling to escape themselves;
+                // SQLite's bracket identifiers have no escape at all.
+                if (!TryReadDelimited(
+                        sql,
+                        ref index,
+                        closing,
+                        allowDoubling: character != '[',
+                        out var text))
                 {
-                    index++;
+                    return null;
                 }
 
+                tokens.Add(new SqlToken(
+                    character == '\'' ? SqlTokenKind.StringLiteral : SqlTokenKind.QuotedName,
+                    text));
                 continue;
             }
 
-            if (character == '/'
-                && index + 1 < sql.Length
-                && sql[index + 1] == '*')
+            if (char.IsAsciiLetter(character) || character == '_')
             {
-                normalized.Append(' ');
-                index += 2;
-                while (index + 1 < sql.Length
-                       && !(sql[index] == '*' && sql[index + 1] == '/'))
+                var start = index;
+                while (index < sql.Length
+                       && (char.IsAsciiLetterOrDigit(sql[index])
+                           || sql[index] is '_' or '$'))
                 {
                     index++;
                 }
 
-                if (index + 1 < sql.Length)
-                {
-                    index++;
-                }
-
+                tokens.Add(new SqlToken(SqlTokenKind.Word, sql[start..index]));
                 continue;
             }
 
-            normalized.Append(
-                char.IsAsciiLetterOrDigit(character) || character == '_'
-                    ? character
-                    : ' ');
+            if (character is '(' or ')' or ',' or ';' or '.')
+            {
+                tokens.Add(new SqlToken(
+                    SqlTokenKind.Punctuator,
+                    character.ToString()));
+                index++;
+                continue;
+            }
+
+            // Digits, operators and anything else: kept as a distinct token so it cannot
+            // be mistaken for a keyword and cannot be silently dropped.
+            tokens.Add(new SqlToken(SqlTokenKind.Other, character.ToString()));
+            index++;
         }
 
-        return normalized
-            .ToString()
-            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return tokens;
     }
 
-    private static bool ContainsTokenSequence(
-        IReadOnlyList<string> tokens,
-        IReadOnlyList<string> expected)
+    /// <summary>
+    /// Reads a delimited run starting at the opening delimiter. On success
+    /// <paramref name="index"/> lands just past the closing delimiter.
+    /// </summary>
+    private static bool TryReadDelimited(
+        string sql,
+        ref int index,
+        char closing,
+        bool allowDoubling,
+        out string text)
     {
-        for (var start = 0; start <= tokens.Count - expected.Count; start++)
+        var builder = new StringBuilder();
+        var cursor = index + 1;
+        while (cursor < sql.Length)
         {
-            var matches = true;
-            for (var offset = 0; offset < expected.Count; offset++)
+            if (sql[cursor] != closing)
             {
-                if (!string.Equals(
-                        tokens[start + offset],
-                        expected[offset],
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    matches = false;
-                    break;
-                }
+                builder.Append(sql[cursor]);
+                cursor++;
+                continue;
             }
 
-            if (matches)
+            if (allowDoubling && cursor + 1 < sql.Length && sql[cursor + 1] == closing)
             {
-                return true;
+                builder.Append(closing);
+                cursor += 2;
+                continue;
             }
+
+            index = cursor + 1;
+            text = builder.ToString();
+            return true;
         }
 
+        text = string.Empty;
         return false;
     }
+
+    private enum SqlTokenKind
+    {
+        Word,
+        StringLiteral,
+        QuotedName,
+        Punctuator,
+        Other
+    }
+
+    private readonly record struct SqlToken(SqlTokenKind Kind, string Text);
 
     private static InvalidOperationException SchemaNotReady(
         TableRequirement requirement,
@@ -695,10 +923,16 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         bool IsNotNull,
         int PrimaryKeyOrdinal);
 
+    /// <summary>
+    /// One column as pragma_table_xinfo reports it. <paramref name="Hidden"/> is 0 for a
+    /// normal column; anything else marks a hidden or generated column, which the
+    /// canonical schema never declares.
+    /// </summary>
     private sealed record ColumnMetadata(
         string DeclaredType,
         bool IsNotNull,
-        int PrimaryKeyOrdinal);
+        int PrimaryKeyOrdinal,
+        long Hidden);
 
     private sealed record ForeignKeyRequirement(
         string FromColumn,
