@@ -91,7 +91,6 @@ internal sealed class ManualTimerTimeProvider : TimeProvider
 
         var completed = new TaskCompletionSource(
             TaskCreationOptions.RunContinuationsAsynchronously);
-        var scheduleDispatch = false;
         lock (_sync)
         {
             _utcNow += amount;
@@ -109,22 +108,44 @@ internal sealed class ManualTimerTimeProvider : TimeProvider
             // The marker is behind every callback caused by this advancement, so it
             // observes exactly their failures.
             _callbacks.Enqueue(() => CompleteAdvance(completed));
-            if (!_dispatchScheduled)
-            {
-                _dispatchScheduled = true;
-                scheduleDispatch = true;
-            }
-        }
-
-        if (scheduleDispatch)
-        {
-            _ = ThreadPool.UnsafeQueueUserWorkItem(
-                static provider => provider.DrainCallbacks(),
-                this,
-                preferLocal: false);
+            EnsureDispatcherRunning();
         }
 
         return completed.Task;
+    }
+
+    /// <summary>
+    /// Starts the single dispatcher if it is not already running. Claiming the flag and
+    /// queueing the work item happen together under <c>_sync</c>, so exactly one drainer
+    /// can exist at a time; if queueing fails the claim is released again rather than
+    /// left latched, which would strand every later advancement. Must be called with
+    /// <c>_sync</c> held.
+    /// </summary>
+    private void EnsureDispatcherRunning()
+    {
+        if (_dispatchScheduled)
+        {
+            return;
+        }
+
+        _dispatchScheduled = true;
+        try
+        {
+            if (!ThreadPool.UnsafeQueueUserWorkItem(
+                    static provider => provider.DrainCallbacks(),
+                    this,
+                    preferLocal: false))
+            {
+                _dispatchScheduled = false;
+                throw new InvalidOperationException(
+                    "The manual test clock could not queue its dispatcher.");
+            }
+        }
+        catch
+        {
+            _dispatchScheduled = false;
+            throw;
+        }
     }
 
     private static void ValidateDueTime(TimeSpan dueTime)
@@ -170,62 +191,44 @@ internal sealed class ManualTimerTimeProvider : TimeProvider
     }
 
     /// <summary>
-    /// Runs queued work items in order. Every remaining due callback of an advancement
-    /// still runs after one of them fails; the failures travel to that advancement's
-    /// marker. Nothing thrown here escapes onto the thread pool, and the dispatcher flag
-    /// is always released, so a later <see cref="AdvanceAsync"/> can never be stranded.
+    /// The single dispatcher. Every remaining due callback of an advancement still runs
+    /// after one of them fails; the failures travel to that advancement's marker.
     /// </summary>
+    /// <remarks>
+    /// There is exactly one owner of <c>_dispatchScheduled</c> at any time: it is claimed
+    /// under <c>_sync</c> by <see cref="EnsureDispatcherRunning"/> and released under the
+    /// same lock at the one exit below, in the same critical section that observes an
+    /// empty queue. No second-guessing after the fact, so a concurrent
+    /// <see cref="AdvanceAsync"/> can never cause a second drainer to be queued.
+    /// Everything a work item can throw is caught in the loop, so the loop cannot unwind
+    /// and no exception reaches the thread pool.
+    /// </remarks>
     private void DrainCallbacks()
     {
-        var handOff = false;
-        try
+        while (true)
         {
-            while (true)
-            {
-                Action callback;
-                lock (_sync)
-                {
-                    if (_callbacks.Count == 0)
-                    {
-                        _dispatchScheduled = false;
-                        return;
-                    }
-
-                    callback = _callbacks.Dequeue();
-                }
-
-                try
-                {
-                    callback();
-                }
-                catch (Exception exception)
-                {
-                    lock (_sync)
-                    {
-                        (_pendingFailures ??= []).Add(exception);
-                    }
-                }
-            }
-        }
-        finally
-        {
-            // Defence in depth: nothing above is expected to unwind, but the flag must
-            // never latch on. Anything still queued is handed to a fresh drain.
+            Action callback;
             lock (_sync)
             {
-                if (_dispatchScheduled)
+                if (_callbacks.Count == 0)
                 {
-                    handOff = _callbacks.Count > 0;
-                    _dispatchScheduled = handOff;
+                    _dispatchScheduled = false;
+                    return;
                 }
+
+                callback = _callbacks.Dequeue();
             }
 
-            if (handOff)
+            try
             {
-                _ = ThreadPool.UnsafeQueueUserWorkItem(
-                    static provider => provider.DrainCallbacks(),
-                    this,
-                    preferLocal: false);
+                callback();
+            }
+            catch (Exception exception)
+            {
+                lock (_sync)
+                {
+                    (_pendingFailures ??= []).Add(exception);
+                }
             }
         }
     }

@@ -118,6 +118,8 @@ public sealed class SqliteLiveMonitoringRepositoryTests
     [InlineData(
         EvidenceSchemaMutation.TriggerNameTakenByView,
         "live_capture_records_no_update")]
+    [InlineData(EvidenceSchemaMutation.ExtraForeignKey, "channel_name")]
+    [InlineData(EvidenceSchemaMutation.CascadingForeignKey, "CASCADE")]
     [InlineData(
         EvidenceSchemaMutation.VirtualGeneratedColumn,
         "shadow_outcome")]
@@ -1110,6 +1112,21 @@ public sealed class SqliteLiveMonitoringRepositoryTests
             EvidenceSchemaMutation.TriggerNameTakenByView => ReplaceCanonicalRecordUpdate(
                 migration,
                 "CREATE VIEW live_capture_records_no_update AS SELECT 1 AS ok;"),
+            // An extra key the canonical shape does not declare.
+            EvidenceSchemaMutation.ExtraForeignKey => ReplaceRequiredOnce(
+                migration,
+                "    UNIQUE (live_session_id, received_sequence)",
+                "    FOREIGN KEY (channel_name)\n"
+                + "        REFERENCES live_capture_sessions(live_session_id),\n"
+                + "    UNIQUE (live_session_id, received_sequence)"),
+            // The required key, but with a referential action that silently repairs data.
+            EvidenceSchemaMutation.CascadingForeignKey => ReplaceRequiredOnce(
+                migration,
+                "                                REFERENCES live_capture_sessions(live_session_id),\n"
+                + "    -- Assigned on the delivery thread",
+                "                                REFERENCES live_capture_sessions(live_session_id)\n"
+                + "                                ON DELETE CASCADE,\n"
+                + "    -- Assigned on the delivery thread"),
             // pragma_table_info hides these; only pragma_table_xinfo reports them.
             EvidenceSchemaMutation.VirtualGeneratedColumn => ReplaceRequiredOnce(
                 migration,
@@ -1514,6 +1531,8 @@ public sealed class SqliteLiveMonitoringRepositoryTests
         CommentHeaderDecoy,
         WrongTriggerName,
         TriggerNameTakenByView,
+        ExtraForeignKey,
+        CascadingForeignKey,
         VirtualGeneratedColumn,
         StoredGeneratedColumn,
         MissingStrict

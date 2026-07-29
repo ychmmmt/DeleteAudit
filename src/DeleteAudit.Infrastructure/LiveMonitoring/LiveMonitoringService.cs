@@ -1140,8 +1140,10 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
                 if (!_queueOverflowReported)
                 {
                     _queueOverflowReported = true;
-                    _lastError =
-                        $"事件队列已满（容量 {_options.QueueCapacity}），部分事件已被丢弃。";
+                    // Overflow is a condition, not a session fault. Routed through the
+                    // shared entry point so it can never displace an earlier root cause.
+                    ReportConditionCore(
+                        $"事件队列已满（容量 {_options.QueueCapacity}），部分事件已被丢弃。");
                     AddDiagnosticCore(
                         "live_queue_overflow",
                         $"The bounded queue reached its capacity of {_options.QueueCapacity}; records are being dropped.",
@@ -1368,6 +1370,24 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
         {
             _lastError = LiveMonitoringLimits.TruncateMessage(message);
         }
+    }
+
+    /// <summary>
+    /// Records a non-fault condition — currently only queue overflow — that is worth
+    /// showing when nothing else has claimed the field. It never overwrites anything,
+    /// so it cannot displace a fault root cause; conversely a later real fault still
+    /// replaces it, because a fault is the more causal explanation. This is the only
+    /// other writer of <see cref="_lastError"/>: no branch assigns it directly. Must be
+    /// called with <see cref="_sessionLock"/> held.
+    /// </summary>
+    private void ReportConditionCore(string message)
+    {
+        if (_sessionFaulted || !string.IsNullOrWhiteSpace(_lastError))
+        {
+            return;
+        }
+
+        _lastError = LiveMonitoringLimits.TruncateMessage(message);
     }
 
     private void Count(Func<Counters, Counters> update)

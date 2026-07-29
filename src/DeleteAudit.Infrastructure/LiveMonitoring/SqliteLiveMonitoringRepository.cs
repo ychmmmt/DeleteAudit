@@ -351,15 +351,46 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
                 requirement.Name,
                 cancellationToken)
             .ConfigureAwait(false);
+        // Referential actions are part of the shape: a canonical key is plain
+        // NO ACTION / NO ACTION / MATCH NONE, and a non-canonical one is named rather
+        // than dropped, which would have let it hide behind the exact-count comparison.
+        foreach (var actual in foreignKeys)
+        {
+            if (!actual.IsCanonicalAction)
+            {
+                throw SchemaNotReady(
+                    requirement,
+                    $"foreign key '{actual.Key.FromColumn}' to "
+                    + $"'{actual.Key.ToTable}.{actual.Key.ToColumn}' declares "
+                    + $"ON UPDATE {actual.OnUpdate}, ON DELETE {actual.OnDelete}, "
+                    + $"MATCH {actual.Match}; expected NO ACTION, NO ACTION, NONE");
+            }
+        }
+
         foreach (var expected in requirement.ForeignKeys)
         {
-            if (!foreignKeys.Contains(expected))
+            if (!foreignKeys.Any(actual => actual.Key == expected))
             {
                 throw SchemaNotReady(
                     requirement,
                     $"required foreign key '{expected.FromColumn}' to "
                     + $"'{expected.ToTable}.{expected.ToColumn}' is missing or malformed");
             }
+        }
+
+        var unexpected = foreignKeys
+            .Where(actual => !requirement.ForeignKeys.Contains(actual.Key))
+            .Select(actual =>
+                $"'{actual.Key.FromColumn}' to "
+                + $"'{actual.Key.ToTable}.{actual.Key.ToColumn}'")
+            .OrderBy(text => text, StringComparer.Ordinal)
+            .ToArray();
+        if (unexpected.Length != 0)
+        {
+            throw SchemaNotReady(
+                requirement,
+                "unexpected foreign key(s) are declared: "
+                + string.Join(", ", unexpected));
         }
 
         if (foreignKeys.Count != requirement.ForeignKeys.Count)
@@ -423,7 +454,7 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         return columns;
     }
 
-    private static async Task<IReadOnlyList<ForeignKeyRequirement>> ReadForeignKeysAsync(
+    private static async Task<IReadOnlyList<ForeignKeyMetadata>> ReadForeignKeysAsync(
         SqliteConnection connection,
         string tableName,
         CancellationToken cancellationToken)
@@ -436,26 +467,23 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
             """;
         command.Parameters.Add("$table", SqliteType.Text).Value = tableName;
         command.Parameters.Add("$schema", SqliteType.Text).Value = "main";
-        var foreignKeys = new List<ForeignKeyRequirement>();
+        var foreignKeys = new List<ForeignKeyMetadata>();
         await using var reader = await command
             .ExecuteReaderAsync(cancellationToken)
             .ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            var onUpdate = reader.GetString(3);
-            var onDelete = reader.GetString(4);
-            var match = reader.GetString(5);
-            if (!string.Equals(onUpdate, "NO ACTION", StringComparison.OrdinalIgnoreCase)
-                || !string.Equals(onDelete, "NO ACTION", StringComparison.OrdinalIgnoreCase)
-                || !string.Equals(match, "NONE", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            foreignKeys.Add(new ForeignKeyRequirement(
-                reader.GetString(1),
-                reader.GetString(0),
-                reader.GetString(2)));
+            // Every declared foreign key is returned, including ones whose referential
+            // actions are not canonical. Dropping those here would have let an extra
+            // ON DELETE CASCADE key hide behind an exact-count comparison.
+            foreignKeys.Add(new ForeignKeyMetadata(
+                new ForeignKeyRequirement(
+                    reader.GetString(1),
+                    reader.GetString(0),
+                    reader.GetString(2)),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetString(5)));
         }
 
         return foreignKeys;
@@ -938,6 +966,23 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         string FromColumn,
         string ToTable,
         string ToColumn);
+
+    /// <summary>
+    /// One declared foreign key exactly as SQLite reports it, including its referential
+    /// actions. Actions are carried rather than filtered on so a non-canonical key is
+    /// reported by name instead of disappearing from the comparison.
+    /// </summary>
+    private sealed record ForeignKeyMetadata(
+        ForeignKeyRequirement Key,
+        string OnUpdate,
+        string OnDelete,
+        string Match)
+    {
+        public bool IsCanonicalAction =>
+            string.Equals(OnUpdate, "NO ACTION", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(OnDelete, "NO ACTION", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(Match, "NONE", StringComparison.OrdinalIgnoreCase);
+    }
 
     private sealed record UniqueRequirement(IReadOnlyList<string> Columns);
 
