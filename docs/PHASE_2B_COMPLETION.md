@@ -24,7 +24,7 @@
 | 1 | 项目级 | 进程异常终止时最多 63 条未提交记录可能丢失 | 产品边界 | **保留** | 定时刷新只把滞留*时间*有界化，条数上界不变；三语 README 与 SECURITY.md 均如实披露 |
 | 2 | 项目级 | 没有 Live History 只读界面 | 产品边界 | **已关闭** | Phase 2B.2.2 已实现：`ILiveHistoryQueryService` + `SqliteLiveHistoryQueryService`（全部 ReadOnly、参数化、分页上限 200、raw XML 按需并在 SQLite 内截断）、`LiveHistoryViewModel`、以及 MainWindow 中真实可用的「实时接入历史」页。15 个集成用例 + 13 个 ViewModel 用例，其中包含「浏览后数据库逐字节不变」与注入/通配符转义 |
 | 3 | 项目级 | `live_capture_completions.stopped_utc` 无跨表先后约束 | 代码缺陷（schema） | **保留** | SQLite 的 CHECK 不能跨表；唯一手段是触发器 + 子查询，必须新增 migration |
-| 4 | 项目级 | cancellation 测试相邻断言债 | 测试债 | **保留** | 本轮 A7 未执行 |
+| 4 | 项目级 | cancellation 测试相邻断言债 | 测试债 | **已关闭** | 五个 cancellation 用例补齐相邻断言：LastError / diagnostics / counters / `CompletionStarted` / `LifecycleCompleted` / `SessionPersisted` / 重复 Stop 不重试也不重复写入 / 下一会话不继承上一会话的诊断与错误 |
 | 5 | 项目级 | `docs/PHASE_*` 未记录 Phase 2B.1 / 2B.2.1 | 文档债 | **保留** | 本文件只覆盖台账，未补阶段验收文档 |
 | 6 | 项目级 | secret scanning validity checks / non-provider patterns 关闭 | 外部设置 | **保留** | 与代码无关；本轮明令不得修改 GitHub 设置 |
 | 7 | 审计 | `ManualTimerTimeProvider` 正常退出与 `finally` 交接之间可产生第二个 drainer | 代码缺陷（测试基建） | **已关闭** | 改为单一所有权：`EnsureDispatcherRunning` 在 `_sync` 内同时认领标志与排队；`DrainCallbacks` 只有一个释放点，删除了事后猜测的 `finally` |
@@ -37,14 +37,16 @@
 | 13 | 审计 | trigger 变异测试断言不具判别力 | 测试债 | **已关闭** | 见 #9；断言从"消息含 trigger 名"升级为"消息含具体原因" |
 | 14 | 审计 | `recursive_triggers=OFF` 时 `INSERT OR REPLACE` 可绕过 delete trigger | 代码缺陷 + 产品边界 | **部分关闭** | 应用侧已关闭：写连接启用 `recursive_triggers=ON`；`NoProductionSqlUsesReplaceConflictResolution` 扫描整个 `src` 禁止 REPLACE；`ReplaceOnCommittedEvidenceIsAbortedByTheAppendOnlyGuard` 实际执行 REPLACE 并证明被中止且原证据未变。**外部写入者边界无法从数据库层关闭，保留为已披露 P2**（见下） |
 
+| 15 | 本轮自查 | Live History 的「新查询取消旧查询」并未真正实现：`ViewModelBase.RunSafelyAsync` 的 `IsBusy` 门会**静默丢弃**第二个并发请求 | 代码缺陷 | **已关闭** | `LiveHistoryViewModel` 改为专用的 latest-request-wins 路径（`RequestSlot` + `RequestTicket`），不再复用 `RunSafelyAsync`；新请求取消旧请求，唯一提交点前检查 generation，陈旧请求的异常与取消都不得覆盖较新请求的结果，Dispose 后一律不提交。命令不再因加载中而禁用。5 个确定性用例覆盖「A 阻塞→B 完成并显示→A 最后完成/抛错→UI 仍为 B」「陈旧失败不覆盖较新成功」「Dispose 后完成不更新 UI」「陈旧 raw XML 预览不覆盖新选择」。全部在旧实现下失败 |
+
 ## 3. 当前真实计数
 
 ```text
-本轮关闭：2, 7, 8, 9, 10, 11, 12, 13，以及 14 的应用侧
-仍然保留：1, 3, 4, 5, 6, 9b, 14（外部写入者）
+已关闭：2, 4, 7, 8, 9, 10, 11, 12, 13, 15，以及 14 的应用侧
+仍然保留：1, 3, 5, 6, 9b, 14（外部写入者）
 ```
 
-**项目当前 P2 总数 = 7。** 注意这与审计报告的 `P2 = 8` 构成完全不同：审计那 8 项中已有
+**项目当前 P2 总数 = 6。** 注意这与审计报告的 `P2 = 8` 构成完全不同：审计那 8 项中已有
 6 项关闭、1 项部分关闭，剩余名额由此前一直存在的产品级债务占据。
 
 ## 3b. 尚未实现的 Phase 2B 范围

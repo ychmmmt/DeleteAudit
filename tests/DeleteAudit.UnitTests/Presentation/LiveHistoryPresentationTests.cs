@@ -174,26 +174,133 @@ public sealed class LiveHistoryPresentationTests
     }
 
     /// <summary>
-    /// A second load started while one is still running is dropped rather than run
-    /// concurrently, so two queries can never race to publish into the same list.
+    /// The user changes a filter while a slow query is still running. The newer query
+    /// must win: it is started rather than dropped, it publishes, and the older one — no
+    /// matter how late it finishes — must not overwrite what the newer one showed.
     /// </summary>
     [Fact]
-    public async Task ASecondLoadDoesNotRunWhileOneIsStillInFlight()
+    public async Task ANewerQueryWinsEvenWhenTheOlderOneFinishesLast()
     {
         var service = new FakeLiveHistoryQueryService();
         service.SetSessions([Session(1)]);
-        using var gate = new ManualResetEventSlim(false);
-        service.SessionGate = gate;
+        using var slow = new ManualResetEventSlim(false);
+        service.GateCall(1, slow);
         using var viewModel = new LiveHistoryViewModel(service);
 
         var first = viewModel.LoadSessionsAsync();
-        await service.SessionEntered.WaitAsync(TimeSpan.FromSeconds(10));
-        var second = viewModel.LoadSessionsAsync();
-        gate.Set();
-        await Task.WhenAll(first, second);
+        await service.CallEntered(1).WaitAsync(TimeSpan.FromSeconds(10));
 
-        Assert.Equal(1, service.SessionCalls);
-        Assert.Single(viewModel.Sessions);
+        // The data set changes and the user re-queries while the first call is parked.
+        service.SetSessions([Session(7), Session(8)]);
+        var second = viewModel.LoadSessionsAsync();
+        await second;
+
+        // The newer query has published before the older one has even returned.
+        Assert.Equal(2, service.SessionCalls);
+        Assert.Equal(2, viewModel.Sessions.Count);
+        Assert.Equal("session-7", viewModel.Sessions[0].LiveSessionId);
+
+        slow.Set();
+        await first;
+
+        // The superseded query finished last and still changed nothing.
+        Assert.Equal(2, viewModel.Sessions.Count);
+        Assert.Equal("session-7", viewModel.Sessions[0].LiveSessionId);
+        Assert.True(service.CallObservedCancellation(1));
+        Assert.False(viewModel.HasError);
+    }
+
+    /// <summary>A superseded query that fails must not replace a newer success.</summary>
+    [Fact]
+    public async Task AStaleFailureDoesNotOverwriteANewerSuccess()
+    {
+        var service = new FakeLiveHistoryQueryService { FailingCall = 1 };
+        service.SetSessions([Session(1)]);
+        using var slow = new ManualResetEventSlim(false);
+        service.GateCall(1, slow);
+        using var viewModel = new LiveHistoryViewModel(service);
+
+        var first = viewModel.LoadSessionsAsync();
+        await service.CallEntered(1).WaitAsync(TimeSpan.FromSeconds(10));
+        service.SetSessions([Session(7)]);
+        await viewModel.LoadSessionsAsync();
+
+        slow.Set();
+        await first;
+
+        Assert.False(viewModel.HasError);
+        Assert.Equal("session-7", Assert.Single(viewModel.Sessions).LiveSessionId);
+    }
+
+    /// <summary>A failure that is still the newest request must be shown.</summary>
+    [Fact]
+    public async Task TheNewestQueryFailureIsReported()
+    {
+        var service = new FakeLiveHistoryQueryService { FailingCall = 1 };
+        using var viewModel = new LiveHistoryViewModel(service);
+
+        await viewModel.LoadSessionsAsync();
+
+        Assert.True(viewModel.HasError);
+        Assert.Contains("fixture failure 1", viewModel.ErrorMessage!, StringComparison.Ordinal);
+    }
+
+    /// <summary>A query that completes after Dispose must not touch the view model.</summary>
+    [Fact]
+    public async Task AQueryCompletingAfterDisposeNeverUpdatesTheViewModel()
+    {
+        var service = new FakeLiveHistoryQueryService();
+        service.SetSessions([Session(1)]);
+        using var slow = new ManualResetEventSlim(false);
+        service.GateCall(1, slow);
+        var viewModel = new LiveHistoryViewModel(service);
+
+        var loading = viewModel.LoadSessionsAsync();
+        await service.CallEntered(1).WaitAsync(TimeSpan.FromSeconds(10));
+        viewModel.Dispose();
+        slow.Set();
+        await loading;
+
+        Assert.Empty(viewModel.Sessions);
+        Assert.False(viewModel.HasError);
+        Assert.True(service.CallObservedCancellation(1));
+        // A load started after disposal does not reach the service at all.
+        var callsAfterDispose = service.SessionCalls;
+        await viewModel.LoadSessionsAsync();
+        Assert.Equal(callsAfterDispose, service.SessionCalls);
+        viewModel.Dispose();
+    }
+
+    /// <summary>
+    /// Selecting another record while a preview is still loading must leave the newer
+    /// record's preview in place.
+    /// </summary>
+    [Fact]
+    public async Task AStaleRawXmlPreviewDoesNotOverwriteTheSelectedOne()
+    {
+        var service = new FakeLiveHistoryQueryService();
+        service.SetSessions([Session(1)]);
+        service.SetRecords([Record(1), Record(2)]);
+        using var viewModel = new LiveHistoryViewModel(service);
+        await viewModel.LoadSessionsAsync();
+        viewModel.SelectedSession = viewModel.Sessions[0];
+
+        using var slow = new ManualResetEventSlim(false);
+        service.RawXmlGate = slow;
+        service.RawXmlFor("session-1:1", "<Event first=\"true\" />");
+        service.RawXmlFor("session-1:2", "<Event second=\"true\" />");
+
+        viewModel.SelectedRecord = viewModel.Records[0];
+        await service.RawXmlEntered.WaitAsync(TimeSpan.FromSeconds(10));
+        service.RawXmlGate = null;
+        viewModel.SelectedRecord = viewModel.Records[1];
+        await viewModel.LoadRawXmlAsync();
+
+        slow.Set();
+        await service.DrainRawXmlAsync();
+
+        Assert.Contains("second", viewModel.RawXmlPreview, StringComparison.Ordinal);
+        Assert.DoesNotContain("first", viewModel.RawXmlPreview, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -324,7 +431,52 @@ public sealed class LiveHistoryPresentationTests
         public RawXmlDocument? RawXml { get; init; } =
             RawXmlDocument.CreatePreview("evidence-1", "<Event />", 9);
 
+        private readonly TaskCompletionSource _rawXmlEntered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly Dictionary<string, string> _rawXmlByRecord = [];
+        private readonly List<Task> _rawXmlTasks = [];
+        private readonly Dictionary<int, ManualResetEventSlim> _callGates = [];
+        private readonly Dictionary<int, TaskCompletionSource> _callEntered = [];
+        private readonly HashSet<int> _cancelledCalls = [];
+        private readonly object _sync = new();
+
         public ManualResetEventSlim? SessionGate { get; set; }
+
+        /// <summary>Blocks the given 1-based session query until the gate is released.</summary>
+        public void GateCall(int call, ManualResetEventSlim gate)
+        {
+            lock (_sync)
+            {
+                _callGates[call] = gate;
+            }
+        }
+
+        /// <summary>Completes once that session query has started.</summary>
+        public Task CallEntered(int call)
+        {
+            lock (_sync)
+            {
+                if (!_callEntered.TryGetValue(call, out var source))
+                {
+                    source = new TaskCompletionSource(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    _callEntered[call] = source;
+                }
+
+                return source.Task;
+            }
+        }
+
+        public bool CallObservedCancellation(int call)
+        {
+            lock (_sync)
+            {
+                return _cancelledCalls.Contains(call);
+            }
+        }
+
+        /// <summary>Throws from the given session query instead of returning a page.</summary>
+        public int FailingCall { get; set; }
 
         public int OverridePageSize { get; init; }
 
@@ -358,18 +510,31 @@ public sealed class LiveHistoryPresentationTests
             LiveHistorySessionQuery query,
             CancellationToken cancellationToken = default)
         {
-            SessionCalls++;
-            var gate = SessionGate;
+            int call;
+            ManualResetEventSlim? gate;
+            LiveCaptureSessionRow[] snapshot;
+            lock (_sync)
+            {
+                call = ++SessionCalls;
+                _callGates.TryGetValue(call, out gate);
+                gate ??= SessionGate;
+                // Captured at entry: a slow call keeps returning the data it started
+                // with, which is exactly how a stale result reaches the view model.
+                snapshot = _sessions;
+            }
+
             var limit = OverridePageSize == 0 ? query.Page.Limit : OverridePageSize;
+            var failing = FailingCall == call;
 
             // Parking runs off the caller's thread: a real query never blocks the thread
             // that started it, and neither may the fake.
             return Task.Run(
                 () =>
                 {
+                    SignalEntered(call);
+                    _sessionEntered.TrySetResult();
                     if (gate is not null)
                     {
-                        _sessionEntered.TrySetResult();
                         // A real signal; the timeout only guards a hung test.
                         gate.Wait(TimeSpan.FromSeconds(10), CancellationToken.None);
                     }
@@ -377,19 +542,46 @@ public sealed class LiveHistoryPresentationTests
                     if (cancellationToken.IsCancellationRequested)
                     {
                         ObservedCancellation = true;
+                        lock (_sync)
+                        {
+                            _cancelledCalls.Add(call);
+                        }
                     }
 
-                    var items = _sessions
+                    if (failing)
+                    {
+                        throw new InvalidOperationException($"fixture failure {call}");
+                    }
+
+                    var items = snapshot
                         .Skip(query.Page.Offset)
                         .Take(limit)
                         .ToArray();
                     return new PageResult<LiveCaptureSessionRow>(
                         items,
-                        _sessions.Length,
+                        snapshot.Length,
                         query.Page.Offset,
                         query.Page.Limit);
                 },
                 CancellationToken.None);
+        }
+
+        private void SignalEntered(int call)
+        {
+            TaskCompletionSource source;
+            lock (_sync)
+            {
+                if (!_callEntered.TryGetValue(call, out var existing))
+                {
+                    existing = new TaskCompletionSource(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    _callEntered[call] = existing;
+                }
+
+                source = existing;
+            }
+
+            source.TrySetResult();
         }
 
         public Task<PageResult<LiveCaptureRecordRow>> GetRecordsAsync(
@@ -410,12 +602,71 @@ public sealed class LiveHistoryPresentationTests
             CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<LiveCaptureDiagnosticRow>>(_diagnostics);
 
+        public ManualResetEventSlim? RawXmlGate { get; set; }
+
+        public Task RawXmlEntered => _rawXmlEntered.Task;
+
+        public void RawXmlFor(string liveEvidenceId, string xml)
+        {
+            lock (_sync)
+            {
+                _rawXmlByRecord[liveEvidenceId] = xml;
+            }
+        }
+
+        /// <summary>Awaits every raw XML query started so far.</summary>
+        public Task DrainRawXmlAsync()
+        {
+            Task[] pending;
+            lock (_sync)
+            {
+                pending = [.. _rawXmlTasks];
+            }
+
+            return Task.WhenAll(pending);
+        }
+
         public Task<RawXmlDocument?> GetRecordRawXmlAsync(
             string liveEvidenceId,
             CancellationToken cancellationToken = default)
         {
-            RawXmlCalls++;
-            return Task.FromResult(RawXml);
+            ManualResetEventSlim? gate;
+            string? configured;
+            lock (_sync)
+            {
+                RawXmlCalls++;
+                gate = RawXmlGate;
+                _rawXmlByRecord.TryGetValue(liveEvidenceId, out configured);
+            }
+
+            if (configured is null && gate is null)
+            {
+                return Task.FromResult(RawXml);
+            }
+
+            var task = Task.Run(
+                () =>
+                {
+                    _rawXmlEntered.TrySetResult();
+                    if (gate is not null)
+                    {
+                        gate.Wait(TimeSpan.FromSeconds(10), CancellationToken.None);
+                    }
+
+                    return configured is null
+                        ? RawXml
+                        : RawXmlDocument.CreatePreview(
+                            liveEvidenceId,
+                            configured,
+                            configured.Length);
+                },
+                CancellationToken.None);
+            lock (_sync)
+            {
+                _rawXmlTasks.Add(task);
+            }
+
+            return task;
         }
     }
 }

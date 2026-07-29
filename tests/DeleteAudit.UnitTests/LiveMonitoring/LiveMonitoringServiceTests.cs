@@ -2379,6 +2379,19 @@ public sealed class LiveMonitoringServiceTests
         Assert.Equal(0, probe.ProbeCount);
         // A user cancellation is not a database failure and not a faulted capture.
         Assert.Equal(LiveMonitoringState.Stopped, service.Snapshot.State);
+        // Adjacent facts: nothing was blamed on anything, no counter moved, and the
+        // lifecycle really did finish rather than merely look finished.
+        Assert.Null(service.Snapshot.LastError);
+        Assert.Empty(service.SessionDiagnostics);
+        Assert.Equal(LiveMonitoringCounters.Empty, service.Snapshot.Counters);
+        Assert.True(service.CompletionStarted);
+        Assert.True(service.LifecycleCompleted);
+        Assert.False(service.SessionPersisted);
+        // Repeated shutdown stays a no-op: still nothing recorded, still Stopped.
+        await service.StopAsync();
+        Assert.Empty(repository.Starts);
+        Assert.Equal(0, repository.SaveCount);
+        Assert.Equal(LiveMonitoringState.Stopped, service.Snapshot.State);
     }
 
     [Fact]
@@ -2415,6 +2428,16 @@ public sealed class LiveMonitoringServiceTests
         Assert.Contains(
             repository.LastDiagnostics,
             item => item.Code == "live_start_cancelled");
+        // Adjacent facts: the cancellation is the recorded root cause, the summary was
+        // persisted exactly once, and a later Stop neither retries nor duplicates it.
+        Assert.Contains("取消", service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.True(service.SessionPersisted);
+        Assert.Equal(1, repository.SaveCount);
+        await service.StopAsync();
+        await service.StopAsync();
+        Assert.Equal(1, repository.SaveCount);
+        Assert.Single(repository.Completions);
+        Assert.Single(repository.Sessions);
     }
 
     [Fact]
@@ -2491,6 +2514,21 @@ public sealed class LiveMonitoringServiceTests
         // Exactly one attempt; a later Stop does not retry it.
         await service.StopAsync();
         Assert.Equal(1, repository.SaveCount);
+        // Adjacent facts: the completion failure never reached the database, so the
+        // cancellation root cause survives only in memory — and it must still be there,
+        // alongside the persistence failure, rather than one having replaced the other.
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_start_cancelled");
+        Assert.Contains(
+            service.SessionDiagnostics,
+            item => item.Code == "live_session_persist_failed");
+        Assert.Contains("取消", service.Snapshot.LastError, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "fixture completion failure",
+            service.Snapshot.LastError,
+            StringComparison.Ordinal);
+        Assert.True(service.LifecycleCompleted);
     }
 
     [Fact]
@@ -2542,6 +2580,17 @@ public sealed class LiveMonitoringServiceTests
         Assert.All(
             repository.Records,
             record => Assert.NotEqual(cancelledSessionId, record.LiveSessionId));
+        // Adjacent facts: B inherits none of A's explanation. Neither the cancellation
+        // diagnostic nor A's error text may appear anywhere in B's session.
+        Assert.DoesNotContain(
+            serviceB.SessionDiagnostics,
+            item => item.Code == "live_start_cancelled");
+        Assert.Null(serviceB.Snapshot.LastError);
+        Assert.DoesNotContain(
+            repository.LastDiagnostics,
+            item => item.Code == "live_start_cancelled");
+        Assert.Equal(LiveMonitoringState.Stopped, serviceB.Snapshot.State);
+        Assert.True(serviceB.SessionPersisted);
     }
 
     // ---------- Phase 2B.1 callback identity ----------

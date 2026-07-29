@@ -37,12 +37,10 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     private readonly ObservableCollection<LiveCaptureRecordRow> _records = [];
     private readonly ObservableCollection<LiveCaptureDiagnosticRow> _diagnostics = [];
 
-    private CancellationTokenSource? _sessionCts;
-    private CancellationTokenSource? _recordCts;
-    private CancellationTokenSource? _rawXmlCts;
-    private long _sessionGeneration;
-    private long _recordGeneration;
-    private long _rawXmlGeneration;
+    private readonly RequestSlot _sessionRequests = new();
+    private readonly RequestSlot _recordRequests = new();
+    private readonly RequestSlot _rawXmlRequests = new();
+    private int _inFlight;
     private bool _disposed;
 
     private LiveHistoryAvailability? _availability;
@@ -68,33 +66,36 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     {
         _queryService = queryService ?? throw new ArgumentNullException(nameof(queryService));
 
+        // None of these gate on a load being in flight: a newer request replaces an
+        // older one rather than being refused, so the user is never locked out of
+        // changing a filter or page while a slow query is still running.
         RefreshCommand = new AsyncCommand(
             () => LoadSessionsAsync(resetPage: false),
-            () => !IsBusy,
+            null,
             ShowUnexpectedError);
         ApplyFiltersCommand = new AsyncCommand(
             () => LoadSessionsAsync(resetPage: true),
-            () => !IsBusy,
+            null,
             ShowUnexpectedError);
         PreviousSessionPageCommand = new AsyncCommand(
             () => MoveSessionPageAsync(-PageSize),
-            () => !IsBusy && HasPreviousSessionPage,
+            () => HasPreviousSessionPage,
             ShowUnexpectedError);
         NextSessionPageCommand = new AsyncCommand(
             () => MoveSessionPageAsync(PageSize),
-            () => !IsBusy && HasNextSessionPage,
+            () => HasNextSessionPage,
             ShowUnexpectedError);
         PreviousRecordPageCommand = new AsyncCommand(
             () => MoveRecordPageAsync(-PageSize),
-            () => !IsBusy && HasPreviousRecordPage,
+            () => HasPreviousRecordPage,
             ShowUnexpectedError);
         NextRecordPageCommand = new AsyncCommand(
             () => MoveRecordPageAsync(PageSize),
-            () => !IsBusy && HasNextRecordPage,
+            () => HasNextRecordPage,
             ShowUnexpectedError);
         ApplyRecordFiltersCommand = new AsyncCommand(
             () => LoadRecordsAsync(resetPage: true),
-            () => !IsBusy && SelectedSession is not null,
+            () => SelectedSession is not null,
             ShowUnexpectedError);
 
         Sessions = new ReadOnlyObservableCollection<LiveCaptureSessionRow>(_sessions);
@@ -123,6 +124,12 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     public AsyncCommand PreviousRecordPageCommand { get; }
 
     public AsyncCommand NextRecordPageCommand { get; }
+
+    /// <summary>
+    /// At least one query is running. This page tracks its own loading state: unlike
+    /// <see cref="ViewModelBase.IsBusy"/> it never refuses a newer request.
+    /// </summary>
+    public bool IsLoading => Volatile.Read(ref _inFlight) > 0;
 
     /// <summary>True once a load has run and the live capture tables were unusable.</summary>
     public bool IsUnavailable => _availability is not null && !_availability.IsReady;
@@ -304,21 +311,34 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     /// an exception.
     /// </summary>
     public Task LoadSessionsAsync(bool resetPage = true) =>
-        RunSafelyAsync(async () =>
+        RunLatestAsync(_sessionRequests, async ticket =>
         {
             if (resetPage)
             {
                 _sessionOffset = 0;
             }
 
-            var generation = Interlocked.Increment(ref _sessionGeneration);
-            using var cancellation = ReplaceCancellation(ref _sessionCts);
-            var token = cancellation.Token;
-
             var availability = await _queryService
-                .GetAvailabilityAsync(token)
+                .GetAvailabilityAsync(ticket.Token)
                 .ConfigureAwait(true);
-            if (generation != Interlocked.Read(ref _sessionGeneration))
+            var query = new LiveHistorySessionQuery(
+                FilterPresentation.ParseOptionalUtc(FromUtcText, "开始时间"),
+                FilterPresentation.ParseOptionalUtc(ToUtcText, "结束时间"),
+                SessionState,
+                new PageRequest(_sessionOffset, PageSize));
+
+            PageResult<LiveCaptureSessionRow>? page = null;
+            if (availability.IsReady)
+            {
+                page = await _queryService
+                    .GetSessionsAsync(query, ticket.Token)
+                    .ConfigureAwait(true);
+                RejectOversizedPage(page.Items.Count);
+            }
+
+            // Nothing above touched the UI. The single commit point below runs only for
+            // the newest request, so a slower predecessor can never publish over it.
+            if (!ticket.IsCurrent)
             {
                 return;
             }
@@ -326,30 +346,13 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
             _availability = availability;
             OnPropertyChanged(nameof(IsUnavailable));
             OnPropertyChanged(nameof(UnavailableMessage));
-            if (!availability.IsReady)
+            if (page is null)
             {
                 ClearSessions();
                 ClearRecords();
                 return;
             }
 
-            var page = await _queryService
-                .GetSessionsAsync(
-                    new LiveHistorySessionQuery(
-                        FilterPresentation.ParseOptionalUtc(FromUtcText, "开始时间"),
-                        FilterPresentation.ParseOptionalUtc(ToUtcText, "结束时间"),
-                        SessionState,
-                        new PageRequest(_sessionOffset, PageSize)),
-                    token)
-                .ConfigureAwait(true);
-
-            // A page produced for filters the user has already replaced must not land.
-            if (generation != Interlocked.Read(ref _sessionGeneration))
-            {
-                return;
-            }
-
-            RejectOversizedPage(page.Items.Count);
             _sessions.Clear();
             foreach (var row in page.Items)
             {
@@ -362,12 +365,16 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         });
 
     public Task LoadRecordsAsync(bool resetPage = true) =>
-        RunSafelyAsync(async () =>
+        RunLatestAsync(_recordRequests, async ticket =>
         {
             var session = SelectedSession;
             if (session is null)
             {
-                ClearRecords();
+                if (ticket.IsCurrent)
+                {
+                    ClearRecords();
+                }
+
                 return;
             }
 
@@ -375,10 +382,6 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
             {
                 _recordOffset = 0;
             }
-
-            var generation = Interlocked.Increment(ref _recordGeneration);
-            using var cancellation = ReplaceCancellation(ref _recordCts);
-            var token = cancellation.Token;
 
             var page = await _queryService
                 .GetRecordsAsync(
@@ -397,18 +400,18 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
                         null,
                         NewestFirst,
                         new PageRequest(_recordOffset, PageSize)),
-                    token)
+                    ticket.Token)
                 .ConfigureAwait(true);
+            RejectOversizedPage(page.Items.Count);
             var diagnostics = await _queryService
-                .GetSessionDiagnosticsAsync(session.LiveSessionId, token)
+                .GetSessionDiagnosticsAsync(session.LiveSessionId, ticket.Token)
                 .ConfigureAwait(true);
 
-            if (generation != Interlocked.Read(ref _recordGeneration))
+            if (!ticket.IsCurrent)
             {
                 return;
             }
 
-            RejectOversizedPage(page.Items.Count);
             _records.Clear();
             foreach (var row in page.Items)
             {
@@ -427,23 +430,25 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         });
 
     public Task LoadRawXmlAsync() =>
-        RunSafelyAsync(async () =>
+        RunLatestAsync(_rawXmlRequests, async ticket =>
         {
             var record = SelectedRecord;
             if (record is null)
             {
-                SetRawXml(null);
+                if (ticket.IsCurrent)
+                {
+                    SetRawXml(null);
+                }
+
                 return;
             }
 
-            var generation = Interlocked.Increment(ref _rawXmlGeneration);
-            using var cancellation = ReplaceCancellation(ref _rawXmlCts);
-
             var document = await _queryService
-                .GetRecordRawXmlAsync(record.LiveEvidenceId, cancellation.Token)
+                .GetRecordRawXmlAsync(record.LiveEvidenceId, ticket.Token)
                 .ConfigureAwait(true);
 
-            if (generation != Interlocked.Read(ref _rawXmlGeneration))
+            // A preview for a record the user has already moved off must not land.
+            if (!ticket.IsCurrent)
             {
                 return;
             }
@@ -455,7 +460,87 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
             }
         });
 
-    /// <summary>Cancels anything still running. Called when the window closes.</summary>
+    /// <summary>
+    /// Runs one request under a latest-request-wins policy: starting a new one cancels
+    /// the request it supersedes, and only the newest may touch the view model.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ViewModelBase.RunSafelyAsync"/> is deliberately not used here. It
+    /// drops a second concurrent call instead of replacing it, which is right for the
+    /// offline pages but would silently ignore a user changing a filter while a slow
+    /// query is still running. A superseded request's cancellation and its failures are
+    /// both swallowed: neither may disturb the state a newer request already published.
+    /// </remarks>
+    private async Task RunLatestAsync(RequestSlot slot, Func<RequestTicket, Task> work)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        RequestTicket ticket;
+        try
+        {
+            ticket = slot.Begin();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Disposed between the check above and here; nothing may run.
+            return;
+        }
+
+        BeginLoading();
+        try
+        {
+            if (ticket.IsCurrent)
+            {
+                ErrorMessage = null;
+            }
+
+            await work(ticket).ConfigureAwait(true);
+        }
+        catch (OperationCanceledException)
+        {
+            if (ticket.IsCurrent)
+            {
+                ErrorMessage = "操作已取消。";
+            }
+        }
+        catch (Exception exception)
+        {
+            // A stale failure must never replace a newer request's success.
+            if (ticket.IsCurrent)
+            {
+                ErrorMessage = exception.Message;
+            }
+        }
+        finally
+        {
+            ticket.Complete();
+            EndLoading();
+        }
+    }
+
+    private void BeginLoading()
+    {
+        if (Interlocked.Increment(ref _inFlight) == 1)
+        {
+            OnPropertyChanged(nameof(IsLoading));
+        }
+    }
+
+    private void EndLoading()
+    {
+        if (Interlocked.Decrement(ref _inFlight) == 0)
+        {
+            OnPropertyChanged(nameof(IsLoading));
+        }
+    }
+
+    /// <summary>
+    /// Cancels anything still running and permanently retires every request slot, so a
+    /// query that completes after the window closed can no longer touch this view model.
+    /// </summary>
     public void Dispose()
     {
         if (_disposed)
@@ -464,15 +549,9 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         }
 
         _disposed = true;
-        CancelAndDispose(ref _sessionCts);
-        CancelAndDispose(ref _recordCts);
-        CancelAndDispose(ref _rawXmlCts);
-    }
-
-    protected override void OnBusyStateChanged()
-    {
-        NotifyCommands();
-        base.OnBusyStateChanged();
+        _sessionRequests.Dispose();
+        _recordRequests.Dispose();
+        _rawXmlRequests.Dispose();
     }
 
     private Task MoveSessionPageAsync(int delta)
@@ -485,49 +564,6 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     {
         _recordOffset = Math.Max(0, _recordOffset + delta);
         return LoadRecordsAsync(resetPage: false);
-    }
-
-    /// <summary>
-    /// Replaces the token source for one kind of load, cancelling whatever it superseded.
-    /// The returned source is owned by the caller's <c>using</c>.
-    /// </summary>
-    private static CancellationTokenSource ReplaceCancellation(
-        ref CancellationTokenSource? field)
-    {
-        var created = new CancellationTokenSource();
-        var previous = Interlocked.Exchange(ref field, created);
-        if (previous is not null)
-        {
-            try
-            {
-                previous.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-                // Already retired by Dispose; nothing left to cancel.
-            }
-        }
-
-        return created;
-    }
-
-    private static void CancelAndDispose(ref CancellationTokenSource? field)
-    {
-        var existing = Interlocked.Exchange(ref field, null);
-        if (existing is null)
-        {
-            return;
-        }
-
-        try
-        {
-            existing.Cancel();
-        }
-        catch (ObjectDisposedException)
-        {
-        }
-
-        existing.Dispose();
     }
 
     /// <summary>
@@ -602,6 +638,112 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         NextSessionPageCommand.NotifyCanExecuteChanged();
         PreviousRecordPageCommand.NotifyCanExecuteChanged();
         NextRecordPageCommand.NotifyCanExecuteChanged();
+    }
+
+    /// <summary>
+    /// One kind of load. Beginning a request cancels the one it replaces and stamps a
+    /// generation; only the newest generation is allowed to publish. Retiring the slot
+    /// invalidates every generation at once, which is how Dispose stops a late result
+    /// from touching a closed page.
+    /// </summary>
+    private sealed class RequestSlot : IDisposable
+    {
+        private readonly object _sync = new();
+        private CancellationTokenSource? _current;
+        private long _generation;
+        private bool _disposed;
+
+        public RequestTicket Begin()
+        {
+            lock (_sync)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                var previous = _current;
+                var created = new CancellationTokenSource();
+                _current = created;
+                var generation = ++_generation;
+                Cancel(previous);
+                return new RequestTicket(this, created, generation);
+            }
+        }
+
+        public bool IsCurrent(long generation)
+        {
+            lock (_sync)
+            {
+                return !_disposed && generation == _generation;
+            }
+        }
+
+        /// <summary>
+        /// Releases one request's token source. The source is disposed by whoever
+        /// created it, after its work has finished, so a cancelled predecessor never
+        /// disposes a source another operation is still registering callbacks on.
+        /// </summary>
+        public void Retire(CancellationTokenSource source, long generation)
+        {
+            lock (_sync)
+            {
+                if (ReferenceEquals(_current, source))
+                {
+                    _current = null;
+                }
+
+                _ = generation;
+            }
+
+            source.Dispose();
+        }
+
+        public void Dispose()
+        {
+            CancellationTokenSource? current;
+            lock (_sync)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
+                // Bumping the generation invalidates everything already in flight.
+                _generation++;
+                current = _current;
+                _current = null;
+            }
+
+            Cancel(current);
+        }
+
+        private static void Cancel(CancellationTokenSource? source)
+        {
+            if (source is null)
+            {
+                return;
+            }
+
+            try
+            {
+                source.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The owning request already finished and disposed it; nothing to cancel.
+            }
+        }
+    }
+
+    private readonly struct RequestTicket(
+        RequestSlot slot,
+        CancellationTokenSource source,
+        long generation)
+    {
+        public CancellationToken Token => source.Token;
+
+        /// <summary>This is still the newest request of its kind, and may publish.</summary>
+        public bool IsCurrent => slot.IsCurrent(generation);
+
+        public void Complete() => slot.Retire(source, generation);
     }
 
     private static string DescribePage(int offset, int count, long totalCount)
