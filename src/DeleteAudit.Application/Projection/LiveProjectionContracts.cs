@@ -35,7 +35,10 @@ public sealed record LiveProjectionRunResult(
 {
     /// <summary>Everything eligible was already projected by an earlier run.</summary>
     public bool WasAlreadyComplete =>
-        Succeeded && ProjectedCount == 0 && SkippedCount == ConsideredCount;
+        Succeeded
+        && ConsideredCount > 0
+        && ProjectedCount == 0
+        && SkippedCount == ConsideredCount;
 }
 
 /// <summary>

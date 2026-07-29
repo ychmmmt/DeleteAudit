@@ -314,6 +314,8 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
     /// <summary>Held open to park a save mid-flight and interleave a concurrent Stop.</summary>
     public ManualResetEventSlim? SaveGate { get; init; }
 
+    public bool ObserveCompletionCancellationAfterGate { get; init; }
+
     /// <summary>Held open to park an append mid-flight.</summary>
     public ManualResetEventSlim? AppendGate { get; init; }
 
@@ -512,6 +514,11 @@ internal sealed class FakeRepository : ILiveMonitoringRepository
 
         // Waits on a real signal; the timeout only guards against a hung test.
         SaveGate?.Wait(SaveGatePatience, CancellationToken.None);
+        if (ObserveCompletionCancellationAfterGate)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
         return Task.CompletedTask;
     }
 }

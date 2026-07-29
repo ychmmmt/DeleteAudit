@@ -166,6 +166,60 @@ public sealed class LiveProjectionPresentationTests
     }
 
     [Fact]
+    public async Task RefreshCannotCancelOrHideDurableProjectionResult()
+    {
+        using var projectionGate = new ManualResetEventSlim(false);
+        var service = new FakeProjectionService
+        {
+            ProjectionGate = projectionGate,
+            ProjectionResult = new LiveProjectionRunResult(
+                "session-1", 1, 1, 0, true, null, null)
+        };
+        using var viewModel = new LiveProjectionViewModel(service);
+        viewModel.SetSession("session-1");
+
+        var projecting = viewModel.ProjectAsync();
+        await service.ProjectionEntered.WaitAsync(TimeSpan.FromSeconds(10));
+        await viewModel.LoadAsync();
+        projectionGate.Set();
+        await projecting;
+
+        Assert.False(service.ProjectionCancellationObserved);
+        Assert.True(viewModel.HasLastRun);
+        Assert.False(viewModel.LastRunFailed);
+        Assert.Contains("新增 1", viewModel.LastRunSummary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task IncompleteSessionCannotStartProjectionAndShowsReason()
+    {
+        var service = new FakeProjectionService();
+        using var viewModel = new LiveProjectionViewModel(service);
+        viewModel.SetSession("active-session", isComplete: false);
+
+        await viewModel.ProjectAsync();
+
+        Assert.True(viewModel.SelectedSessionIsIncomplete);
+        Assert.False(viewModel.CanProject);
+        Assert.False(viewModel.ProjectCommand.CanExecute(null));
+        Assert.Contains("禁止规范投影", viewModel.IncompleteSessionNotice, StringComparison.Ordinal);
+        Assert.Equal(0, service.ProjectCalls);
+    }
+
+    [Fact]
+    public async Task EmptySuccessfulProjectionDoesNotClaimPriorCompleteness()
+    {
+        var service = new FakeProjectionService();
+        using var viewModel = new LiveProjectionViewModel(service);
+        viewModel.SetSession("session-1");
+
+        await viewModel.ProjectAsync();
+
+        Assert.Contains("没有可投影", viewModel.LastRunSummary, StringComparison.Ordinal);
+        Assert.DoesNotContain("先前已完整投影", viewModel.LastRunSummary, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task NewerQueryWinsAndStaleCompletionIsDiscarded()
     {
         var service = new FakeProjectionService { DelayQueries = true };
@@ -299,6 +353,14 @@ public sealed class LiveProjectionPresentationTests
             "Text=\"{Binding LiveProjection.Disclosure}\"",
             xaml,
             StringComparison.Ordinal);
+        Assert.Contains(
+            "LiveProjection.SelectedSessionIsIncomplete",
+            xaml,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "AutomationProperties.LiveSetting=\"Assertive\"",
+            xaml,
+            StringComparison.Ordinal);
 
         var disclosure = LiveProjectionViewModel.ProjectionDisclosure;
         Assert.Contains("live_evidence_id", disclosure, StringComparison.Ordinal);
@@ -363,6 +425,15 @@ public sealed class LiveProjectionPresentationTests
 
         public bool DelayQueries { get; set; }
 
+        public ManualResetEventSlim? ProjectionGate { get; set; }
+
+        private readonly TaskCompletionSource _projectionEntered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task ProjectionEntered => _projectionEntered.Task;
+
+        public bool ProjectionCancellationObserved { get; private set; }
+
         public int ProjectCalls { get; private set; }
 
         public int VerifyCalls { get; private set; }
@@ -382,12 +453,27 @@ public sealed class LiveProjectionPresentationTests
             string liveSessionId,
             CancellationToken cancellationToken = default)
         {
-            cancellationToken.ThrowIfCancellationRequested();
             ProjectCalls++;
-            return Task.FromResult(ProjectionResult with
+            var result = ProjectionResult with
             {
                 LiveSessionId = liveSessionId
-            });
+            };
+            var gate = ProjectionGate;
+            if (gate is null)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return Task.FromResult(result);
+            }
+
+            return Task.Run(
+                () =>
+                {
+                    _projectionEntered.TrySetResult();
+                    gate.Wait(TimeSpan.FromSeconds(10), CancellationToken.None);
+                    ProjectionCancellationObserved = cancellationToken.IsCancellationRequested;
+                    return result;
+                },
+                CancellationToken.None);
         }
 
         public Task<LiveContinuityStatus> VerifyContinuityAsync(

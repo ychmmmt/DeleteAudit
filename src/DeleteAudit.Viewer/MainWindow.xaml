@@ -672,10 +672,15 @@
                     </WrapPanel>
 
                     <StackPanel Grid.Row="2">
+                        <TextBlock AutomationProperties.LiveSetting="Polite"
+                                   Text="正在读取实时接入历史…"
+                                   Visibility="{Binding LiveHistory.IsLoading, Converter={StaticResource BoolToVisibility}}" />
                         <TextBlock Style="{StaticResource ErrorText}"
+                                   AutomationProperties.LiveSetting="Assertive"
                                    Text="{Binding LiveHistory.UnavailableMessage}"
                                    Visibility="{Binding LiveHistory.IsUnavailable, Converter={StaticResource BoolToVisibility}}" />
                         <TextBlock Style="{StaticResource ErrorText}"
+                                   AutomationProperties.LiveSetting="Assertive"
                                    Text="{Binding LiveHistory.ErrorMessage}" />
                         <TextBlock Margin="0,4,0,0"
                                    Text="没有符合条件的实时接入会话。"
@@ -934,9 +939,10 @@
                                     Content="验证连续性"
                                     Margin="8,0,0,0"
                                     Padding="12,6" />
-                            <TextBlock Margin="12,0,0,0"
-                                       VerticalAlignment="Center"
-                                       Text="正在执行…"
+                             <TextBlock Margin="12,0,0,0"
+                                        AutomationProperties.LiveSetting="Polite"
+                                        VerticalAlignment="Center"
+                                        Text="正在执行…"
                                        Visibility="{Binding LiveProjection.IsLoading, Converter={StaticResource BoolToVisibility}}" />
                         </WrapPanel>
 
@@ -971,6 +977,18 @@
                     </StackPanel>
 
                     <StackPanel Grid.Row="2" Margin="0,8,0,0">
+                        <Border Background="#FFF4E5"
+                                BorderBrush="#B54708"
+                                BorderThickness="1"
+                                CornerRadius="4"
+                                Padding="10,8"
+                                AutomationProperties.LiveSetting="Assertive"
+                                Visibility="{Binding LiveProjection.SelectedSessionIsIncomplete, Converter={StaticResource BoolToVisibility}}">
+                            <TextBlock Foreground="#B54708"
+                                       FontWeight="SemiBold"
+                                       Text="{Binding LiveProjection.IncompleteSessionNotice}"
+                                       TextWrapping="Wrap" />
+                        </Border>
                         <TextBlock Text="{Binding LiveProjection.AvailabilityMessage}"
                                    TextWrapping="Wrap" />
                         <TextBlock Margin="0,4,0,0"

@@ -28,8 +28,10 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
 
     private readonly ILiveProjectionService _service;
     private readonly ObservableCollection<LiveProjectedRecordRow> _records = [];
-    private readonly RequestSlot _requests = new();
+    private readonly RequestSlot _queryRequests = new();
+    private readonly RequestSlot _projectionRequests = new();
     private string? _selectedSessionId;
+    private bool _selectedSessionIsComplete;
     private LiveProjectionAvailability? _availability;
     private LiveProjectionRunResult? _lastRun;
     private LiveContinuityStatus? _continuity;
@@ -50,7 +52,7 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
 
         ProjectCommand = new AsyncCommand(
             ProjectAsync,
-            () => HasSelectedSession,
+            () => CanProject,
             ShowUnexpectedError);
         RefreshCommand = new AsyncCommand(
             () => LoadAsync(resetPage: false),
@@ -98,6 +100,16 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
     public bool HasSelectedSession =>
         !string.IsNullOrWhiteSpace(_selectedSessionId);
 
+    public bool SelectedSessionIsIncomplete =>
+        HasSelectedSession && !_selectedSessionIsComplete;
+
+    public bool CanProject => HasSelectedSession && _selectedSessionIsComplete;
+
+    public string IncompleteSessionNotice =>
+        SelectedSessionIsIncomplete
+            ? "该实时接入会话尚未完成。为避免与活动采集争用 SQLite 写锁，完成前禁止规范投影；只读查看与连续性检查仍可用。"
+            : string.Empty;
+
     public string SelectedSessionSummary =>
         HasSelectedSession
             ? $"当前投影会话：{_selectedSessionId}"
@@ -135,6 +147,11 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
             {
                 return $"投影失败（{_lastRun.FailureCode}）："
                     + $"{_lastRun.FailureDetail}";
+            }
+
+            if (_lastRun.ConsideredCount == 0)
+            {
+                return "投影完成：该会话没有可投影的删除、进程上下文或安全补强记录。";
             }
 
             return string.Format(
@@ -223,7 +240,7 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
     /// Retires all work belonging to the previous live capture. No database operation is
     /// started here; the user chooses project, refresh or verify explicitly.
     /// </summary>
-    public void SetSession(string? liveSessionId)
+    public void SetSession(string? liveSessionId, bool isComplete = true)
     {
         if (_disposed)
         {
@@ -233,16 +250,20 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
         var normalized = string.IsNullOrWhiteSpace(liveSessionId)
             ? null
             : liveSessionId;
+        var normalizedComplete = normalized is not null && isComplete;
         if (string.Equals(
                 _selectedSessionId,
                 normalized,
-                StringComparison.Ordinal))
+                StringComparison.Ordinal)
+            && _selectedSessionIsComplete == normalizedComplete)
         {
             return;
         }
 
-        _requests.Invalidate();
+        _queryRequests.Invalidate();
+        _projectionRequests.Invalidate();
         _selectedSessionId = normalized;
+        _selectedSessionIsComplete = normalizedComplete;
         _availability = null;
         _lastRun = null;
         _continuity = null;
@@ -255,7 +276,10 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
     }
 
     public Task LoadAsync(bool resetPage = true) =>
-        RunLatestAsync(async ticket =>
+        LoadAtOffsetAsync(resetPage ? 0 : _offset);
+
+    private Task LoadAtOffsetAsync(int requestedOffset) =>
+        RunLatestAsync(_queryRequests, async ticket =>
         {
             var sessionId = _selectedSessionId;
             if (sessionId is null)
@@ -263,7 +287,6 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
                 return;
             }
 
-            var requestedOffset = resetPage ? 0 : _offset;
             var availability = await _service
                 .GetAvailabilityAsync(ticket.Token)
                 .ConfigureAwait(true);
@@ -300,10 +323,10 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
         });
 
     public Task ProjectAsync() =>
-        RunLatestAsync(async ticket =>
+        RunLatestAsync(_projectionRequests, async ticket =>
         {
             var sessionId = _selectedSessionId;
-            if (sessionId is null)
+            if (sessionId is null || !_selectedSessionIsComplete)
             {
                 return;
             }
@@ -327,33 +350,14 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
                 return;
             }
 
-            var availability = await _service
-                .GetAvailabilityAsync(ticket.Token)
-                .ConfigureAwait(true);
-            var page = await _service
-                .GetProjectedRecordsAsync(
-                    CreateQuery(sessionId, offset: 0),
-                    ticket.Token)
-                .ConfigureAwait(true);
-            RejectOversizedPage(page.Items.Count);
-            var continuity = await _service
-                .VerifyContinuityAsync(sessionId, ticket.Token)
-                .ConfigureAwait(true);
-
-            if (!CanCommit(ticket, sessionId))
-            {
-                return;
-            }
-
-            _availability = availability;
-            _continuity = continuity;
-            _recordsLoaded = true;
-            ReplaceRecords(page);
-            NotifyAllStateChanged();
+            // A durable mutation gets its own request lifetime. Its follow-up read enters
+            // the normal latest-query slot, cancelling any pre-commit snapshot while
+            // allowing a later user filter/page request to win.
+            await LoadAfterProjectionAsync(sessionId).ConfigureAwait(true);
         });
 
     public Task VerifyAsync() =>
-        RunLatestAsync(async ticket =>
+        RunLatestAsync(_queryRequests, async ticket =>
         {
             var sessionId = _selectedSessionId;
             if (sessionId is null)
@@ -391,7 +395,8 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
         }
 
         _disposed = true;
-        _requests.Dispose();
+        _queryRequests.Dispose();
+        _projectionRequests.Dispose();
     }
 
     private LiveProjectionQuery CreateQuery(string sessionId, int offset) =>
@@ -405,7 +410,37 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
             Descending,
             new PageRequest(offset, PageSize));
 
-    private async Task RunLatestAsync(Func<RequestTicket, Task> work)
+    private Task LoadAfterProjectionAsync(string sessionId) =>
+        RunLatestAsync(_queryRequests, async ticket =>
+        {
+            var availability = await _service
+                .GetAvailabilityAsync(ticket.Token)
+                .ConfigureAwait(true);
+            var page = await _service
+                .GetProjectedRecordsAsync(
+                    CreateQuery(sessionId, offset: 0),
+                    ticket.Token)
+                .ConfigureAwait(true);
+            RejectOversizedPage(page.Items.Count);
+            var continuity = await _service
+                .VerifyContinuityAsync(sessionId, ticket.Token)
+                .ConfigureAwait(true);
+
+            if (!CanCommit(ticket, sessionId))
+            {
+                return;
+            }
+
+            _availability = availability;
+            _continuity = continuity;
+            _recordsLoaded = true;
+            ReplaceRecords(page);
+            NotifyAllStateChanged();
+        });
+
+    private async Task RunLatestAsync(
+        RequestSlot slot,
+        Func<RequestTicket, Task> work)
     {
         if (_disposed)
         {
@@ -415,7 +450,7 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
         RequestTicket ticket;
         try
         {
-            ticket = _requests.Begin();
+            ticket = slot.Begin();
         }
         catch (ObjectDisposedException)
         {
@@ -472,13 +507,11 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
         _offset = page.Offset;
     }
 
-    private Task MovePageAsync(int delta)
-    {
-        _offset = delta < 0
-            ? Math.Max(0, _offset + delta)
-            : checked(_offset + delta);
-        return LoadAsync(resetPage: false);
-    }
+    private Task MovePageAsync(int delta) =>
+        LoadAtOffsetAsync(
+            delta < 0
+                ? Math.Max(0, _offset + delta)
+                : checked(_offset + delta));
 
     private void BeginLoading()
     {
@@ -500,6 +533,9 @@ public sealed class LiveProjectionViewModel : ViewModelBase, IDisposable
     {
         OnPropertyChanged(nameof(SelectedSessionId));
         OnPropertyChanged(nameof(HasSelectedSession));
+        OnPropertyChanged(nameof(SelectedSessionIsIncomplete));
+        OnPropertyChanged(nameof(CanProject));
+        OnPropertyChanged(nameof(IncompleteSessionNotice));
         OnPropertyChanged(nameof(SelectedSessionSummary));
         NotifyQueryStateChanged();
         NotifyRunStateChanged();

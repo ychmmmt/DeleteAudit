@@ -9,7 +9,11 @@ project, not a product.
 evidence, or compliance.** It does not provide a complete or tamper-evident
 delete audit trail, and it cannot prevent, block, or recover deletions.
 
-## What the current release does
+## What the Phase 2B source candidate does
+
+The capabilities below describe the Phase 2B source candidate. A local feature
+branch or acceptance record is not a supported release; only code integrated
+into the default branch falls under the supported-version statement below.
 
 - Offline analysis of Windows event data that the user explicitly imports
   (a single `.xml` or `.evtx` file at a time).

@@ -2939,6 +2939,59 @@ public sealed class LiveMonitoringServiceTests
     }
 
     [Fact]
+    public async Task CancellationAfterStopBeginsCannotAbandonCompletion()
+    {
+        using var saveGate = new ManualResetEventSlim(false);
+        var repository = new FakeRepository
+        {
+            SaveGate = saveGate,
+            ObserveCompletionCancellationAfterGate = true
+        };
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            new FakeLiveEventSource(),
+            repository);
+        await service.StartAsync();
+        using var cancellation = new CancellationTokenSource();
+
+        var stopping = service.StopAsync(cancellation.Token);
+        await repository.FirstCompletionEntered.WaitAsync(Patience);
+        cancellation.Cancel();
+        saveGate.Set();
+        await stopping;
+
+        Assert.True(service.CompletionStarted);
+        Assert.True(service.LifecycleCompleted);
+        Assert.True(service.SessionPersisted);
+        Assert.Equal(LiveMonitoringState.Stopped, service.Snapshot.State);
+        Assert.Single(repository.Completions);
+    }
+
+    [Fact]
+    public async Task SourceFaultAfterCleanStopCannotReviseFinalState()
+    {
+        var source = new FakeLiveEventSource();
+        var repository = new FakeRepository();
+        await using var service = new LiveMonitoringService(
+            FakeProbe.AllAvailable(),
+            source,
+            repository);
+        await service.StartAsync();
+        var watcher = source.Watcher(0);
+        await service.StopAsync();
+
+        watcher.Fault("late_fixture_fault", "late fault after stop");
+
+        Assert.Equal(LiveMonitoringState.Stopped, service.Snapshot.State);
+        Assert.Equal(
+            LiveMonitoringState.Stopped,
+            Assert.Single(repository.Sessions).FinalState);
+        Assert.DoesNotContain(
+            service.SessionDiagnostics,
+            item => item.Code == "late_fixture_fault");
+    }
+
+    [Fact]
     public async Task CompletionStartedLifecycleAndPersistedAreDistinctFacts()
     {
         var repository = new FakeRepository

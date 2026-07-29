@@ -261,6 +261,24 @@ public sealed partial class SqliteLiveProjectionService
             expectedSequence++;
         }
 
+        var projectedCount = expectedSequence - 1;
+        var successfulHighWater = await ReadSuccessfulProjectionHighWaterAsync(
+                connection,
+                transaction,
+                liveSessionId,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (successfulHighWater > projectedCount)
+        {
+            return Broken(
+                liveSessionId,
+                projectedCount,
+                projectedCount + 1,
+                priorEvidenceId,
+                $"已有成功投影曾覆盖 {successfulHighWater} 条记录，当前仅剩 "
+                + $"{projectedCount} 条；检测到尾部截断。");
+        }
+
         if (epochs.Count != seenEpochs.Count)
         {
             return Broken(
@@ -404,6 +422,52 @@ public sealed partial class SqliteLiveProjectionService
             is not null;
     }
 
+    private static async Task<CompletedSourceLedger?> ReadCompletedSourceLedgerAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string liveSessionId,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT
+                c.persisted_record_count,
+                (SELECT COUNT(*)
+                 FROM live_capture_records AS r
+                 WHERE r.live_session_id = c.live_session_id)
+            FROM live_capture_completions AS c
+            WHERE c.live_session_id = $session;
+            """;
+        command.Parameters.Add("$session", SqliteType.Text).Value = liveSessionId;
+        await using var reader = await command
+            .ExecuteReaderAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            ? new CompletedSourceLedger(reader.GetInt64(0), reader.GetInt64(1))
+            : null;
+    }
+
+    private static async Task<long> ReadSuccessfulProjectionHighWaterAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string liveSessionId,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT COALESCE(MAX(considered_count), 0)
+            FROM live_projection_runs
+            WHERE live_session_id = $session
+              AND outcome = 'completed';
+            """;
+        command.Parameters.Add("$session", SqliteType.Text).Value = liveSessionId;
+        return Convert.ToInt64(
+            await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
+            System.Globalization.CultureInfo.InvariantCulture);
+    }
+
     private static StoredProjection ReadStoredProjection(SqliteDataReader reader) =>
         new(
             reader.GetString(0),
@@ -510,4 +574,15 @@ public sealed partial class SqliteLiveProjectionService
         string? ProviderName,
         DateTimeOffset OpenedUtc,
         long FirstReceivedSequence);
+
+    private sealed record CompletedSourceLedger(
+        long PersistedRecordCount,
+        long ActualRecordCount)
+    {
+        public bool IsConsistent => PersistedRecordCount == ActualRecordCount;
+
+        public string DescribeMismatch() =>
+            $"完成记录声明已持久化 {PersistedRecordCount} 条 live evidence，"
+            + $"当前源账本实际为 {ActualRecordCount} 条；拒绝把不完整来源视为连续。";
+    }
 }

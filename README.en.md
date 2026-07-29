@@ -41,7 +41,7 @@ It is a tool for **looking at and organising** logs. It is not a protection tool
 - **The completion record is attempted once, with no automatic retry.** If that save fails, the session shows `Error`; records committed successfully beforehand are kept.
 - **No signature, no external anchoring, and no tamper-proof guarantee.** The live-owned continuity hash can help expose an ordering break or accidental modification, but anyone with database write access can rebuild the whole chain. SQLite is not a tamper-proof medium.
 - This repository ships **source code only**. There is **no** ready-to-run, signed Windows installer.
-- Latest verification: **278 unit tests, 184 integration tests, 462 in total, all passing in two consecutive runs**, with a 0 warning / 0 error build.
+- Latest verification: **286 unit tests, 188 integration tests, 474 in total, all passing in two consecutive runs**, with a 0 warning / 0 error build.
 
 Per-phase acceptance records, the design overview and the threat model live in [`docs/`](docs/).
 
@@ -85,7 +85,7 @@ Run the viewer:
 dotnet run --project src/DeleteAudit.Viewer
 ```
 
-Data and output stay inside the repository's `artifacts\` folder; nothing is written outside the checkout. Build rules, test rules and directory conventions are in [CONTRIBUTING.md](CONTRIBUTING.md).
+Application data and synthetic test output are configured under the ignored repository `artifacts\` folder; normal .NET build products remain in each project's `bin/obj`. To keep the CLI home, NuGet cache and temporary directories inside the checkout as well, set the environment described in [CONTRIBUTING.md](CONTRIBUTING.md) first.
 
 ## Reporting a security problem
 

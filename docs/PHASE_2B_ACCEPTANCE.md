@@ -2,7 +2,7 @@
 
 ## 1. 裁定
 
-Phase 2B.1–2B.4 的当前进程实时接入范围已完成，可作为 Alpha 源码阶段签字。该裁定只覆盖：
+Phase 2B.1–2B.4 的当前进程实时接入范围已完成，可作为本文件所在本地 Git commit 的 Alpha 源码候选签字。该裁定不是远端发布、default-branch 集成、tag 或受支持版本声明，只覆盖：
 
 - 用户手动启动的本机 Windows Event Log 只读接入；
 - live evidence 持久化与有界时间批次刷新；
@@ -18,13 +18,18 @@ Phase 2B.1–2B.4 的当前进程实时接入范围已完成，可作为 Alpha �
 .NET SDK:   8.0.423
 Restore:    成功
 Build:      7/7 projects，0 warning，0 error
-Unit:       278/278，Failed 0，Skipped 0
-Integration:184/184，Failed 0，Skipped 0
-Total:      462/462
+Unit:       286/286，Failed 0，Skipped 0
+Integration:188/188，Failed 0，Skipped 0
+Total:      474/474
 Repeat:     全量测试连续两轮数量一致且全部通过
 ```
 
 CLI home、NuGet cache、TEMP、测试数据库与测试输出均位于仓库忽略的 `artifacts/` 下。验收不读取真实 Event Log，不启动 watcher，不访问远程资源，也不修改系统状态。
+
+验收对象以“本文件所在 commit”为不可变锚点；命令依次为 `dotnet restore`、
+`dotnet build --no-restore`、Unit 与 Integration 的 `dotnet test --no-build`，
+随后重复两项全量测试。执行日期为 2026-07-29（UTC），SDK 为项目批准的
+8.0.423。控制台日志仅保存在 ignored `artifacts/`，不是签名或外部发布证明。
 
 ## 3. Phase 2B.1：live evidence
 
@@ -77,9 +82,9 @@ Sysmon 1 只补充进程上下文；Security 4663 只有明确 DELETE/DELETE_CHI
 
 投影前重新计算 raw XML SHA-256、重新运行 Phase 1A parser，并核对 capture 保存的 parser identity 与 outcome。canonical payload digest 覆盖全部规范字段；entry hash 覆盖前一 live entry、evidence identity、epoch、live sequence、raw digest 和 payload digest。首条记录从独立零锚点开始，不连接离线链。
 
-重放同一会话不会重复创建 projection、epoch、sequence 或 hash。已有投影必须是源 evidence 接收顺序的完整前缀且 continuity 验证通过，才允许追加。单次投影、epoch、projected rows 与 completed run 在一个 immediate transaction 中提交；失败回滚后保留原始 live evidence，并尽力追加独立 failed run 诊断。
+重放同一会话不会重复创建 projection、epoch、sequence 或 hash。只有存在 completion 且 completion 的 `persisted_record_count` 与当前 source ledger 总行数一致的会话才允许投影；该检查先在 ReadOnly preflight 中完成，并在 immediate transaction 内再次核对。incomplete 或 source-ledger mismatch 不取得投影写锁、不写 failed run。已有投影必须是源 evidence 接收顺序的完整前缀且 continuity 验证通过，才允许追加。其余单次投影、epoch、projected rows 与 completed run 在一个 immediate transaction 中提交；事务失败回滚后保留原始 live evidence，并尽力追加独立 failed run 诊断。
 
-continuity 验证会重新读取 source、重算 parser/payload/digest/hash，并检测缺节点、乱序、source identity 不一致、epoch 首记录不一致和内容修改。该结果只辅助检测连续性与意外修改：没有签名或外部锚点，有写权限的人可以重建整链，故不具备防篡改能力。
+continuity 验证会重新读取 source、重算 parser/payload/digest/hash，并通过 completed source count 与 successful-run high-water 检测首次投影前源记录缺失、投影尾部截断、其他缺节点、乱序、source identity 不一致、epoch 首记录不一致和内容修改。该结果只辅助检测连续性与意外修改：没有签名或外部锚点，有写权限的人可以同时重建账本与整链，故不具备防篡改能力。
 
 ## 7. Readiness、查询与 WPF
 
@@ -90,7 +95,7 @@ runtime 不执行 migration。projection readiness 使用 ReadOnly 连接，并�
 - 完整外键集合及 `NO ACTION` 行为；
 - 完整 table-declared、非 partial、无表达式的 UNIQUE 集合；
 - 无 hidden/generated column；
-- unconditional `BEFORE UPDATE/DELETE ... SELECT RAISE(ABORT, ...)` trigger。
+- 每个受保护 live 表完整且无额外项的 trigger allowlist，其中 canonical guard 必须是 unconditional `BEFORE UPDATE/DELETE ... SELECT RAISE(ABORT, ...)`。
 
 缺数据库、缺 0005 或任一结构变异都只使 projection 页面 fail closed 为 unavailable；已有离线、实时预览、Live History 和派生分析不自动降级或迁移。
 

@@ -35,7 +35,7 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
 
     private readonly ILiveHistoryQueryService _queryService;
     private readonly ILiveAnalysisService _analysisService;
-    private readonly Action<string?>? _selectedSessionChanged;
+    private readonly Action<LiveCaptureSessionRow?>? _selectedSessionChanged;
     private readonly ObservableCollection<LiveCaptureSessionRow> _sessions = [];
     private readonly ObservableCollection<LiveCaptureRecordRow> _records = [];
     private readonly ObservableCollection<LiveCaptureDiagnosticRow> _diagnostics = [];
@@ -72,7 +72,7 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     public LiveHistoryViewModel(
         ILiveHistoryQueryService queryService,
         ILiveAnalysisService analysisService,
-        Action<string?>? selectedSessionChanged = null)
+        Action<LiveCaptureSessionRow?>? selectedSessionChanged = null)
     {
         _queryService = queryService ?? throw new ArgumentNullException(nameof(queryService));
         _analysisService = analysisService
@@ -232,13 +232,13 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         {
             if (SetProperty(ref _selectedSession, value))
             {
-                _selectedSessionChanged?.Invoke(value?.LiveSessionId);
+                _recordRequests.Invalidate();
+                _rawXmlRequests.Invalidate();
+                _analysisRequests.Invalidate();
+                ClearRecords();
+                _selectedSessionChanged?.Invoke(value);
                 OnPropertyChanged(nameof(SelectedSessionSummary));
                 OnPropertyChanged(nameof(SelectedSessionIsIncomplete));
-                // An analysis belongs to the session it was derived from. Switching
-                // sessions retires it immediately rather than leaving another session's
-                // conclusions on screen while the new records load.
-                SetAnalysis(null);
                 NotifyCommands();
                 // Selecting a session loads its records; the previous load is cancelled.
                 _ = LoadRecordsAsync(resetPage: true);
@@ -382,13 +382,11 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     /// an exception.
     /// </summary>
     public Task LoadSessionsAsync(bool resetPage = true) =>
+        LoadSessionsAtOffsetAsync(resetPage ? 0 : _sessionOffset);
+
+    private Task LoadSessionsAtOffsetAsync(int requestedOffset) =>
         RunLatestAsync(_sessionRequests, async ticket =>
         {
-            if (resetPage)
-            {
-                _sessionOffset = 0;
-            }
-
             var availability = await _queryService
                 .GetAvailabilityAsync(ticket.Token)
                 .ConfigureAwait(true);
@@ -396,7 +394,7 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
                 FilterPresentation.ParseOptionalUtc(FromUtcText, "开始时间"),
                 FilterPresentation.ParseOptionalUtc(ToUtcText, "结束时间"),
                 SessionState,
-                new PageRequest(_sessionOffset, PageSize));
+                new PageRequest(requestedOffset, PageSize));
 
             PageResult<LiveCaptureSessionRow>? page = null;
             if (availability.IsReady)
@@ -436,6 +434,9 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         });
 
     public Task LoadRecordsAsync(bool resetPage = true) =>
+        LoadRecordsAtOffsetAsync(resetPage ? 0 : _recordOffset);
+
+    private Task LoadRecordsAtOffsetAsync(int requestedOffset) =>
         RunLatestAsync(_recordRequests, async ticket =>
         {
             var session = SelectedSession;
@@ -447,11 +448,6 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
                 }
 
                 return;
-            }
-
-            if (resetPage)
-            {
-                _recordOffset = 0;
             }
 
             var page = await _queryService
@@ -470,7 +466,7 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
                         null,
                         null,
                         NewestFirst,
-                        new PageRequest(_recordOffset, PageSize)),
+                        new PageRequest(requestedOffset, PageSize)),
                     ticket.Token)
                 .ConfigureAwait(true);
             RejectOversizedPage(page.Items.Count);
@@ -478,7 +474,11 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
                 .GetSessionDiagnosticsAsync(session.LiveSessionId, ticket.Token)
                 .ConfigureAwait(true);
 
-            if (!ticket.IsCurrent)
+            if (!ticket.IsCurrent
+                || !string.Equals(
+                    SelectedSession?.LiveSessionId,
+                    session.LiveSessionId,
+                    StringComparison.Ordinal))
             {
                 return;
             }
@@ -519,7 +519,11 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
                 .ConfigureAwait(true);
 
             // A preview for a record the user has already moved off must not land.
-            if (!ticket.IsCurrent)
+            if (!ticket.IsCurrent
+                || !string.Equals(
+                    SelectedRecord?.LiveEvidenceId,
+                    record.LiveEvidenceId,
+                    StringComparison.Ordinal))
             {
                 return;
             }
@@ -553,7 +557,11 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
                 .AnalyzeAsync(session.LiveSessionId, ticket.Token)
                 .ConfigureAwait(true);
 
-            if (!ticket.IsCurrent)
+            if (!ticket.IsCurrent
+                || !string.Equals(
+                    SelectedSession?.LiveSessionId,
+                    session.LiveSessionId,
+                    StringComparison.Ordinal))
             {
                 return;
             }
@@ -657,7 +665,7 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
 
     private void EndLoading()
     {
-        if (Interlocked.Decrement(ref _inFlight) == 0)
+        if (Interlocked.Decrement(ref _inFlight) == 0 && !_disposed)
         {
             OnPropertyChanged(nameof(IsLoading));
         }
@@ -681,17 +689,11 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
         _analysisRequests.Dispose();
     }
 
-    private Task MoveSessionPageAsync(int delta)
-    {
-        _sessionOffset = Math.Max(0, _sessionOffset + delta);
-        return LoadSessionsAsync(resetPage: false);
-    }
+    private Task MoveSessionPageAsync(int delta) =>
+        LoadSessionsAtOffsetAsync(Math.Max(0, _sessionOffset + delta));
 
-    private Task MoveRecordPageAsync(int delta)
-    {
-        _recordOffset = Math.Max(0, _recordOffset + delta);
-        return LoadRecordsAsync(resetPage: false);
-    }
+    private Task MoveRecordPageAsync(int delta) =>
+        LoadRecordsAtOffsetAsync(Math.Max(0, _recordOffset + delta));
 
     /// <summary>
     /// The service is the authority on page size. A larger page means the query layer
@@ -729,12 +731,15 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
     {
         _records.Clear();
         _diagnostics.Clear();
+        _selectedRecord = null;
         _recordTotalCount = 0;
         _recordOffset = 0;
         SetRawXml(null);
         // Analysis belongs to one capture session; changing session retires it rather
         // than leaving another session's conclusions on screen.
         SetAnalysis(null);
+        OnPropertyChanged(nameof(SelectedRecord));
+        OnPropertyChanged(nameof(SelectedRecordSummary));
         NotifyRecordListChanged();
     }
 
@@ -804,6 +809,24 @@ public sealed class LiveHistoryViewModel : ViewModelBase, IDisposable
             {
                 return !_disposed && generation == _generation;
             }
+        }
+
+        public void Invalidate()
+        {
+            CancellationTokenSource? current;
+            lock (_sync)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _generation++;
+                current = _current;
+                _current = null;
+            }
+
+            Cancel(current);
         }
 
         /// <summary>

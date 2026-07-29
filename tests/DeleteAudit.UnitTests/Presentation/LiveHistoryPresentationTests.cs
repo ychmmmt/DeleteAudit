@@ -98,6 +98,50 @@ public sealed class LiveHistoryPresentationTests
     }
 
     [Fact]
+    public async Task AnalysisCompletingAfterSessionSwitchCannotLandOnNewSession()
+    {
+        var service = new FakeLiveHistoryQueryService();
+        service.SetSessions([Session(1), Session(2)]);
+        using var gate = new ManualResetEventSlim(false);
+        service.AnalysisGate = gate;
+        using var viewModel = new LiveHistoryViewModel(service, service);
+        await viewModel.LoadSessionsAsync();
+        viewModel.SelectedSession = viewModel.Sessions[0];
+
+        var analyzing = viewModel.AnalyzeAsync();
+        await service.AnalysisEntered.WaitAsync(TimeSpan.FromSeconds(10));
+        viewModel.SelectedSession = viewModel.Sessions[1];
+        gate.Set();
+        await analyzing;
+
+        Assert.Equal("session-2", viewModel.SelectedSession?.LiveSessionId);
+        Assert.False(viewModel.HasAnalysis);
+        Assert.Empty(viewModel.AnalysisSessions);
+    }
+
+    [Fact]
+    public async Task SwitchingSessionImmediatelyClearsOldRecordsAndRawXml()
+    {
+        var service = new FakeLiveHistoryQueryService();
+        service.SetSessions([Session(1), Session(2)]);
+        service.SetRecords([Record(1)]);
+        using var viewModel = new LiveHistoryViewModel(service, service);
+        await viewModel.LoadSessionsAsync();
+        viewModel.SelectedSession = viewModel.Sessions[0];
+        await viewModel.LoadRecordsAsync();
+        viewModel.SelectedRecord = viewModel.Records[0];
+        await viewModel.LoadRawXmlAsync();
+        Assert.True(viewModel.HasRawXml);
+
+        service.SetRecords([]);
+        viewModel.SelectedSession = viewModel.Sessions[1];
+
+        Assert.Empty(viewModel.Records);
+        Assert.Null(viewModel.SelectedRecord);
+        Assert.False(viewModel.HasRawXml);
+    }
+
+    [Fact]
     public async Task AnUnusableDatabaseBecomesAStateNotAnException()
     {
         var service = new FakeLiveHistoryQueryService
@@ -341,6 +385,34 @@ public sealed class LiveHistoryPresentationTests
         viewModel.Dispose();
     }
 
+    [Fact]
+    public async Task DisposePreventsLatePropertyChangedNotifications()
+    {
+        var service = new FakeLiveHistoryQueryService();
+        service.SetSessions([Session(1)]);
+        using var gate = new ManualResetEventSlim(false);
+        service.GateCall(1, gate);
+        var viewModel = new LiveHistoryViewModel(service, service);
+        var notificationsAfterDispose = 0;
+        var disposed = false;
+        viewModel.PropertyChanged += (_, _) =>
+        {
+            if (disposed)
+            {
+                notificationsAfterDispose++;
+            }
+        };
+
+        var loading = viewModel.LoadSessionsAsync();
+        await service.CallEntered(1).WaitAsync(TimeSpan.FromSeconds(10));
+        disposed = true;
+        viewModel.Dispose();
+        gate.Set();
+        await loading;
+
+        Assert.Equal(0, notificationsAfterDispose);
+    }
+
     /// <summary>
     /// Selecting another record while a preview is still loading must leave the newer
     /// record's preview in place.
@@ -504,13 +576,33 @@ public sealed class LiveHistoryPresentationTests
 
         public LiveSessionAnalysis? Analysis { get; set; }
 
+        public ManualResetEventSlim? AnalysisGate { get; set; }
+
+        private readonly TaskCompletionSource _analysisEntered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task AnalysisEntered => _analysisEntered.Task;
+
         public Task<LiveSessionAnalysis> AnalyzeAsync(
             string liveSessionId,
             CancellationToken cancellationToken = default)
         {
             AnalyzeCalls++;
-            return Task.FromResult(
-                Analysis ?? LiveSessionAnalysis.Empty(liveSessionId));
+            var analysis = Analysis ?? LiveSessionAnalysis.Empty(liveSessionId);
+            var gate = AnalysisGate;
+            if (gate is null)
+            {
+                return Task.FromResult(analysis);
+            }
+
+            return Task.Run(
+                () =>
+                {
+                    _analysisEntered.TrySetResult();
+                    gate.Wait(TimeSpan.FromSeconds(10), CancellationToken.None);
+                    return analysis;
+                },
+                CancellationToken.None);
         }
 
         private readonly TaskCompletionSource _sessionEntered =

@@ -41,7 +41,7 @@ Windows 会把"某个文件被删除了"这类事情记录在系统日志里，�
 - **会话完成记录只尝试保存一次，不会自动重试。** 保存失败时会话显示 `Error`；此前已经成功提交的记录仍会保留。
 - **不提供签名、外部锚定或防篡改保证。** live-owned 投影连续性哈希可辅助发现顺序断裂或意外修改，但有数据库写权限的人可以重建整条链；SQLite 不是防篡改介质。
 - 本仓库**只提供源代码**。目前**没有**提供可直接使用的、已签名的 Windows 安装包。
-- 最近一次验收：**Unit 278、Integration 184，合计 462 项测试连续两轮全部通过**，构建 0 warning、0 error。
+- 最近一次验收：**Unit 286、Integration 188，合计 474 项测试连续两轮全部通过**，构建 0 warning、0 error。
 
 各阶段的详细验收记录、设计总览与威胁模型见 [`docs/`](docs/)。
 
@@ -85,7 +85,7 @@ dotnet test --no-build
 dotnet run --project src/DeleteAudit.Viewer
 ```
 
-数据和输出都放在仓库内的 `artifacts\` 目录下，不会写到仓库以外的地方。更详细的构建规则、测试要求与目录约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+应用运行数据与测试夹具输出配置在仓库内忽略的 `artifacts\`；标准 .NET 编译产物位于各项目的 `bin/obj`。如需把 CLI home、NuGet cache 与临时目录也隔离在 checkout 内，请先按 [CONTRIBUTING.md](CONTRIBUTING.md) 设置环境变量。
 
 ## 反馈安全问题
 

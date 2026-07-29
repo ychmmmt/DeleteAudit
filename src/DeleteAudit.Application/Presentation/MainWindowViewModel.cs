@@ -52,7 +52,9 @@ public sealed class MainWindowViewModel : ViewModelBase
         LiveHistory = new LiveHistoryViewModel(
             liveHistoryQueryService,
             liveAnalysisService,
-            sessionId => LiveProjection.SetSession(sessionId));
+            session => LiveProjection.SetSession(
+                session?.LiveSessionId,
+                session?.IsComplete ?? false));
         ImportHistory = new ImportHistoryViewModel(queryService);
         DeleteSessions = new DeleteSessionsViewModel(queryService);
         DeleteEvents = new DeleteEventsViewModel(queryService, OpenRawXmlAsync);

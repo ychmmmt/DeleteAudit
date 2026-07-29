@@ -41,7 +41,7 @@ Tool ito para **tumingin at mag-ayos**. Hindi ito panangga. Hindi nito mapipigil
 - **Isang beses lang sinusubukang i-save ang completion record at walang awtomatikong retry.** Kapag nabigo iyon, `Error` ang ipinapakita ng session; nananatili ang mga record na matagumpay nang na-commit.
 - **Walang signature, walang external anchoring, at walang tamper-proof na garantiya.** Makatutulong ang live-owned continuity hash na makita ang naputol na pagkakasunod o aksidenteng pagbabago, pero kayang buuin muli ang buong chain ng sinumang may write access sa database. Hindi tamper-proof na medium ang SQLite.
 - **Source code lamang** ang inilalabas ng repository na ito. **Walang** handang gamitin at nakapirmang (signed) Windows installer.
-- Pinakahuling beripikasyon: **278 unit test, 184 integration test, 462 lahat, dalawang magkasunod na run na pasado lahat**, na may build na 0 warning at 0 error.
+- Pinakahuling beripikasyon: **286 unit test, 188 integration test, 474 lahat, dalawang magkasunod na run na pasado lahat**, na may build na 0 warning at 0 error.
 
 Nasa [`docs/`](docs/) ang mga talaan ng bawat yugto, ang pangkalahatang disenyo, at ang threat model.
 
@@ -85,7 +85,7 @@ Patakbuhin ang viewer:
 dotnet run --project src/DeleteAudit.Viewer
 ```
 
-Nananatili sa loob ng `artifacts\` na folder ng repository ang data at output; walang isinusulat sa labas ng checkout. Nasa [CONTRIBUTING.md](CONTRIBUTING.md) ang mga panuntunan sa build, sa test, at sa mga direktoryo.
+Naka-configure sa ignored na `artifacts\` folder ng repository ang application data at synthetic test output; nananatili naman sa `bin/obj` ng bawat project ang karaniwang .NET build products. Para mailagay din sa loob ng checkout ang CLI home, NuGet cache, at temporary directories, itakda muna ang environment na nasa [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Pag-uulat ng problema sa seguridad
 

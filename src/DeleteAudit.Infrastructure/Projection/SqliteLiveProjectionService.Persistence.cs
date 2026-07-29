@@ -35,6 +35,30 @@ public sealed partial class SqliteLiveProjectionService
                     0);
             }
 
+            var sourceLedger = await ReadCompletedSourceLedgerAsync(
+                    connection,
+                    transaction,
+                    liveSessionId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (sourceLedger is null)
+            {
+                throw new ProjectionFailureException(
+                    "session_incomplete",
+                    "实时接入会话尚未完成；为避免与活动采集争用写锁，拒绝投影。",
+                    0,
+                    0);
+            }
+
+            if (!sourceLedger.IsConsistent)
+            {
+                throw new ProjectionFailureException(
+                    "source_ledger_count_mismatch",
+                    sourceLedger.DescribeMismatch(),
+                    0,
+                    0);
+            }
+
             var existing = await ReadProjectionPositionAsync(
                     connection,
                     transaction,

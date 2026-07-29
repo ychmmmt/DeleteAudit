@@ -32,6 +32,7 @@ public sealed class SqliteLiveProjectionServiceTests
             CreateRecord(sessionId, 3, SecurityXml(3), LiveEventOutcome.SecurityEvidence),
             CreateRecord(sessionId, 4, NonDeleteSecurityXml(4), LiveEventOutcome.Ignored)
         ]);
+        await CompleteSessionFixtureAsync(location, sessionId, persistedRecordCount: 4);
         using var service = new SqliteLiveProjectionService(location);
 
         var result = await service.ProjectSessionAsync(sessionId);
@@ -81,6 +82,7 @@ public sealed class SqliteLiveProjectionServiceTests
             CreateRecord(sessionId, 2, DeleteXml(2, "a.txt"), LiveEventOutcome.DeleteFact),
             CreateRecord(sessionId, 9, DeleteXml(9, "b.txt"), LiveEventOutcome.DeleteFact)
         ]);
+        await CompleteSessionFixtureAsync(location, sessionId, persistedRecordCount: 2);
         using var service = new SqliteLiveProjectionService(location);
 
         var first = await service.ProjectSessionAsync(sessionId);
@@ -112,6 +114,7 @@ public sealed class SqliteLiveProjectionServiceTests
         [
             CreateRecord(sessionId, 2, DeleteXml(2, "earlier.txt"), LiveEventOutcome.DeleteFact)
         ]);
+        await CompleteSessionFixtureAsync(location, sessionId, persistedRecordCount: 2);
         using var service = new SqliteLiveProjectionService(location);
 
         var result = await service.ProjectSessionAsync(sessionId);
@@ -141,6 +144,7 @@ public sealed class SqliteLiveProjectionServiceTests
             CreateRecord(sessionId, 1, DeleteXml(1, "one.txt"), LiveEventOutcome.DeleteFact),
             CreateRecord(sessionId, 2, DeleteXml(2, "two.txt"), LiveEventOutcome.DeleteFact)
         ]);
+        await CompleteSessionFixtureAsync(location, sessionId, persistedRecordCount: 2);
         using var service = new SqliteLiveProjectionService(location);
 
         var results = await Task.WhenAll(
@@ -169,6 +173,7 @@ public sealed class SqliteLiveProjectionServiceTests
             CreateRecord(sessionId, 3, DeleteXml(3, "beta.txt"), LiveEventOutcome.DeleteFact),
             CreateRecord(sessionId, 4, SecurityXml(4), LiveEventOutcome.SecurityEvidence)
         ]);
+        await CompleteSessionFixtureAsync(location, sessionId, persistedRecordCount: 4);
         using var service = new SqliteLiveProjectionService(location);
         _ = await service.ProjectSessionAsync(sessionId);
 
@@ -207,6 +212,7 @@ public sealed class SqliteLiveProjectionServiceTests
         [
             CreateRecord(sessionId, 1, DeleteXml(1, "source.txt"), LiveEventOutcome.DeleteFact)
         ]);
+        await CompleteSessionFixtureAsync(location, sessionId, persistedRecordCount: 1);
         using var service = new SqliteLiveProjectionService(location);
 
         var availability = await service.GetAvailabilityAsync();
@@ -320,6 +326,91 @@ public sealed class SqliteLiveProjectionServiceTests
     }
 
     [Fact]
+    public async Task UnexpectedTriggerOnProtectedLiveTableFailsClosed()
+    {
+        var location = await CreateDatabaseAsync(applyProjection: true);
+        await ExecuteAsync(
+            location,
+            """
+            CREATE TRIGGER fixture_unexpected_projection_trigger
+            AFTER INSERT ON live_projected_records
+            BEGIN
+                SELECT 1;
+            END;
+            """);
+        using var service = new SqliteLiveProjectionService(location);
+
+        var availability = await service.GetAvailabilityAsync();
+
+        Assert.Equal(LiveProjectionState.MissingSchema, availability.State);
+        Assert.Contains("unexpected trigger", availability.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task IncompleteCaptureSessionCannotBeProjected()
+    {
+        var location = await CreateDatabaseAsync(applyProjection: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var sessionId = $"active-session-{Guid.NewGuid():N}";
+        await repository.StartCaptureSessionAsync(
+            new LiveCaptureSessionStart(sessionId, StartedUtc, 2_048, "active-fixture"));
+        await repository.AppendRecordsAsync(
+        [
+            CreateRecord(sessionId, 1, DeleteXml(1, "active.txt"), LiveEventOutcome.DeleteFact)
+        ]);
+        using var service = new SqliteLiveProjectionService(location);
+
+        var result = await service.ProjectSessionAsync(sessionId);
+        var continuity = await service.VerifyContinuityAsync(sessionId);
+
+        Assert.False(result.Succeeded);
+        Assert.Equal("session_incomplete", result.FailureCode);
+        Assert.False(continuity.IsContinuous);
+        Assert.Contains("尚未完成", continuity.Detail, StringComparison.Ordinal);
+        Assert.Equal(0, await ScalarAsync(
+            location,
+            "SELECT COUNT(*) FROM live_projected_records;"));
+        Assert.Equal(0, await ScalarAsync(
+            location,
+            "SELECT COUNT(*) FROM live_projection_runs;"));
+    }
+
+    [Fact]
+    public async Task CompletedSourceLedgerCountDetectsDeletionBeforeFirstProjection()
+    {
+        var location = await CreateDatabaseAsync(applyProjection: true);
+        var repository = new SqliteLiveMonitoringRepository(location);
+        var sessionId = await StartSessionAsync(repository);
+        await repository.AppendRecordsAsync(
+        [
+            CreateRecord(sessionId, 1, DeleteXml(1, "missing-source.txt"), LiveEventOutcome.DeleteFact)
+        ]);
+        await CompleteSessionFixtureAsync(location, sessionId, persistedRecordCount: 1);
+        await ExecuteAsync(
+            location,
+            """
+            DROP TRIGGER live_capture_records_no_delete;
+            DELETE FROM live_capture_records;
+            CREATE TRIGGER live_capture_records_no_delete
+            BEFORE DELETE ON live_capture_records BEGIN
+                SELECT RAISE(ABORT, 'live_capture_records is append-only');
+            END;
+            """);
+        using var service = new SqliteLiveProjectionService(location);
+
+        var continuity = await service.VerifyContinuityAsync(sessionId);
+        var result = await service.ProjectSessionAsync(sessionId);
+
+        Assert.False(continuity.IsContinuous);
+        Assert.Contains("声明已持久化 1", continuity.Detail, StringComparison.Ordinal);
+        Assert.False(result.Succeeded);
+        Assert.Equal("source_ledger_count_mismatch", result.FailureCode);
+        Assert.Equal(0, await ScalarAsync(
+            location,
+            "SELECT COUNT(*) FROM live_projection_runs;"));
+    }
+
+    [Fact]
     public async Task Applying0005DoesNotAlterOfflineTableDefinitions()
     {
         var beforeLocation = await CreateDatabaseAsync(applyProjection: false);
@@ -384,6 +475,7 @@ public sealed class SqliteLiveProjectionServiceTests
         [
             CreateRecord(sessionId, 1, DeleteXml(1, "cancelled.txt"), LiveEventOutcome.DeleteFact)
         ]);
+        await CompleteSessionFixtureAsync(location, sessionId, persistedRecordCount: 1);
         using var service = new SqliteLiveProjectionService(location);
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
@@ -426,6 +518,7 @@ public sealed class SqliteLiveProjectionServiceTests
                 null,
                 null)
         ]);
+        await CompleteSessionFixtureAsync(location, sessionId, persistedRecordCount: 1);
         using var service = new SqliteLiveProjectionService(location);
 
         var result = await service.ProjectSessionAsync(sessionId);
@@ -495,6 +588,31 @@ public sealed class SqliteLiveProjectionServiceTests
     }
 
     [Fact]
+    public async Task ContinuityVerificationDetectsTailTruncation()
+    {
+        var location = await ProjectThreeDeletesAsync();
+        await ExecuteAsync(
+            location,
+            """
+            DROP TRIGGER live_projected_records_no_delete;
+            DELETE FROM live_projected_records
+            WHERE live_ingest_sequence = 3;
+            CREATE TRIGGER live_projected_records_no_delete
+            BEFORE DELETE ON live_projected_records BEGIN
+                SELECT RAISE(ABORT, 'live_projected_records is append-only');
+            END;
+            """);
+        var sessionId = await ReadSessionIdAsync(location);
+        using var service = new SqliteLiveProjectionService(location);
+
+        var continuity = await service.VerifyContinuityAsync(sessionId);
+
+        Assert.False(continuity.IsContinuous);
+        Assert.Equal(3, continuity.FirstBrokenSequence);
+        Assert.Contains("尾部截断", continuity.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task AvailabilityAndQueriesDoNotModifyDatabase()
     {
         var location = await ProjectThreeDeletesAsync();
@@ -522,6 +640,7 @@ public sealed class SqliteLiveProjectionServiceTests
             CreateRecord(sessionId, 2, DeleteXml(2, "two.txt"), LiveEventOutcome.DeleteFact),
             CreateRecord(sessionId, 3, DeleteXml(3, "three.txt"), LiveEventOutcome.DeleteFact)
         ]);
+        await CompleteSessionFixtureAsync(location, sessionId, persistedRecordCount: 3);
         using var service = new SqliteLiveProjectionService(location);
         var result = await service.ProjectSessionAsync(sessionId);
         Assert.True(result.Succeeded, result.FailureDetail);
@@ -588,6 +707,33 @@ public sealed class SqliteLiveProjectionServiceTests
                 2_048,
                 "phase-2b4-tests"));
         return sessionId;
+    }
+
+    private static async Task CompleteSessionFixtureAsync(
+        ViewerDataLocation location,
+        string sessionId,
+        long persistedRecordCount)
+    {
+        await using var connection = WritableConnection(location);
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO live_capture_completions (
+                live_session_id, stopped_utc, final_state, received_count,
+                delete_fact_count, process_context_count, security_evidence_count,
+                ignored_count, error_count, dropped_count, late_discarded_count,
+                suppressed_diagnostic_count, persisted_record_count)
+            VALUES (
+                $session, $stopped, 'stopped', $received,
+                0, 0, 0, $received, 0, 0, 0, 0, $persisted);
+            """;
+        command.Parameters.AddWithValue("$session", sessionId);
+        command.Parameters.AddWithValue(
+            "$stopped",
+            StartedUtc.AddMinutes(1).ToString("O", CultureInfo.InvariantCulture));
+        command.Parameters.AddWithValue("$received", persistedRecordCount);
+        command.Parameters.AddWithValue("$persisted", persistedRecordCount);
+        await command.ExecuteNonQueryAsync();
     }
 
     private static LiveCaptureRecord CreateRecord(

@@ -378,7 +378,9 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             }
 
             SetState(LiveMonitoringState.Stopping);
-            await CompleteSessionAsync(cancellationToken).ConfigureAwait(false);
+            // Cancellation only governs admission to shutdown. Once shutdown starts it
+            // is irreversible and must persist exactly one completion.
+            await CompleteSessionAsync(CancellationToken.None).ConfigureAwait(false);
         }
         finally
         {
@@ -413,6 +415,10 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
             _transitionGate.Release();
         }
 
+        // A persistence fault can be discovered by the draining consumer while Dispose
+        // owns the transition gate. Observe that newly-created teardown task after
+        // releasing the gate and before disposing the gate it must acquire/release.
+        await ObserveFaultShutdownAsync().ConfigureAwait(false);
         await _source.DisposeAsync().ConfigureAwait(false);
         _transitionGate.Dispose();
     }
@@ -1174,9 +1180,10 @@ public sealed class LiveMonitoringService : ILiveMonitoringService
     {
         lock (_sessionLock)
         {
-            if (generation != _generation)
+            if (generation != _generation || !_acceptingEvents || _completionStarted)
             {
-                // A stale watcher: it cannot mark a newer session as faulted.
+                // A stale watcher, or a callback arriving after clean shutdown began,
+                // cannot revise the already-linearized session outcome.
                 return;
             }
 

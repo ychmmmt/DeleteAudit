@@ -207,6 +207,12 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
             await ValidateTriggerAsync(connection, trigger, cancellationToken)
                 .ConfigureAwait(false);
         }
+
+        await ValidateExactTriggerSetAsync(
+                connection,
+                EvidenceTriggers,
+                cancellationToken)
+            .ConfigureAwait(false);
     }
 
     internal static async Task ValidateTableAsync(
@@ -652,6 +658,55 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
         if (!TryMatchCanonicalTrigger(tokens, requirement, out var mismatch))
         {
             throw TriggerNotReady(requirement, mismatch);
+        }
+    }
+
+    internal static async Task ValidateExactTriggerSetAsync(
+        SqliteConnection connection,
+        IReadOnlyList<TriggerRequirement> requirements,
+        CancellationToken cancellationToken)
+    {
+        foreach (var group in requirements.GroupBy(
+                     requirement => requirement.TableName,
+                     StringComparer.OrdinalIgnoreCase))
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT name
+                FROM main.sqlite_master
+                WHERE type = 'trigger'
+                  AND tbl_name = $table COLLATE NOCASE;
+                """;
+            command.Parameters.Add("$table", SqliteType.Text).Value = group.Key;
+            var actual = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            await using var reader = await command
+                .ExecuteReaderAsync(cancellationToken)
+                .ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                actual.Add(reader.GetString(0));
+            }
+
+            var expected = group
+                .Select(requirement => requirement.Name)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (!actual.SetEquals(expected))
+            {
+                var unexpected = actual.Except(expected, StringComparer.OrdinalIgnoreCase);
+                var missing = expected.Except(actual, StringComparer.OrdinalIgnoreCase);
+                var detail = string.Join(
+                    "; ",
+                    new[]
+                    {
+                        unexpected.Any()
+                            ? $"unexpected trigger(s): {string.Join(", ", unexpected)}"
+                            : null,
+                        missing.Any()
+                            ? $"missing trigger(s): {string.Join(", ", missing)}"
+                            : null
+                    }.Where(value => value is not null));
+                throw TriggerNotReady(group.First(), detail);
+            }
         }
     }
 
@@ -1230,6 +1285,13 @@ public sealed class SqliteLiveMonitoringRepository : ILiveMonitoringRepository
             {
                 throw new ArgumentException(
                     "A batch may not span more than one live session.",
+                    nameof(records));
+            }
+
+            if (string.IsNullOrWhiteSpace(record.ChannelName))
+            {
+                throw new ArgumentException(
+                    "Every record must carry a non-blank channel name.",
                     nameof(records));
             }
 

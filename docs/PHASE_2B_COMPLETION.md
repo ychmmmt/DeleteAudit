@@ -39,16 +39,26 @@
 
 | 15 | 本轮自查 | Live History 的「新查询取消旧查询」并未真正实现：`ViewModelBase.RunSafelyAsync` 的 `IsBusy` 门会**静默丢弃**第二个并发请求 | 代码缺陷 | **已关闭** | `LiveHistoryViewModel` 改为专用的 latest-request-wins 路径（`RequestSlot` + `RequestTicket`），不再复用 `RunSafelyAsync`；新请求取消旧请求，唯一提交点前检查 generation，陈旧请求的异常与取消都不得覆盖较新请求的结果，Dispose 后一律不提交。命令不再因加载中而禁用。5 个确定性用例覆盖「A 阻塞→B 完成并显示→A 最后完成/抛错→UI 仍为 B」「陈旧失败不覆盖较新成功」「Dispose 后完成不更新 UI」「陈旧 raw XML 预览不覆盖新选择」。全部在旧实现下失败 |
 | 16 | Phase 2B.4 自查 | readiness 只验证必需 UNIQUE，可能接受额外/partial/表达式 UNIQUE | 代码缺陷 | **已关闭** | 共享 structural validator 现在读取全部非-PK unique index，要求 origin=`u`、非 partial、无表达式并与声明列表精确相等；0005 requirement 覆盖 `live_evidence_id`、两组 session sequence 与 `entry_hash`，并有额外 UNIQUE 变异测试 |
+| 17 | 最终隔离审计 | Stop 进入不可逆关闭后仍受调用方 cancellation 影响；clean Stop 后晚到 fault 可改写 UI 状态 | 代码缺陷 | **已关闭** | cancellation 只控制取得 transition gate，completion 使用 `None`；停止接收后 fault callback 不再修改最终状态；新增确定性取消与 late-fault 测试 |
+| 18 | 最终隔离审计 | Live History 切换会话时在途分析、记录和 Raw XML 可落到新会话 | 代码缺陷 | **已关闭** | 会话切换同步 invalidate 三类 request slot 并清空旧状态；commit 同时核对 generation 与 session/evidence identity；新增分析、记录/XML、Dispose 后零通知测试 |
+| 19 | 最终隔离审计 | projection 与 refresh 共用取消槽；活动会话可触发写锁竞争 | 代码缺陷 | **已关闭** | mutation/query 使用独立 request slot；durable run 先发布，再通过 query slot 刷新；UI 与 service 都拒绝 incomplete session，service 在任何写连接前只读 preflight，拒绝时不写 failure run |
+| 20 | 最终隔离审计 | continuity 无法识别尾部截断或首次投影前 source ledger 删除 | 代码缺陷 | **已关闭** | 成功 run high-water 检测投影尾删；completion `persisted_record_count` 与当前全部 source rows 双向核对；preflight、事务内 TOCTOU 检查与 public verifier 均 fail closed |
+| 21 | 最终隔离审计 | readiness 接受受保护 live 表上的额外 trigger | 代码缺陷 | **已关闭** | validator 对每个受保护表枚举并精确比较完整 trigger allowlist；额外 INSERT/UPDATE/DELETE trigger 均令 projection/source readiness unavailable |
+| 22 | 最终隔离审计 | readiness 尚未逐项证明 CHECK、DEFAULT、collation 与普通索引语义 | 代码缺陷（防御纵深） | **保留** | 当前已精确验证对象、列/hidden、PK/FK/UNIQUE 与 trigger；补齐 DDL 语义需要单独设计 canonical DDL/index requirement，不在本轮临时扩大 parser |
+| 23 | 最终隔离审计 | Live History 的部分服务筛选尚无 WPF 控件 | UI 债 | **保留** | 服务端参数化白名单与分页边界已实现；当前 WPF 暴露 UTC、错误与顺序筛选，provider/channel/outcome 等高级筛选留待后续显式 UI 设计 |
+| 24 | 最终隔离审计 | timer/queue 尚缺 System TimeProvider smoke、永不完成 append 与多 producer 压测 | 测试债 | **保留** | deterministic 可注入时钟、deadline/fault/Dispose 竞态已覆盖；真实调度与极端 liveness/压力测试需隔离的长期运行测试环境 |
+| 25 | 最终隔离审计 | Dispose 排空期间新建 fault-shutdown task 可与 transition gate disposal 竞态 | 代码缺陷 | **已关闭** | Dispose 释放 gate 后再次观察 drain 期间创建的 fault-shutdown task，再 dispose source/gate |
+| 26 | 最终隔离审计 | 文档把 feature candidate 称为 current release，并夸大测试/构建输出位置 | 文档缺陷 | **已关闭** | SECURITY 改为 source candidate；Acceptance 明确本地 commit 不是 release/default-branch；PROJECT_PLAN 与三语 README 分别准确描述 artifacts、文件 SQLite 与 bin/obj/CLI 隔离 |
 
 ## 3. 当前真实计数
 
 ```text
-已关闭：2, 4, 5, 7, 8, 9, 10, 11, 12, 13, 15, 16，以及 14 的应用侧
-仍然保留：1, 3, 6, 9b, 14（外部写入者）
+已关闭：2, 4, 5, 7, 8, 9, 10, 11, 12, 13, 15–21, 25, 26，以及 14 的应用侧
+仍然保留：1, 3, 6, 9b, 14（外部写入者）, 22, 23, 24
 ```
 
-**项目当前 P2 总数 = 5。** 注意这与早期审计报告的 `P2 = 8` 构成完全不同：早期审计项中已有
-6 项关闭、1 项部分关闭，剩余名额由此前一直存在的产品级债务占据。
+**项目当前 P2 总数 = 8。** 其中 5 项是此前已披露的产品/外部边界，3 项是本轮独立审计保留的
+防御纵深、UI 与长期测试债；本轮发现的全部 P0/P1 均已关闭并经独立 re-review。
 
 ## 3b. Phase 2B 已实现范围
 
@@ -70,7 +80,11 @@ Phase 2B.1–2B.4 均已实现：
 - **#9b**：失败方向为 fail closed，且官方 migration 不受影响。
 - **#14 外部写入者**：任何能写数据库文件的进程都可以自选连接设置。这与 SECURITY.md 已声明的
   "SQLite 不是防篡改介质" 是同一条边界，**不能**通过应用层设置关闭，也不得声称已关闭。
+- **#22**：当前 validator 已 fail closed 覆盖会导致直接边界绕过的对象/trigger/identity 结构；
+  更完整的 CHECK/default/collation/index 证明是防御纵深，需独立 parser/requirement 设计。
+- **#23**：缺少的是高级筛选控件，不是未参数化查询；已有页面仍可分页、按 UTC/错误/顺序筛选。
+- **#24**：确定性功能测试已覆盖本轮状态机，保留项是长期调度、永不返回依赖和压力环境。
 
 ## 5. 本文件未覆盖
 
-Phase 2C、Windows Service、USN、ProgramData、签名/外部锚点、安装包和生产部署不在本文件范围内。`v0.1.0-alpha` 仍是冻结的 source-only 快照，未被本分支移动或修改。
+Phase 2C、Windows Service、USN、ProgramData、签名/外部锚点、安装包和生产部署不在本文件范围内。`v0.1.0-alpha` 仍是冻结的 source-only 快照，未被本分支移动或修改。该本地 feature branch 无 upstream，未进入 default branch，因此 **Phase 2B 源码候选可签字，但发布仍为 NO-GO**；本轮不 push、不建 PR、不 merge、不 tag。

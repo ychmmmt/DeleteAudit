@@ -87,6 +87,13 @@ public sealed partial class SqliteLiveProjectionService
                     .ConfigureAwait(false);
             }
 
+            await SqliteLiveMonitoringRepository
+                .ValidateExactTriggerSetAsync(
+                    connection,
+                    LiveProjectionSchema.Triggers,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
             return new LiveProjectionAvailability(
                 LiveProjectionState.Ready,
                 "实时规范投影已就绪；该能力独立于离线导入链。",
@@ -137,6 +144,51 @@ public sealed partial class SqliteLiveProjectionService
                     availability.Message);
             }
 
+            await using (var preflight = _location.CreateReadOnlyConnection())
+            {
+                await preflight.OpenAsync(cancellationToken).ConfigureAwait(false);
+                if (!await SessionExistsAsync(
+                        preflight,
+                        transaction: null,
+                        liveSessionId,
+                        cancellationToken)
+                    .ConfigureAwait(false))
+                {
+                    return Failed(
+                        liveSessionId,
+                        0,
+                        0,
+                        "session_not_found",
+                        "找不到指定的实时接入会话。");
+                }
+
+                var ledger = await ReadCompletedSourceLedgerAsync(
+                        preflight,
+                        transaction: null,
+                        liveSessionId,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (ledger is null)
+                {
+                    return Failed(
+                        liveSessionId,
+                        0,
+                        0,
+                        "session_incomplete",
+                        "实时接入会话尚未完成；拒绝取得写锁或写入失败运行。");
+                }
+
+                if (!ledger.IsConsistent)
+                {
+                    return Failed(
+                        liveSessionId,
+                        0,
+                        0,
+                        "source_ledger_count_mismatch",
+                        ledger.DescribeMismatch());
+                }
+            }
+
             var startedUtc = _timeProvider.GetUtcNow();
             try
             {
@@ -174,6 +226,7 @@ public sealed partial class SqliteLiveProjectionService
                     or UnauthorizedAccessException
                     or CryptographicException
                     or FormatException
+                    or ArgumentException
                     or InvalidOperationException)
             {
                 const string code = "projection_failed";
@@ -235,12 +288,59 @@ public sealed partial class SqliteLiveProjectionService
                     "找不到指定的实时接入会话。");
             }
 
+            var sourceLedger = await ReadCompletedSourceLedgerAsync(
+                    connection,
+                    transaction,
+                    liveSessionId,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (sourceLedger is null)
+            {
+                return Broken(
+                    liveSessionId,
+                    0,
+                    null,
+                    null,
+                    "实时接入会话尚未完成，无法给出完整连续性结论。");
+            }
+
+            if (!sourceLedger.IsConsistent)
+            {
+                return Broken(
+                    liveSessionId,
+                    0,
+                    null,
+                    null,
+                    sourceLedger.DescribeMismatch());
+            }
+
             var status = await VerifyContinuityCoreAsync(
                     connection,
                     transaction,
                     liveSessionId,
                     cancellationToken)
                 .ConfigureAwait(false);
+            if (status.IsContinuous)
+            {
+                var projectableSourceCount = await CountProjectableSourceAsync(
+                        connection,
+                        transaction,
+                        liveSessionId,
+                        maximumReceivedSequence: null,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (projectableSourceCount != status.ProjectedCount)
+                {
+                    status = Broken(
+                        liveSessionId,
+                        status.ProjectedCount,
+                        status.ProjectedCount + 1,
+                        null,
+                        $"投影记录数 {status.ProjectedCount} 与已完成会话的可投影源证据数 "
+                        + $"{projectableSourceCount} 不一致。");
+                }
+            }
+
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return status;
         }
