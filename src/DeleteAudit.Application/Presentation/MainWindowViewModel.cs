@@ -26,6 +26,7 @@ public sealed class MainWindowViewModel : ViewModelBase
         IOfflineFilePicker filePicker,
         IRawXmlPreviewClipboard rawXmlPreviewClipboard,
         ILiveMonitoringService liveMonitoringService,
+        ILiveHistoryQueryService liveHistoryQueryService,
         IUiDispatcher uiDispatcher,
         INetworkPathImportConfirmation? networkPathConfirmation = null)
     {
@@ -35,10 +36,12 @@ public sealed class MainWindowViewModel : ViewModelBase
         ArgumentNullException.ThrowIfNull(filePicker);
         ArgumentNullException.ThrowIfNull(rawXmlPreviewClipboard);
         ArgumentNullException.ThrowIfNull(liveMonitoringService);
+        ArgumentNullException.ThrowIfNull(liveHistoryQueryService);
         ArgumentNullException.ThrowIfNull(uiDispatcher);
 
         RawXml = new RawXmlViewModel(queryService, rawXmlPreviewClipboard);
         LiveMonitoring = new LiveMonitoringViewModel(liveMonitoringService, uiDispatcher);
+        LiveHistory = new LiveHistoryViewModel(liveHistoryQueryService);
         ImportHistory = new ImportHistoryViewModel(queryService);
         DeleteSessions = new DeleteSessionsViewModel(queryService);
         DeleteEvents = new DeleteEventsViewModel(queryService, OpenRawXmlAsync);
@@ -84,6 +87,13 @@ public sealed class MainWindowViewModel : ViewModelBase
     public RawXmlViewModel RawXml { get; }
 
     public LiveMonitoringViewModel LiveMonitoring { get; }
+
+    /// <summary>
+    /// Read-only history of past live captures. It is not loaded by
+    /// <see cref="InitializeAsync"/>: reading it is an explicit user action, and the live
+    /// evidence tables may legitimately be absent on an older database.
+    /// </summary>
+    public LiveHistoryViewModel LiveHistory { get; }
 
     public Task InitializeAsync() =>
         RunSafelyAsync(async () =>

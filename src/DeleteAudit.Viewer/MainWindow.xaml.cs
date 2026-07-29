@@ -26,17 +26,21 @@ public partial class MainWindow : Window
             new OpenFileDialogOfflineFilePicker(),
             new WpfRawXmlPreviewClipboard(),
             liveMonitoring,
+            new SqliteLiveHistoryQueryService(location),
             new WpfUiDispatcher(),
             new WpfNetworkPathImportConfirmation(this));
         DataContext = _viewModel;
         Loaded += OnLoaded;
 
-        // Closing the window releases every live watcher and unsubscribes the page.
-        // Monitoring never outlives the window and never continues in the background.
+        // Closing the window releases every live watcher and unsubscribes the page, and
+        // cancels any history query still in flight. Neither monitoring nor a query
+        // outlives the window, and nothing continues in the background.
         var liveMonitoringPage = _viewModel.LiveMonitoring;
+        var liveHistoryPage = _viewModel.LiveHistory;
         Closed += async (_, _) =>
         {
             liveMonitoringPage.Dispose();
+            liveHistoryPage.Dispose();
             await liveMonitoring.DisposeAsync().ConfigureAwait(true);
         };
     }

@@ -612,6 +612,205 @@
                 </ScrollViewer>
                 </Grid>
             </TabItem>
+
+            <TabItem Header="实时接入历史">
+                <Grid Margin="10">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <!-- Row 0 stays outside the working area: what this page is, and what
+                         it deliberately does not do, must remain visible at all times. -->
+                    <Border Grid.Row="0"
+                            Background="#EEF4FF"
+                            BorderBrush="#2F5BB7"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="10,8">
+                        <TextBlock Text="{Binding LiveHistory.Disclosure}"
+                                   TextWrapping="Wrap" />
+                    </Border>
+
+                    <WrapPanel Grid.Row="1" Margin="0,8,0,0">
+                        <TextBlock Style="{StaticResource FilterLabel}" Text="开始时间 (UTC)" />
+                        <TextBox Width="165"
+                                 AutomationProperties.Name="按开始时间筛选，UTC"
+                                 Text="{Binding LiveHistory.FromUtcText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        <TextBlock Margin="12,0,6,0"
+                                   Style="{StaticResource FilterLabel}"
+                                   Text="结束时间 (UTC)" />
+                        <TextBox Width="165"
+                                 AutomationProperties.Name="按结束时间筛选，UTC"
+                                 Text="{Binding LiveHistory.ToUtcText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        <CheckBox Margin="12,0,0,0"
+                                  VerticalAlignment="Center"
+                                  Content="只看有错误的记录"
+                                  IsChecked="{Binding LiveHistory.ErrorsOnly, Mode=TwoWay}" />
+                        <CheckBox Margin="12,0,0,0"
+                                  VerticalAlignment="Center"
+                                  Content="接收序号倒序"
+                                  IsChecked="{Binding LiveHistory.NewestFirst, Mode=TwoWay}" />
+                        <Button Command="{Binding LiveHistory.ApplyFiltersCommand}"
+                                Content="筛选会话"
+                                Margin="12,0,0,0"
+                                Padding="10,4" />
+                        <Button Command="{Binding LiveHistory.ApplyRecordFiltersCommand}"
+                                Content="筛选记录"
+                                Margin="8,0,0,0"
+                                Padding="10,4" />
+                        <Button Command="{Binding LiveHistory.RefreshCommand}"
+                                Content="刷新"
+                                Margin="8,0,0,0"
+                                Padding="10,4" />
+                    </WrapPanel>
+
+                    <StackPanel Grid.Row="2">
+                        <TextBlock Style="{StaticResource ErrorText}"
+                                   Text="{Binding LiveHistory.UnavailableMessage}"
+                                   Visibility="{Binding LiveHistory.IsUnavailable, Converter={StaticResource BoolToVisibility}}" />
+                        <TextBlock Style="{StaticResource ErrorText}"
+                                   Text="{Binding LiveHistory.ErrorMessage}" />
+                        <TextBlock Margin="0,4,0,0"
+                                   Text="没有符合条件的实时接入会话。"
+                                   Visibility="{Binding LiveHistory.IsSessionListEmpty, Converter={StaticResource BoolToVisibility}}" />
+                    </StackPanel>
+
+                    <Grid Grid.Row="3" Margin="0,8,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="2*" />
+                            <ColumnDefinition Width="3*" />
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Sessions -->
+                        <Grid Grid.Column="0" Margin="0,0,6,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <DataGrid Grid.Row="0"
+                                      AutomationProperties.Name="实时接入会话列表"
+                                      ItemsSource="{Binding LiveHistory.Sessions}"
+                                      SelectedItem="{Binding LiveHistory.SelectedSession, Mode=TwoWay}"
+                                      Style="{StaticResource VirtualizedDataGrid}">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Binding="{Binding StartedUtc}" Header="开始 (UTC)" />
+                                    <DataGridTextColumn Binding="{Binding FinalState, Converter={StaticResource UnknownValue}}" Header="结束状态" />
+                                    <DataGridTextColumn Binding="{Binding ReceivedCount}" Header="接收" />
+                                    <DataGridTextColumn Binding="{Binding DeleteFactCount}" Header="删除事实" />
+                                    <DataGridTextColumn Binding="{Binding StoredRecordCount}" Header="已保存" />
+                                    <DataGridTextColumn Binding="{Binding LiveSessionId}" Header="会话 ID" Width="*" />
+                                </DataGrid.Columns>
+                            </DataGrid>
+                            <DockPanel Grid.Row="1" Margin="0,6,0,0">
+                                <TextBlock VerticalAlignment="Center"
+                                           Text="{Binding LiveHistory.SessionPageStatus}" />
+                                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                    <Button Command="{Binding LiveHistory.PreviousSessionPageCommand}"
+                                            Content="上一页"
+                                            Padding="10,4" />
+                                    <Button Command="{Binding LiveHistory.NextSessionPageCommand}"
+                                            Content="下一页"
+                                            Margin="8,0,0,0"
+                                            Padding="10,4" />
+                                </StackPanel>
+                            </DockPanel>
+                        </Grid>
+
+                        <!-- Records, diagnostics and the selected record's raw XML -->
+                        <Grid Grid.Column="1" Margin="6,0,0,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <StackPanel Grid.Row="0">
+                                <TextBlock Text="{Binding LiveHistory.SelectedSessionSummary}"
+                                           TextWrapping="Wrap" />
+                                <Border Background="#FFF4E5"
+                                        BorderBrush="#B54708"
+                                        BorderThickness="1"
+                                        CornerRadius="4"
+                                        Margin="0,6,0,0"
+                                        Padding="10,8"
+                                        Visibility="{Binding LiveHistory.SelectedSessionIsIncomplete, Converter={StaticResource BoolToVisibility}}">
+                                    <TextBlock Foreground="#B54708"
+                                               Text="该会话没有完成记录，本次接入可能异常中断；上面的计数不完整。"
+                                               TextWrapping="Wrap" />
+                                </Border>
+                                <TextBlock Margin="0,4,0,0"
+                                           Text="该会话没有已保存的记录。"
+                                           Visibility="{Binding LiveHistory.IsRecordListEmpty, Converter={StaticResource BoolToVisibility}}" />
+                            </StackPanel>
+
+                            <DataGrid Grid.Row="1"
+                                      Margin="0,6,0,0"
+                                      AutomationProperties.Name="实时接入记录列表"
+                                      ItemsSource="{Binding LiveHistory.Records}"
+                                      SelectedItem="{Binding LiveHistory.SelectedRecord, Mode=TwoWay}"
+                                      Style="{StaticResource VirtualizedDataGrid}">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Binding="{Binding ReceivedSequence}" Header="序号" />
+                                    <DataGridTextColumn Binding="{Binding Outcome}" Header="分类" />
+                                    <DataGridTextColumn Binding="{Binding ObservedUtc}" Header="接收时间 (UTC)" />
+                                    <DataGridTextColumn Binding="{Binding ProviderName, Converter={StaticResource UnknownValue}}" Header="Provider" />
+                                    <DataGridTextColumn Binding="{Binding ChannelName}" Header="通道" />
+                                    <DataGridTextColumn Binding="{Binding ParsedEventId, Converter={StaticResource UnknownValue}}" Header="Event ID" />
+                                    <DataGridTextColumn Binding="{Binding EventRecordId, Converter={StaticResource UnknownValue}}" Header="Record ID" />
+                                    <DataGridTextColumn Binding="{Binding ErrorCode, Converter={StaticResource UnknownValue}}" Header="错误码" Width="*" />
+                                </DataGrid.Columns>
+                            </DataGrid>
+
+                            <DockPanel Grid.Row="2" Margin="0,6,0,0">
+                                <TextBlock VerticalAlignment="Center"
+                                           Text="{Binding LiveHistory.RecordPageStatus}" />
+                                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                                    <Button Command="{Binding LiveHistory.PreviousRecordPageCommand}"
+                                            Content="上一页"
+                                            Padding="10,4" />
+                                    <Button Command="{Binding LiveHistory.NextRecordPageCommand}"
+                                            Content="下一页"
+                                            Margin="8,0,0,0"
+                                            Padding="10,4" />
+                                </StackPanel>
+                            </DockPanel>
+
+                            <StackPanel Grid.Row="3" Margin="0,8,0,0">
+                                <TextBlock Text="{Binding LiveHistory.SelectedRecordSummary}"
+                                           TextWrapping="Wrap" />
+                                <TextBlock Margin="0,4,0,0"
+                                           Text="{Binding LiveHistory.RawXmlLengthSummary}" />
+                                <Border Background="#FFF4E5"
+                                        BorderBrush="#B54708"
+                                        BorderThickness="1"
+                                        CornerRadius="4"
+                                        Margin="0,6,0,0"
+                                        Padding="10,8"
+                                        Visibility="{Binding LiveHistory.RawXmlIsTruncated, Converter={StaticResource BoolToVisibility}}">
+                                    <TextBlock Foreground="#B54708"
+                                               Text="{Binding LiveHistory.RawXmlTruncationNotice}"
+                                               TextWrapping="Wrap" />
+                                </Border>
+                            </StackPanel>
+
+                            <TextBox Grid.Row="4"
+                                     Margin="0,6,0,0"
+                                     AutomationProperties.Name="所选记录的只读原始 XML 预览"
+                                     FontFamily="Consolas"
+                                     HorizontalScrollBarVisibility="Auto"
+                                     IsReadOnly="True"
+                                     Text="{Binding LiveHistory.RawXmlPreview, Mode=OneWay}"
+                                     TextWrapping="NoWrap"
+                                     VerticalScrollBarVisibility="Auto" />
+                        </Grid>
+                    </Grid>
+                </Grid>
+            </TabItem>
         </TabControl>
     </Grid>
 </Window>
