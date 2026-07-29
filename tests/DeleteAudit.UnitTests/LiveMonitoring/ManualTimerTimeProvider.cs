@@ -15,6 +15,13 @@ internal sealed class ManualTimerTimeProvider : TimeProvider
     private bool _dispatchScheduled;
     private int _createdTimerCount;
 
+    /// <summary>
+    /// Failures raised by callbacks of the advancement currently being drained. The
+    /// marker enqueued behind those callbacks consumes and clears this, so a failure is
+    /// reported to exactly the <see cref="AdvanceAsync"/> that caused it.
+    /// </summary>
+    private List<Exception>? _pendingFailures;
+
     internal Action? BeforeTimerCallback { get; set; }
 
     internal Action? BeforeTimerDisposeWait { get; set; }
@@ -99,8 +106,9 @@ internal sealed class ManualTimerTimeProvider : TimeProvider
                 _callbacks.Enqueue(() => timer.InvokeIfCurrent(generation));
             }
 
-            // The marker is behind every callback caused by this advancement.
-            _callbacks.Enqueue(() => completed.TrySetResult());
+            // The marker is behind every callback caused by this advancement, so it
+            // observes exactly their failures.
+            _callbacks.Enqueue(() => CompleteAdvance(completed));
             if (!_dispatchScheduled)
             {
                 _dispatchScheduled = true;
@@ -136,23 +144,89 @@ internal sealed class ManualTimerTimeProvider : TimeProvider
         }
     }
 
+    /// <summary>
+    /// Reports one advancement. A callback that threw is surfaced through the advancement
+    /// it belonged to — never as an unhandled thread-pool exception — and the failure
+    /// state is cleared so the next advancement starts clean. When several callbacks of
+    /// one advancement fail, all of them are reported together.
+    /// </summary>
+    private void CompleteAdvance(TaskCompletionSource completed)
+    {
+        List<Exception>? failures;
+        lock (_sync)
+        {
+            failures = _pendingFailures;
+            _pendingFailures = null;
+        }
+
+        if (failures is null || failures.Count == 0)
+        {
+            completed.TrySetResult();
+            return;
+        }
+
+        completed.TrySetException(
+            failures.Count == 1 ? failures[0] : new AggregateException(failures));
+    }
+
+    /// <summary>
+    /// Runs queued work items in order. Every remaining due callback of an advancement
+    /// still runs after one of them fails; the failures travel to that advancement's
+    /// marker. Nothing thrown here escapes onto the thread pool, and the dispatcher flag
+    /// is always released, so a later <see cref="AdvanceAsync"/> can never be stranded.
+    /// </summary>
     private void DrainCallbacks()
     {
-        while (true)
+        var handOff = false;
+        try
         {
-            Action callback;
-            lock (_sync)
+            while (true)
             {
-                if (_callbacks.Count == 0)
+                Action callback;
+                lock (_sync)
                 {
-                    _dispatchScheduled = false;
-                    return;
+                    if (_callbacks.Count == 0)
+                    {
+                        _dispatchScheduled = false;
+                        return;
+                    }
+
+                    callback = _callbacks.Dequeue();
                 }
 
-                callback = _callbacks.Dequeue();
+                try
+                {
+                    callback();
+                }
+                catch (Exception exception)
+                {
+                    lock (_sync)
+                    {
+                        (_pendingFailures ??= []).Add(exception);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            // Defence in depth: nothing above is expected to unwind, but the flag must
+            // never latch on. Anything still queued is handed to a fresh drain.
+            lock (_sync)
+            {
+                if (_dispatchScheduled)
+                {
+                    handOff = _callbacks.Count > 0;
+                    _dispatchScheduled = handOff;
+                }
             }
 
-            callback();
+            if (handOff)
+            {
+                _ = ThreadPool.UnsafeQueueUserWorkItem(
+                    static provider => provider.DrainCallbacks(),
+                    this,
+                    preferLocal: false);
+            }
         }
     }
 

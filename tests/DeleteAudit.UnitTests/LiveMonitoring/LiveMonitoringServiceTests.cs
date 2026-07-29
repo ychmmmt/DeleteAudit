@@ -188,6 +188,180 @@ public sealed class LiveMonitoringServiceTests
         Assert.Equal(1, callbackCount);
     }
 
+    // ---------- manual clock failure handling ----------
+
+    [Fact]
+    public async Task ThrowingTimerCallbackFaultsItsOwnAdvance()
+    {
+        var time = CaptureTime();
+        var failure = new InvalidOperationException("fixture callback failure");
+        using var timer = time.CreateTimer(
+            _ => throw failure,
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var advancing = time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => advancing.WaitAsync(Patience));
+
+        // Faulted, not hung, and carrying the original failure.
+        Assert.Same(failure, thrown);
+        Assert.True(advancing.IsFaulted);
+    }
+
+    [Fact]
+    public async Task ThrowingBeforeTimerCallbackHookIsObservable()
+    {
+        var time = CaptureTime();
+        var failure = new InvalidOperationException("fixture hook failure");
+        time.BeforeTimerCallback = () => throw failure;
+        var fired = 0;
+        using var timer = time.CreateTimer(
+            _ => Interlocked.Increment(ref fired),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience));
+
+        Assert.Same(failure, thrown);
+        // The hook threw before the callback body, so the timer never ran.
+        Assert.Equal(0, fired);
+    }
+
+    [Fact]
+    public async Task DispatcherRecoversAndLaterAdvancesAreUnaffected()
+    {
+        var time = CaptureTime();
+        using (var failing = time.CreateTimer(
+            _ => throw new InvalidOperationException("fixture callback failure"),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan))
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience));
+        }
+
+        // An advance with nothing due must still complete, proving the dispatcher was
+        // released rather than latched on by the earlier failure.
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience);
+
+        var fired = 0;
+        using var healthy = time.CreateTimer(
+            _ => Interlocked.Increment(ref fired),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        // A brand new timer still fires, and its advance does not inherit the old failure.
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience);
+
+        Assert.Equal(1, fired);
+        Assert.Equal(0, time.ActiveTimerCount);
+    }
+
+    [Fact]
+    public async Task EveryDueCallbackRunsAndAllFailuresReachTheSameAdvance()
+    {
+        var time = CaptureTime();
+        var firstFailure = new InvalidOperationException("fixture failure one");
+        var secondFailure = new InvalidOperationException("fixture failure two");
+        var survivorRan = 0;
+        using var failingFirst = time.CreateTimer(
+            _ => throw firstFailure,
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+        using var survivor = time.CreateTimer(
+            _ => Interlocked.Increment(ref survivorRan),
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+        using var failingLast = time.CreateTimer(
+            _ => throw secondFailure,
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var thrown = await Assert.ThrowsAsync<AggregateException>(
+            () => time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience));
+
+        // One failure never cancels the rest of the advancement.
+        Assert.Equal(1, survivorRan);
+        Assert.Equal([firstFailure, secondFailure], thrown.InnerExceptions);
+    }
+
+    [Fact]
+    public async Task QueuedAdvancesStillCompleteAfterAnEarlierCallbackFails()
+    {
+        var time = CaptureTime();
+        var reachedCallback = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim(false);
+        using var failing = time.CreateTimer(
+            _ =>
+            {
+                reachedCallback.TrySetResult();
+                release.Wait(Patience);
+                throw new InvalidOperationException("fixture callback failure");
+            },
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var failingAdvance = time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await reachedCallback.Task.WaitAsync(Patience);
+
+        // Queued behind the failing callback while the dispatcher is still busy.
+        var queuedAdvance = time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        release.Set();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => failingAdvance.WaitAsync(Patience));
+        // The later marker is neither lost nor poisoned by the earlier failure.
+        await queuedAdvance.WaitAsync(Patience);
+
+        Assert.True(queuedAdvance.IsCompletedSuccessfully);
+    }
+
+    [Fact]
+    public async Task DisposeRacingAThrowingCallbackNeitherDeadlocksNorLosesTheMarker()
+    {
+        var time = CaptureTime();
+        var reachedCallback = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var disposeWaiting = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim(false);
+        time.BeforeTimerDisposeWait = () => disposeWaiting.TrySetResult();
+        var timer = time.CreateTimer(
+            _ =>
+            {
+                reachedCallback.TrySetResult();
+                release.Wait(Patience);
+                throw new InvalidOperationException("fixture callback failure");
+            },
+            null,
+            TimeSpan.FromSeconds(1),
+            Timeout.InfiniteTimeSpan);
+
+        var advancing = time.AdvanceAsync(TimeSpan.FromSeconds(1));
+        await reachedCallback.Task.WaitAsync(Patience);
+        var disposing = Task.Run(timer.Dispose);
+        await disposeWaiting.Task.WaitAsync(Patience);
+        release.Set();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => advancing.WaitAsync(Patience));
+        await disposing.WaitAsync(Patience);
+
+        Assert.Equal(0, time.ActiveTimerCount);
+        await time.AdvanceAsync(TimeSpan.FromSeconds(1)).WaitAsync(Patience);
+    }
+
     // ---------- channel detection ----------
 
     [Fact]
